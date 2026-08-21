@@ -6,10 +6,15 @@
 //! recreated on any corruption. The git-tracked markdown stays the only source
 //! of truth.
 //!
-//! Citations are content-addressed: `r<ring>-<6 hex of sha256(normalized
+//! Citations are content-addressed: `r<ring>-<prefix of sha256(normalized
 //! block)>`. They survive reordering and unrelated edits; an edited entry
 //! becomes a new citation by construction. The ring prefix makes the trust
 //! level of a hit visible in the id itself.
+//!
+//! The FULL digest behind that prefix is the block's content address, and it
+//! is what every derived artifact is keyed by — so vectors survive a rebuild
+//! that recycles every rowid in the file, and an edit costs the embeddings of
+//! exactly the blocks that changed.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +22,7 @@ use anyhow::Context as _;
 use rusqlite::Connection;
 use sha2::Digest as _;
 
+use crate::config::{Precision, RingRules, VectorSpec};
 use crate::resident::blank_private;
 
 /// Rings 5-6 are never indexed: staging and exhaust must not surface in
@@ -51,47 +57,48 @@ pub struct Hit {
     pub(crate) chain: String,
 }
 
-/// Location defaults for a brain-root-relative path; frontmatter `ring: N`
-/// overrides. Mirrors DESIGN.md "existing brain -> ring mapping".
-pub fn default_ring(rel: &str) -> u8 {
-    if rel == "AGENT.md" || rel == "README.md" {
-        1
-    } else if rel.starts_with("mind/memories/") {
-        // Exactly the index file — a topic file named e.g. OLD-MEMORY.md must
-        // not inherit ring 1 by suffix accident.
-        if rel == "mind/memories/MEMORY.md" { 1 } else { 2 }
-    } else if rel.starts_with("todo/") {
-        4
-    } else {
-        3
-    }
+/// Rewrites `sep` to `/` — the canonical separator of every brain-relative
+/// doc path.
+///
+/// Doc paths are matched by PREFIX against `mind/secrets/`, `logs/`,
+/// `projects/`, `knowledge/archive/` and `.git/`, are stored in the catalog
+/// and are printed in citations. A platform whose separator is `\` produces
+/// `mind\secrets\age.key` from the same file, which matches none of those
+/// prefixes — the secrets boundary would open by pure string accident. On a
+/// platform whose separator is already `/`, a backslash is an ordinary
+/// filename character and is left untouched.
+pub(crate) fn normalize_separators(rel: &str, sep: char) -> String {
+    if sep == '/' { rel.to_string() } else { rel.replace(sep, "/") }
 }
 
-/// Paths that must never enter the index. `knowledge/archive/` is excluded by
-/// convention (do not load unless investigating history); secrets and logs are
-/// excluded as a hard boundary; `projects/` holds repo clones (Milestone 3's
-/// code index owns those).
-fn excluded(rel: &str) -> bool {
-    rel.starts_with("mind/secrets/")
-        || rel.starts_with("logs/")
-        || rel.starts_with("projects/")
-        || rel.starts_with("knowledge/archive/")
-        || rel.starts_with(".git/")
-        || rel.contains("/.git/")
+/// Canonical doc path for a brain-root-relative path, on any platform.
+pub(crate) fn rel_doc_path(rel: &Path) -> String {
+    normalize_separators(&rel.to_string_lossy(), std::path::MAIN_SEPARATOR)
+}
+
+/// THE taxonomy entry point: the configured location default for a
+/// brain-root-relative path. Frontmatter `ring: N` still overrides it at
+/// scan time. Everything that needs a path's ring — the scan, the watcher,
+/// ring-6 capture — comes through here, so the mapping lives in the config
+/// and nowhere else.
+pub fn default_ring(rel: &str, rules: &RingRules) -> u8 {
+    rules.ring_for(rel)
+}
+
+/// Paths that must never enter the index: the compiled-in boundary (secrets,
+/// logs, git internals) plus the operator's `exclude_prefixes` — by default
+/// `projects/` (repo clones, owned by the code index) and
+/// `knowledge/archive/` (retired knowledge, not recallable by accident).
+fn excluded(rel: &str, rules: &RingRules) -> bool {
+    rules.excluded(rel)
 }
 
 /// Directory form of [`excluded`]: true when nothing under `rel` can ever be
-/// indexed, so the serving watcher can skip the whole subtree. Kept beside
-/// `excluded` deliberately — a prefix added there must be reflected here or
-/// the watcher would register watches the indexer ignores.
-pub(crate) fn excluded_dir(rel: &str) -> bool {
-    let rel = rel.trim_end_matches('/');
-    rel == "mind/secrets"
-        || rel == "logs"
-        || rel == "projects"
-        || rel == "knowledge/archive"
-        || rel == ".git"
-        || excluded(&format!("{rel}/"))
+/// indexed, so the serving watcher can skip the whole subtree. One predicate
+/// serves both forms — the watch set is the index set by construction, never
+/// by two hand-maintained lists agreeing.
+pub(crate) fn excluded_dir(rel: &str, rules: &RingRules) -> bool {
+    rules.excluded_dir(rel)
 }
 
 /// Secret-shaped file names are refused even outside mind/secrets/ — capture
@@ -176,14 +183,28 @@ pub fn wikilinks(text: &str) -> Vec<String> {
     out
 }
 
+/// THE content address of a statement: the full sha256 hex of its normalized
+/// text. Every derived artifact — vectors today, rerank scores tomorrow — is
+/// keyed by this, and it is stable across hosts, rescans and reorderings
+/// because it is a function of the content alone.
+///
+/// ONE hashing site: [`cite_from_hash`] shows a truncated PREFIX of this same
+/// digest, so a citation and the vector stored under its hash can never end
+/// up describing different content.
+pub fn content_hash(text: &str) -> String {
+    format!("{:x}", sha2::Sha256::digest(normalize(text).as_bytes()))
+}
+
 /// 40 hash bits: at ~20k blocks the birthday collision expectation is ~0.0002
-/// — the 24-bit version measurably collided in the real corpus.
-pub fn cite_id(ring: u8, text: &str) -> String {
-    let digest = sha2::Sha256::digest(normalize(text).as_bytes());
-    format!(
-        "r{ring}-{:02x}{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3], digest[4]
-    )
+/// — the 24-bit version measurably collided in the real corpus. The citation
+/// TRUNCATES the content address; the full digest keys the artifacts.
+const CITE_HASH_HEX: usize = 10;
+
+/// Citation id of a block: its ring, then a prefix of its content address.
+/// Takes the hash rather than the text so no caller ever hashes twice — the
+/// citation and the block's derived artifacts come from one digest.
+pub fn cite_from_hash(ring: u8, hash: &str) -> String {
+    format!("r{ring}-{}", &hash[..CITE_HASH_HEX])
 }
 
 /// A fence opener: a run of at least three backticks or tildes (CommonMark
@@ -352,7 +373,7 @@ fn db_path(state_dir: &Path) -> PathBuf {
 /// Bump whenever tables/columns/id formats change: an old DB with a new
 /// binary is silently wrong (e.g. stale cite widths), and the cache is
 /// disposable — mismatches are handled by delete-and-rebuild in `open()`.
-const SCHEMA_VERSION: i64 = 6; // 6: heading-chain ctx, doc_links/skipped_docs, code norm columns
+const SCHEMA_VERSION: i64 = 7; // 7: blocks.hash + content-hash-keyed vectors(model, dim)
 
 fn open_at(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -391,9 +412,11 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
            end_line INTEGER NOT NULL,
            text TEXT NOT NULL,
            ctx TEXT NOT NULL DEFAULT '',
-           chain TEXT NOT NULL DEFAULT ''
+           chain TEXT NOT NULL DEFAULT '',
+           hash TEXT NOT NULL DEFAULT ''
          );
          CREATE INDEX IF NOT EXISTS blocks_cite ON blocks(cite);
+         CREATE INDEX IF NOT EXISTS blocks_hash ON blocks(hash);
          CREATE INDEX IF NOT EXISTS blocks_doc ON blocks(doc_id);
          CREATE TABLE IF NOT EXISTS links(
            from_doc INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
@@ -413,7 +436,9 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
          );
          CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(text, ctx, content='blocks', content_rowid='id');
          CREATE TABLE IF NOT EXISTS vectors(
-           block_id INTEGER PRIMARY KEY REFERENCES blocks(id) ON DELETE CASCADE,
+           content_hash TEXT PRIMARY KEY,
+           model TEXT NOT NULL,
+           dim INTEGER NOT NULL,
            embedding BLOB NOT NULL
          );",
     )?;
@@ -460,7 +485,11 @@ fn stat_of(meta: &std::fs::Metadata) -> (u64, u64) {
 /// Native memory (`<native_root>/<project-slug>/memory/*.md`) is indexed as
 /// ring 2 with doc paths `native:<slug>/<file>` — cfetch reads and surfaces
 /// the native store, it never writes to it.
-fn collect_files(brain_root: &Path, native_root: Option<&Path>) -> Vec<SourceFile> {
+fn collect_files(
+    brain_root: &Path,
+    native_root: Option<&Path>,
+    rules: &RingRules,
+) -> Vec<SourceFile> {
     let mut out = Vec::new();
     let walker = ignore::WalkBuilder::new(brain_root)
         .hidden(true)
@@ -473,8 +502,8 @@ fn collect_files(brain_root: &Path, native_root: Option<&Path>) -> Vec<SourceFil
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
-        let rel = rel.to_string_lossy().to_string();
-        if !rel.ends_with(".md") || excluded(&rel) || secret_shaped(&rel) {
+        let rel = rel_doc_path(rel);
+        if !rel.ends_with(".md") || excluded(&rel, rules) || secret_shaped(&rel) {
             continue;
         }
         let (mtime, size) = stat_of(&meta);
@@ -483,7 +512,7 @@ fn collect_files(brain_root: &Path, native_root: Option<&Path>) -> Vec<SourceFil
             abs: entry.path().to_path_buf(),
             mtime,
             size,
-            default_ring: default_ring(&rel),
+            default_ring: default_ring(&rel, rules),
         });
     }
     if let Some(projects) = native_root.and_then(|nr| std::fs::read_dir(nr).ok()) {
@@ -528,20 +557,53 @@ fn source_fingerprint(files: &[SourceFile]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Cheap staleness decision: stat-only fingerprint comparison — no file
-/// bodies are read.
-pub fn stale(conn: &Connection, brain_root: &Path, native_root: Option<&Path>) -> anyhow::Result<bool> {
+/// The stat fingerprint of the tree AS IT IS NOW — one stat walk, no file
+/// bodies read. This is the value the 60s backstop compares against, and the
+/// coverage token the serving daemon's unordered drain barrier takes at query
+/// entry (see `serve::BarrierMode`).
+pub fn tree_fingerprint(
+    brain_root: &Path,
+    native_root: Option<&Path>,
+    rules: &RingRules,
+) -> String {
+    source_fingerprint(&collect_files(brain_root, native_root, rules))
+}
+
+/// The fingerprint of the tree state the COMMITTED catalog describes, written
+/// inside each scan's transaction. `None` = never scanned.
+pub fn stored_fingerprint(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT value FROM meta WHERE key='source_fingerprint'", [], |r| r.get(0)).ok()
+}
+
+/// One stat walk answering both questions the backstop asks: is the catalog
+/// stale, and what does the tree look like right now. A caller that needs the
+/// fingerprint too must never pay for a second walk.
+pub fn staleness(
+    conn: &Connection,
+    brain_root: &Path,
+    native_root: Option<&Path>,
+    rules: &RingRules,
+) -> anyhow::Result<(bool, String)> {
+    let current = tree_fingerprint(brain_root, native_root, rules);
     let root_meta: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key='brain_root'", [], |r| r.get(0))
         .ok();
     if root_meta.as_deref() != Some(brain_root.to_string_lossy().as_ref()) {
-        return Ok(true);
+        return Ok((true, current));
     }
-    let stored: Option<String> = conn
-        .query_row("SELECT value FROM meta WHERE key='source_fingerprint'", [], |r| r.get(0))
-        .ok();
-    let current = source_fingerprint(&collect_files(brain_root, native_root));
-    Ok(stored.as_deref() != Some(current.as_str()))
+    let stale = stored_fingerprint(conn).as_deref() != Some(current.as_str());
+    Ok((stale, current))
+}
+
+/// Cheap staleness decision: stat-only fingerprint comparison — no file
+/// bodies are read.
+pub fn stale(
+    conn: &Connection,
+    brain_root: &Path,
+    native_root: Option<&Path>,
+    rules: &RingRules,
+) -> anyhow::Result<bool> {
+    Ok(staleness(conn, brain_root, native_root, rules)?.0)
 }
 
 pub struct ScanReport {
@@ -650,12 +712,13 @@ fn insert_doc(
             chain_key = chain_text(&chain);
             ctx = chain_key.clone();
         }
-        let cite = cite_id(ring, &body);
+        let hash = content_hash(&body);
+        let cite = cite_from_hash(ring, &hash);
         tx.prepare_cached(
-            "INSERT INTO blocks(cite, doc_id, start_line, end_line, text, ctx, chain)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO blocks(cite, doc_id, start_line, end_line, text, ctx, chain, hash)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?
-        .execute(rusqlite::params![cite, doc_id, start as i64, end as i64, body, ctx, chain_key])?;
+        .execute(rusqlite::params![cite, doc_id, start as i64, end as i64, body, ctx, chain_key, hash])?;
         let block_id = tx.last_insert_rowid();
         tx.prepare_cached("INSERT INTO blocks_fts(rowid, text, ctx) VALUES(?1, ?2, ?3)")?
             .execute(rusqlite::params![block_id, body, ctx])?;
@@ -740,8 +803,13 @@ fn set_fingerprint(tx: &rusqlite::Transaction<'_>, fingerprint: &str) -> anyhow:
 /// Full rebuild inside one transaction. The corpus is small markdown; a
 /// rebuild is cheap, and the incremental path ([`rescan_changed`]) exists for
 /// the serving daemon's event batches.
-pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>) -> anyhow::Result<ScanReport> {
-    let files = collect_files(brain_root, native_root);
+pub fn scan(
+    conn: &mut Connection,
+    brain_root: &Path,
+    native_root: Option<&Path>,
+    rules: &RingRules,
+) -> anyhow::Result<ScanReport> {
+    let files = collect_files(brain_root, native_root, rules);
     let fingerprint = source_fingerprint(&files);
     // Read every body BEFORE the write transaction: the tree may be NFS, and
     // holding SQLite's writer lock across slow I/O starves concurrent readers
@@ -751,12 +819,13 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
         .filter_map(|src| std::fs::read_to_string(&src.abs).ok().map(|raw| (src, raw)))
         .collect();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // Vectors MUST go with the blocks they describe: after `DELETE FROM
-    // blocks` SQLite reuses rowids from 1, so a stale vectors row would
-    // silently attach to an unrelated new block. Embeddings are derived data;
-    // `embed-index` rebuilds them resumably.
+    // Vectors deliberately SURVIVE the rebuild: they are keyed by content
+    // hash, not by a block rowid, so a rebuilt catalog re-joins every vector
+    // whose text is still in the tree. They used to be dropped here because
+    // rowids are recycled — which made one markdown edit cost 100% of the
+    // embeddings. `prune_vectors` below drops exactly the hashes that left.
     tx.execute_batch(
-        "DELETE FROM vectors; DELETE FROM doc_links; DELETE FROM links;
+        "DELETE FROM doc_links; DELETE FROM links;
          DELETE FROM blocks; DELETE FROM docs; DELETE FROM skipped_docs;
          INSERT INTO blocks_fts(blocks_fts) VALUES('delete-all');",
     )?;
@@ -773,13 +842,16 @@ pub fn scan(conn: &mut Connection, brain_root: &Path, native_root: Option<&Path>
         insert_doc(&tx, &src, &raw, &mut report)?;
     }
     resolve_links(&tx)?;
+    prune_vectors(&tx)?;
     tx.commit()?;
     Ok(report)
 }
 
 /// Removes one doc's rows everywhere: FTS rows (external-content FTS5 must be
-/// told each removed row's old values), blocks (vectors cascade), the doc row
-/// (links and doc_links cascade), and any `skipped_docs` entry.
+/// told each removed row's old values), blocks, the doc row (links and
+/// doc_links cascade), and any `skipped_docs` entry. Vectors are NOT touched
+/// here — they belong to content, not to a doc, and the same text in another
+/// file keeps them alive; [`prune_vectors`] settles that at the end of a scan.
 fn delete_doc(tx: &rusqlite::Transaction<'_>, path: &str) -> anyhow::Result<()> {
     tx.execute("DELETE FROM skipped_docs WHERE path=?1", [path])?;
     let doc_id: Option<i64> =
@@ -819,6 +891,7 @@ pub fn rescan_changed(
     conn: &mut Connection,
     brain_root: &Path,
     native_root: Option<&Path>,
+    rules: &RingRules,
 ) -> anyhow::Result<Option<ScanReport>> {
     let root_meta: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key='brain_root'", [], |r| r.get(0))
@@ -828,7 +901,7 @@ pub fn rescan_changed(
     {
         return Ok(None);
     }
-    let files = collect_files(brain_root, native_root);
+    let files = collect_files(brain_root, native_root, rules);
     let fingerprint = source_fingerprint(&files);
     let stored: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key='source_fingerprint'", [], |r| r.get(0))
@@ -894,6 +967,7 @@ pub fn rescan_changed(
         }
     }
     resolve_links(&tx)?;
+    prune_vectors(&tx)?;
     tx.commit()?;
     Ok(Some(report))
 }
@@ -1046,29 +1120,75 @@ const RING_PRIOR: f64 = 0.05;
 const CTX_WEIGHT: f64 = 0.3;
 
 /// The ranked SELECT shared by [`recall`] and [`bm25_block_ids`].
-fn ranked_match_sql(select: &str) -> String {
+/// The slice filter, as SQL over `prefix_count` bound prefixes starting at
+/// `?3`.
+///
+/// Compared by component rather than with LIKE or GLOB: a path is under a
+/// prefix when it IS the prefix or continues with `/`. That is the same rule
+/// `config::under_prefix` applies — so `drafts` never claims `draftsman` —
+/// and it cannot be confused by a `%`, `_` or `[` living in a filename.
+fn slice_filter_sql(prefix_count: usize) -> String {
+    if prefix_count == 0 {
+        return String::new();
+    }
+    let terms: Vec<String> = (0..prefix_count)
+        .map(|i| {
+            let p = i + 3;
+            format!(
+                "(substr(d.path,1,length(?{p})) = ?{p} \
+                  AND (length(d.path) = length(?{p}) OR substr(d.path,length(?{p})+1,1) = '/'))"
+            )
+        })
+        .collect();
+    format!(" AND ({})", terms.join(" OR "))
+}
+
+fn ranked_match_sql(select: &str, prefix_count: usize) -> String {
+    let slice = slice_filter_sql(prefix_count);
     format!(
         "SELECT {select}
          FROM blocks_fts f
          JOIN blocks b ON b.id = f.rowid
          JOIN docs d ON d.id = b.doc_id
-         WHERE blocks_fts MATCH ?1
+         WHERE blocks_fts MATCH ?1{slice}
          ORDER BY bm25(blocks_fts, 1.0, {CTX_WEIGHT}) + {RING_PRIOR} * d.ring, d.ring ASC
          LIMIT ?2"
     )
 }
 
+/// Binds `(fts, limit, prefixes…)` in the order [`ranked_match_sql`] numbers
+/// them. Prefixes lose a trailing slash here so the SQL's length arithmetic
+/// matches `config::under_prefix` exactly.
+fn ranked_params(fts: &str, limit: usize, prefixes: &[String]) -> Vec<rusqlite::types::Value> {
+    use rusqlite::types::Value;
+    let mut p = vec![Value::Text(fts.to_string()), Value::Integer(limit as i64)];
+    p.extend(prefixes.iter().map(|s| Value::Text(s.trim_end_matches('/').to_string())));
+    p
+}
+
 pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<Hit>> {
+    recall_in(conn, query, limit, &[])
+}
+
+/// Recall restricted to documents under `prefixes` — the slice filter. An
+/// empty slice restricts nothing, which is what the root slice is.
+pub fn recall_in(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    prefixes: &[String],
+) -> anyhow::Result<Vec<Hit>> {
     let fts = fts_query(query);
     if fts.is_empty() {
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(&ranked_match_sql(
         "b.cite, d.path, d.ring, b.start_line, b.end_line, b.text, b.ctx, b.chain",
+        prefixes.len(),
     ))?;
     // Twice the candidate pool: duplicate suppression must refill freed
     // slots with the next-ranked hits, never shrink the result count.
-    let rows = stmt.query_map(rusqlite::params![fts, (limit * 2) as i64], |r| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(ranked_params(&fts, limit * 2, prefixes)), |r| {
         Ok(Hit {
             cite: r.get(0)?,
             path: r.get(1)?,
@@ -1092,6 +1212,21 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
     }
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// Every indexed document with its block count, for classification in Rust.
+///
+/// Slice membership is a pure function of (path, config), so it is derived
+/// here rather than stored: a stored slice would silently disagree with the
+/// configuration the moment someone edited it and had not rescanned.
+pub fn doc_block_counts(conn: &Connection) -> anyhow::Result<Vec<(String, usize)>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.path, COUNT(b.id) FROM docs d
+         LEFT JOIN blocks b ON b.doc_id = d.id
+         GROUP BY d.id ORDER BY d.path",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize)))?;
+    Ok(rows.filter_map(Result::ok).collect())
 }
 
 /// Expands a citation id to its full block(s) — the second disclosure layer.
@@ -1121,27 +1256,104 @@ pub fn expand(conn: &Connection, cite: &str) -> anyhow::Result<Vec<Block>> {
 
 // ---- vector store (semantic + hybrid recall) ----
 //
-// Embeddings live INSIDE index.db as little-endian f32 blobs, one row per
-// block, L2-normalized at insert so cosine similarity reduces to a dot
-// product at query time. No vector-index dependency: at ~20k blocks a linear
-// scan in Rust is milliseconds, exact, and zero-dep (the sanctioned fallback
-// in DESIGN.md). A missing row means "not yet embedded" — that single fact
-// makes `embed-index` resumable for free.
+// The RECORD for embeddings is the shared artifact store in the tree (see
+// `vectors.rs`). What lives here is a per-host CACHE of the same vectors,
+// keyed by CONTENT HASH so it survives every rebuild of the catalog, joined
+// to blocks by hash at query time. Rows are L2-normalized at insert, so
+// cosine similarity reduces to a dot product. No vector-index dependency: at
+// ~20k blocks a linear scan in Rust is milliseconds and exact.
+//
+// A missing row means "not yet embedded" — that single fact makes both the
+// hydrate from the shared store and `embed-index` resumable for free.
 
-/// Little-endian f32 encoding — the on-disk vector format.
-pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * 4);
+/// IEEE binary32 -> binary16, round-to-nearest-even, subnormals included.
+/// Written out rather than pulled in: it is thirty lines of well-specified
+/// bit work, and the crate that would supply it is a dependency in every
+/// build of a tool whose bill of materials is deliberately short.
+fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x007f_ffff;
+    if exponent == 0xff {
+        // Inf, or NaN (kept NaN by a non-zero payload).
+        return sign | 0x7c00 | if mantissa != 0 { 0x0200 } else { 0 };
+    }
+    let unbiased = exponent - 127 + 15;
+    if unbiased >= 0x1f {
+        return sign | 0x7c00; // overflows half range -> infinity
+    }
+    if unbiased <= 0 {
+        if unbiased < -10 {
+            return sign; // below the smallest subnormal -> signed zero
+        }
+        // Subnormal: restore the implicit leading one, then shift into place.
+        let full = mantissa | 0x0080_0000;
+        let shift = (14 - unbiased) as u32;
+        let half = full >> shift;
+        let round_bit = 1u32 << (shift - 1);
+        let round_up =
+            (full & round_bit) != 0 && ((full & (round_bit - 1)) != 0 || (half & 1) != 0);
+        return sign | (half + u32::from(round_up)) as u16;
+    }
+    let half = ((unbiased as u32) << 10) | (mantissa >> 13);
+    let round_bit = 1u32 << 12;
+    let round_up = (mantissa & round_bit) != 0 && ((mantissa & (round_bit - 1)) != 0 || (half & 1) != 0);
+    sign | (half + u32::from(round_up)) as u16
+}
+
+/// Inverse of [`f32_to_f16`] — exact, every binary16 is a binary32.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exponent = ((bits >> 10) & 0x1f) as u32;
+    let mantissa = (bits & 0x03ff) as u32;
+    let out = if exponent == 0 {
+        if mantissa == 0 {
+            sign
+        } else {
+            // Subnormal: normalize by shifting the leading one into place.
+            let mut m = mantissa;
+            let mut shifts = 0u32;
+            while m & 0x0400 == 0 {
+                m <<= 1;
+                shifts += 1;
+            }
+            sign | ((113 - shifts) << 23) | ((m & 0x03ff) << 13)
+        }
+    } else if exponent == 0x1f {
+        sign | 0x7f80_0000 | (mantissa << 13)
+    } else {
+        sign | ((exponent + 127 - 15) << 23) | (mantissa << 13)
+    };
+    f32::from_bits(out)
+}
+
+/// Little-endian encoding at the configured width — the ONE codec, used by
+/// both the local cache and the shared artifact files.
+pub fn vec_to_blob(v: &[f32], precision: Precision) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * precision.width());
     for x in v {
-        out.extend_from_slice(&x.to_le_bytes());
+        match precision {
+            Precision::F16 => out.extend_from_slice(&f32_to_f16(*x).to_le_bytes()),
+            Precision::F32 => out.extend_from_slice(&x.to_le_bytes()),
+        }
     }
     out
 }
 
-/// Inverse of [`vec_to_blob`]; a trailing partial chunk (corrupt blob) is
-/// dropped rather than misread.
-pub fn blob_to_vec(b: &[u8]) -> Vec<f32> {
-    let (chunks, _remainder) = b.as_chunks::<4>();
-    chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
+/// Inverse of [`vec_to_blob`], widened to f32 for the dot product; a trailing
+/// partial component (corrupt blob) is dropped rather than misread.
+pub fn blob_to_vec(b: &[u8], precision: Precision) -> Vec<f32> {
+    match precision {
+        Precision::F16 => {
+            let (chunks, _remainder) = b.as_chunks::<2>();
+            chunks.iter().map(|c| f16_to_f32(u16::from_le_bytes(*c))).collect()
+        }
+        Precision::F32 => {
+            let (chunks, _remainder) = b.as_chunks::<4>();
+            chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
+        }
+    }
 }
 
 /// L2-normalizes in place; the zero vector is left untouched (it can never
@@ -1173,69 +1385,96 @@ fn meta_set(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Records the embedding model in meta; a DIFFERENT stored model drops every
-/// vector (and the stored dimension) — mixed-model similarity is meaningless,
-/// and rebuild is a first-class, resumable path. Returns true when vectors
-/// were dropped.
-pub fn ensure_embed_model(conn: &Connection, model: &str) -> anyhow::Result<bool> {
-    let stored = meta_get(conn, "embed_model");
-    if stored.as_deref() == Some(model) {
+/// The artifact spec the cached vectors were written under, if any.
+pub fn stored_vector_spec(conn: &Connection) -> Option<VectorSpec> {
+    let model = meta_get(conn, "embed_model")?;
+    let dim = meta_get(conn, "embed_dim")?.parse().ok()?;
+    let precision = match meta_get(conn, "embed_precision")?.as_str() {
+        "f16" => Precision::F16,
+        "f32" => Precision::F32,
+        _ => return None,
+    };
+    Some(VectorSpec { model, dim, precision })
+}
+
+/// Records `(model, dim, precision)` in meta; a DIFFERENT stored spec drops
+/// every cached vector — vectors of two models, widths or precisions produce
+/// numbers that look like similarity and are not. Returns true when a drop
+/// happened. Re-filling is a first-class path: the shared store still holds
+/// the artifacts, so the cost is usually a hydrate, not an embed run.
+pub fn ensure_vector_spec(conn: &Connection, spec: &VectorSpec) -> anyhow::Result<bool> {
+    let stored = stored_vector_spec(conn);
+    if stored.as_ref() == Some(spec) {
         return Ok(false);
     }
     let dropping = stored.is_some();
     conn.execute("DELETE FROM vectors", [])?;
-    // The dimension belongs to the model: clear it so the next embed run
-    // re-learns it from the first response.
-    conn.execute("DELETE FROM meta WHERE key='embed_dim'", [])?;
-    meta_set(conn, "embed_model", model)?;
+    meta_set(conn, "embed_model", &spec.model)?;
+    meta_set(conn, "embed_dim", &spec.dim.to_string())?;
+    meta_set(conn, "embed_precision", spec.precision.as_str())?;
     Ok(dropping)
 }
 
-/// Same contract as [`ensure_embed_model`] for the vector dimension (a model
-/// NAME can silently change dimension when the endpoint is reconfigured).
-pub fn ensure_embed_dim(conn: &Connection, dim: usize) -> anyhow::Result<bool> {
-    let stored = meta_get(conn, "embed_dim");
-    let dim_str = dim.to_string();
-    if stored.as_deref() == Some(dim_str.as_str()) {
-        return Ok(false);
-    }
-    let dropping = stored.is_some();
-    conn.execute("DELETE FROM vectors", [])?;
-    meta_set(conn, "embed_dim", &dim_str)?;
-    Ok(dropping)
+/// Drops cached vectors whose content is no longer anywhere in the catalog.
+/// Called at the end of every scan: an edited block's old vector goes, every
+/// unchanged block's vector stays.
+fn prune_vectors(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM vectors WHERE content_hash NOT IN (SELECT hash FROM blocks)", [])?;
+    Ok(())
 }
 
-/// Blocks with no vector row yet, in stable id order — the embed-index work
-/// queue. Missing row = not yet embedded (resumability contract).
-pub fn blocks_without_vectors(conn: &Connection, limit: usize) -> anyhow::Result<Vec<(i64, String)>> {
+/// The embed work queue: content hashes with no cached vector, each with one
+/// representative text, in document order. DISTINCT by hash — the same
+/// statement in two files is one artifact, embedded once.
+pub fn hashes_without_vectors(
+    conn: &Connection,
+    spec: &VectorSpec,
+    limit: usize,
+) -> anyhow::Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT b.id, b.text FROM blocks b
-         LEFT JOIN vectors v ON v.block_id = b.id
-         WHERE v.block_id IS NULL
-         ORDER BY b.id LIMIT ?1",
+        "SELECT b.hash, min(b.text), min(b.id) FROM blocks b
+         LEFT JOIN vectors v ON v.content_hash = b.hash AND v.model = ?1 AND v.dim = ?2
+         WHERE v.content_hash IS NULL
+         GROUP BY b.hash ORDER BY min(b.id) LIMIT ?3",
     )?;
-    let rows = stmt.query_map([limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    // SQLite reads a negative LIMIT as unbounded — which is exactly what a
+    // caller asking for usize::MAX (a full hydrate) means.
+    let bound = i64::try_from(limit).unwrap_or(-1);
+    let rows = stmt.query_map(
+        rusqlite::params![spec.model, spec.dim as i64, bound],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )?;
     Ok(rows.filter_map(Result::ok).collect())
 }
 
-/// (embedded, total blocks) — progress reporting.
-pub fn vector_counts(conn: &Connection) -> anyhow::Result<(usize, usize)> {
+/// (blocks reachable by semantic recall, blocks total) FOR THIS SPEC — the
+/// coverage number every degradation warning quotes. Spec-relative on
+/// purpose: vectors of another model are not coverage, they are ballast.
+pub fn vector_coverage(conn: &Connection, spec: &VectorSpec) -> anyhow::Result<(usize, usize)> {
     let (v, b): (i64, i64) = conn.query_row(
-        "SELECT (SELECT count(*) FROM vectors), (SELECT count(*) FROM blocks)",
-        [],
+        "SELECT (SELECT count(*) FROM blocks b JOIN vectors v
+                   ON v.content_hash = b.hash AND v.model = ?1 AND v.dim = ?2),
+                (SELECT count(*) FROM blocks)",
+        rusqlite::params![spec.model, spec.dim as i64],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     Ok((v as usize, b as usize))
 }
 
-/// Stores one block's embedding, L2-normalized, as a little-endian f32 blob.
-pub fn insert_vector(conn: &Connection, block_id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+/// Caches one content hash's embedding, L2-normalized, at the spec's width.
+pub fn insert_vector(
+    conn: &Connection,
+    content_hash: &str,
+    spec: &VectorSpec,
+    embedding: &[f32],
+) -> anyhow::Result<()> {
     let mut v = embedding.to_vec();
     l2_normalize(&mut v);
     conn.execute(
-        "INSERT INTO vectors(block_id, embedding) VALUES(?1, ?2)
-         ON CONFLICT(block_id) DO UPDATE SET embedding=excluded.embedding",
-        rusqlite::params![block_id, vec_to_blob(&v)],
+        "INSERT INTO vectors(content_hash, model, dim, embedding) VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(content_hash) DO UPDATE SET
+           model=excluded.model, dim=excluded.dim, embedding=excluded.embedding",
+        rusqlite::params![content_hash, spec.model, spec.dim as i64, vec_to_blob(&v, spec.precision)],
     )?;
     Ok(())
 }
@@ -1268,16 +1507,43 @@ fn hits_for_block_ids(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<Hit>
     Ok(out)
 }
 
-/// Block ids ranked by dot product against a normalized query vector —
-/// a full linear scan, exact by construction. Rows whose dimension does not
-/// match the query are skipped (transitional state during a model change).
-fn semantic_block_ids(conn: &Connection, query_vec: &[f32], limit: usize) -> anyhow::Result<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT block_id, embedding FROM vectors")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+/// Block ids ranked by dot product against a normalized query vector — a full
+/// linear scan, exact by construction. Vectors join blocks BY CONTENT HASH,
+/// so a rebuilt catalog re-attaches every surviving vector to its new rowid.
+/// Rows whose width does not match the query are skipped (a transitional
+/// state while a spec change is being re-embedded).
+fn semantic_block_ids(
+    conn: &Connection,
+    spec: &VectorSpec,
+    query_vec: &[f32],
+    limit: usize,
+    prefixes: &[String],
+) -> anyhow::Result<Vec<i64>> {
+    // The slice filter belongs HERE and not after ranking: a hybrid answer
+    // fuses this list with the lexical one, so a vector hit from outside the
+    // slice would leak in through the fusion no matter what the lexical half
+    // was restricted to.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT b.id, v.embedding FROM vectors v
+         JOIN blocks b ON b.hash = v.content_hash
+         JOIN docs d ON d.id = b.doc_id
+         WHERE v.model = ?1 AND v.dim = ?2{}",
+        slice_filter_sql(prefixes.len())
+    ))?;
+    let mut params: Vec<rusqlite::types::Value> = vec![
+        rusqlite::types::Value::Text(spec.model.clone()),
+        rusqlite::types::Value::Integer(spec.dim as i64),
+    ];
+    params.extend(
+        prefixes.iter().map(|p| rusqlite::types::Value::Text(p.trim_end_matches('/').to_string())),
+    );
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
     let mut scored: Vec<(i64, f32)> = rows
         .filter_map(Result::ok)
         .filter_map(|(id, blob)| {
-            let v = blob_to_vec(&blob);
+            let v = blob_to_vec(&blob, spec.precision);
             (v.len() == query_vec.len()).then(|| (id, dot(&v, query_vec)))
         })
         .collect();
@@ -1288,19 +1554,31 @@ fn semantic_block_ids(conn: &Connection, query_vec: &[f32], limit: usize) -> any
 
 /// Pure cosine ranking over all stored vectors (query vector must be
 /// normalized). Blocks without vectors simply cannot appear.
-pub fn semantic_recall(conn: &Connection, query_vec: &[f32], limit: usize) -> anyhow::Result<Vec<Hit>> {
-    let ids = semantic_block_ids(conn, query_vec, limit)?;
+pub fn semantic_recall(
+    conn: &Connection,
+    spec: &VectorSpec,
+    query_vec: &[f32],
+    limit: usize,
+    prefixes: &[String],
+) -> anyhow::Result<Vec<Hit>> {
+    let ids = semantic_block_ids(conn, spec, query_vec, limit, prefixes)?;
     hits_for_block_ids(conn, &ids)
 }
 
 /// BM25-ranked block ids for the same query shape and order [`recall`] uses.
-fn bm25_block_ids(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<i64>> {
+fn bm25_block_ids(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    prefixes: &[String],
+) -> anyhow::Result<Vec<i64>> {
     let fts = fts_query(query);
     if fts.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(&ranked_match_sql("b.id"))?;
-    let rows = stmt.query_map(rusqlite::params![fts, limit as i64], |r| r.get(0))?;
+    let mut stmt = conn.prepare(&ranked_match_sql("b.id", prefixes.len()))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(ranked_params(&fts, limit, prefixes)), |r| r.get(0))?;
     Ok(rows.filter_map(Result::ok).collect())
 }
 
@@ -1322,14 +1600,16 @@ pub fn rrf_fuse(lists: &[Vec<i64>], k: f64) -> Vec<i64> {
 /// the final limit so fusion has something to reorder.
 pub fn hybrid_recall(
     conn: &Connection,
+    spec: &VectorSpec,
     query: &str,
     query_vec: &[f32],
     limit: usize,
     rrf_k: f64,
+    prefixes: &[String],
 ) -> anyhow::Result<Vec<Hit>> {
     let pool = (limit * 4).max(20);
-    let lexical = bm25_block_ids(conn, query, pool)?;
-    let semantic = semantic_block_ids(conn, query_vec, pool)?;
+    let lexical = bm25_block_ids(conn, query, pool, prefixes)?;
+    let semantic = semantic_block_ids(conn, spec, query_vec, pool, prefixes)?;
     let mut fused = rrf_fuse(&[lexical, semantic], rrf_k);
     fused.truncate(limit);
     hits_for_block_ids(conn, &fused)
@@ -1343,23 +1623,65 @@ pub fn ensure_fresh(
     state_dir: &Path,
     brain_root: &Path,
     native_root: Option<&Path>,
+    rules: &RingRules,
 ) -> anyhow::Result<Connection> {
     let mut conn = open(state_dir).context("open index")?;
-    if stale(&conn, brain_root, native_root)? {
+    if stale(&conn, brain_root, native_root, rules)? {
         // `None` = another rebuilder is active; serve the committed snapshot.
         let lock = crate::lockfile::acquire(&state_dir.join("scan.lock"), 500, 120);
         // Re-check under the lock: the previous holder may have rebuilt
         // exactly what we were about to.
-        if lock.is_some() && stale(&conn, brain_root, native_root)? {
-            scan(&mut conn, brain_root, native_root)?;
+        if lock.is_some() && stale(&conn, brain_root, native_root, rules)? {
+            scan(&mut conn, brain_root, native_root, rules)?;
         }
     }
     Ok(conn)
 }
 
 #[cfg(test)]
+mod path_shape_tests {
+    use super::*;
+
+    #[test]
+    fn doc_paths_are_slash_separated_whatever_the_platform_uses() {
+        assert_eq!(normalize_separators(r"mind\secrets\age.key", '\\'), "mind/secrets/age.key");
+        assert_eq!(normalize_separators("mind/secrets/age.key", '/'), "mind/secrets/age.key");
+        // A backslash is a legal filename character on unix and must survive.
+        assert_eq!(normalize_separators(r"odd\name.md", '/'), r"odd\name.md");
+    }
+
+    #[test]
+    fn the_exclusion_boundary_holds_for_backslash_separated_paths() {
+        // Without normalization every one of these slips past the prefix
+        // match and lands in the catalog — secrets first.
+        for raw in [r"mind\secrets\age.key.md", r"logs\session.md", r"projects\repo\a.md", r"knowledge\archive\old.md", r".git\COMMIT_EDITMSG.md"] {
+            let rel = normalize_separators(raw, '\\');
+            assert!(excluded(&rel, &RingRules::default()), "{raw} normalized to {rel} must be excluded");
+        }
+        for raw in [r"mind\secrets", r"logs", r"projects", r"knowledge\archive"] {
+            assert!(excluded_dir(&normalize_separators(raw, '\\'), &RingRules::default()), "{raw}");
+        }
+    }
+
+    #[test]
+    fn ring_defaults_survive_the_separator() {
+        let rules = RingRules::default();
+        assert_eq!(default_ring(&normalize_separators(r"mind\memories\MEMORY.md", '\\'), &rules), 1);
+        assert_eq!(default_ring(&normalize_separators(r"mind\memories\topic.md", '\\'), &rules), 2);
+        assert_eq!(default_ring(&normalize_separators(r"todo\active\x\STATUS.md", '\\'), &rules), 4);
+    }
+
+    #[test]
+    fn secret_shaped_names_are_caught_after_normalization() {
+        assert!(secret_shaped(&normalize_separators(r"knowledge\hosts\my.pem", '\\')));
+        assert!(secret_shaped(&normalize_separators(r"knowledge\hosts\password-notes.md", '\\')));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Precision, RingRule, VectorSpec};
 
     fn brain(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -1373,11 +1695,118 @@ mod tests {
 
     #[test]
     fn ring_defaults_follow_design_mapping() {
-        assert_eq!(default_ring("AGENT.md"), 1);
-        assert_eq!(default_ring("mind/memories/MEMORY.md"), 1);
-        assert_eq!(default_ring("mind/memories/feedback_x.md"), 2);
-        assert_eq!(default_ring("knowledge/hosts/server/zfs.md"), 3);
-        assert_eq!(default_ring("todo/active/cfetch/STATUS.md"), 4);
+        // Regression lock: with the shipped rules the taxonomy entry point
+        // answers exactly what the hardcoded version answered.
+        let r = RingRules::default();
+        assert_eq!(default_ring("AGENT.md", &r), 1);
+        assert_eq!(default_ring("README.md", &r), 1);
+        assert_eq!(default_ring("mind/memories/MEMORY.md", &r), 1);
+        assert_eq!(default_ring("mind/memories/feedback_x.md", &r), 2);
+        assert_eq!(default_ring("knowledge/hosts/example/storage.md", &r), 3);
+        assert_eq!(default_ring("todo/active/task/STATUS.md", &r), 4);
+        assert_eq!(default_ring("staging/cfetch/hot-file-1234abcd.md", &r), 5);
+        assert_eq!(default_ring("staging/cfetch/dismissed/hot-file-1234abcd.md", &r), 5);
+    }
+
+    #[test]
+    fn staged_ring5_candidates_are_never_recalled() {
+        // Ring 5 is the ladder's quarantine: staging files sit in the same
+        // tree as everything else and must still be invisible to recall and
+        // injection. Fabricate a tree with a REAL staged candidate, scan it,
+        // and prove nothing of it comes back.
+        let dir = brain(&[("knowledge/live.md", "the reachable fact zulqar\n")]);
+        let staging_dir = dir.path().join("staging/cfetch");
+        crate::staging::write(
+            &staging_dir,
+            &crate::staging::Candidate {
+                id: "hot-file-deadbeef".into(),
+                reason: "hot-file".into(),
+                session: "s1".into(),
+                host: "host-alpha".into(),
+                ts: 1,
+                kind: "write".into(),
+                payload: serde_json::json!({"file_path": "/b/knowledge/x.md", "quarantined": "zulqar"}),
+            },
+        )
+        .unwrap();
+        // A dismissed candidate is kept in the tree too, and is just as quiet.
+        crate::staging::write(
+            &staging_dir,
+            &crate::staging::Candidate {
+                id: "hot-file-cafebabe".into(),
+                reason: "hot-file".into(),
+                session: "s1".into(),
+                host: "host-beta".into(),
+                ts: 2,
+                kind: "write".into(),
+                payload: serde_json::json!({"note": "zulqar"}),
+            },
+        )
+        .unwrap();
+        crate::staging::dismiss(&staging_dir, "hot-file-cafebabe").unwrap();
+
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 1, "only the ring-3 knowledge file is indexed");
+        assert_eq!(report.skipped_high_ring, 2, "both candidates are skipped as ring 5");
+        assert!(report.skipped.iter().all(|p| p.starts_with("staging/")));
+        assert_eq!(recall(&conn, "zulqar", 10).unwrap().len(), 1, "only the ring-3 hit");
+        assert_eq!(recall(&conn, "zulqar", 10).unwrap()[0].path, "knowledge/live.md");
+        assert!(
+            recall(&conn, "hot-file", 10).unwrap().is_empty(),
+            "no staged candidate is recallable, by any of its words"
+        );
+    }
+
+    #[test]
+    fn custom_ring_rules_drive_the_indexed_rings() {
+        // A tree with none of the shipped names: rings come from config only.
+        let dir = brain(&[
+            ("laws.md", "kwenty is the hard law\n"),
+            ("handbook/style.md", "trakkel is the house style\n"),
+            ("misc/loose.md", "vurpel is a loose fact\n"),
+            ("scratch/dump.md", "pargast is scratch\n"),
+        ]);
+        let rules = RingRules {
+            rules: vec![
+                RingRule { prefix: "laws.md".into(), ring: 0 },
+                RingRule { prefix: "handbook/".into(), ring: 1 },
+                RingRule { prefix: "scratch/".into(), ring: 5 },
+                RingRule { prefix: String::new(), ring: 4 },
+            ],
+            exclude_prefixes: Vec::new(),
+        };
+        let mut conn = open(dir.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &rules).unwrap();
+        assert_eq!(report.skipped, vec!["scratch/dump.md".to_string()], "ring 5 is never indexed");
+        let ring_of = |q: &str| recall(&conn, q, 5).unwrap().first().map(|h| h.ring);
+        assert_eq!(ring_of("kwenty"), Some(0));
+        assert_eq!(ring_of("trakkel"), Some(1));
+        assert_eq!(ring_of("vurpel"), Some(4), "the catch-all rule applies");
+        assert_eq!(ring_of("pargast"), None);
+    }
+
+    #[test]
+    fn configured_exclusions_apply_while_hard_ones_cannot_be_lifted() {
+        let dir = brain(&[
+            ("mind/secrets/tokens.md", "hyllvar token\n"),
+            ("drafts/wip.md", "nogrant draft\n"),
+            ("knowledge/live.md", "kavender fact\n"),
+        ]);
+        let rules = RingRules {
+            rules: RingRules::default().rules,
+            exclude_prefixes: vec!["drafts/".into()],
+        };
+        let mut conn = open(dir.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &rules).unwrap();
+        assert!(recall(&conn, "hyllvar", 5).unwrap().is_empty(), "secrets stay out, always");
+        assert!(recall(&conn, "nogrant", 5).unwrap().is_empty(), "configured exclusion applies");
+        assert_eq!(recall(&conn, "kavender", 5).unwrap().len(), 1);
+    }
+
+    fn cite_id(ring: u8, text: &str) -> String {
+        cite_from_hash(ring, &content_hash(text))
     }
 
     #[test]
@@ -1413,7 +1842,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path(), None).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(report.docs, 3);
         assert!(report.blocks >= 4);
 
@@ -1440,7 +1869,7 @@ mod tests {
         )]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert!(recall(&conn, "hunter2", 5).unwrap().is_empty());
         assert_eq!(recall(&conn, "public", 5).unwrap().len(), 1);
     }
@@ -1453,7 +1882,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path(), None).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(report.docs, 1);
         assert_eq!(report.skipped_high_ring, 1);
         let hits = recall(&conn, "locked decision", 5).unwrap();
@@ -1470,7 +1899,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path(), None).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(report.docs, 1);
         assert!(recall(&conn, "tokens", 5).unwrap().is_empty());
         assert!(recall(&conn, "retired", 5).unwrap().is_empty());
@@ -1490,7 +1919,7 @@ mod tests {
         .unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, brain.path(), Some(native.path())).unwrap();
+        let report = scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
         assert_eq!(report.docs, 3);
         let hits = recall(&conn, "nossd", 5).unwrap();
         assert_eq!(hits.len(), 2);
@@ -1510,10 +1939,10 @@ mod tests {
         std::fs::write(mem.join("MEMORY.md"), "first\n").unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, brain.path(), Some(native.path())).unwrap();
-        assert!(!stale(&conn, brain.path(), Some(native.path())).unwrap());
+        scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
+        assert!(!stale(&conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap());
         std::fs::write(mem.join("MEMORY.md"), "second, and quite a bit longer\n").unwrap();
-        assert!(stale(&conn, brain.path(), Some(native.path())).unwrap());
+        assert!(stale(&conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap());
     }
 
     #[test]
@@ -1522,9 +1951,9 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         let absent = brain.path().join("no-such-dir");
-        let report = scan(&mut conn, brain.path(), Some(&absent)).unwrap();
+        let report = scan(&mut conn, brain.path(), Some(&absent), &RingRules::default()).unwrap();
         assert_eq!(report.docs, 1);
-        assert!(!stale(&conn, brain.path(), Some(&absent)).unwrap());
+        assert!(!stale(&conn, brain.path(), Some(&absent), &RingRules::default()).unwrap());
     }
 
     #[test]
@@ -1535,7 +1964,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path(), None).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(report.skipped_high_ring, 1);
         assert!(recall(&conn, "zweptahl", 5).unwrap().is_empty());
         let hits = recall(&conn, "quorvex", 5).unwrap();
@@ -1552,7 +1981,7 @@ mod tests {
         std::fs::write(mem.join("quarantined.md"), "---\nring: 5\n---\nhidden\n").unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, brain_dir.path(), Some(native.path())).unwrap();
+        let report = scan(&mut conn, brain_dir.path(), Some(native.path()), &RingRules::default()).unwrap();
         let hits = recall(&conn, "invariant", 5).unwrap();
         assert_eq!(hits[0].ring, 2, "promotion clamped to the store's contract ring");
         assert_eq!(report.skipped_high_ring, 1, "demotion to 5+ is honored");
@@ -1566,12 +1995,12 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
-        assert!(!stale(&conn, dir.path(), None).unwrap());
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
         // Editing the SKIPPED file (e.g. removing its ring-5 marker = promotion)
         // must be noticed — the old subset comparison was blind to this.
         std::fs::write(dir.path().join("knowledge/staged.md"), "now public\n").unwrap();
-        assert!(stale(&conn, dir.path(), None).unwrap());
+        assert!(stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
     }
 
     #[test]
@@ -1589,10 +2018,10 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         assert_eq!(generation(&conn), 0, "unscanned index has generation 0");
-        let r1 = scan(&mut conn, dir.path(), None).unwrap();
+        let r1 = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(r1.generation, 1);
         assert_eq!(generation(&conn), 1);
-        let r2 = scan(&mut conn, dir.path(), None).unwrap();
+        let r2 = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(r2.generation, 2, "generation is monotonic per committed scan");
         drop(conn);
         let conn = open(state.path()).unwrap();
@@ -1610,17 +2039,17 @@ mod tests {
         let s2 = tempfile::tempdir().unwrap();
         let mut c1 = open(s1.path()).unwrap();
         let mut c2 = open(s2.path()).unwrap();
-        scan(&mut c1, dir.path(), None).unwrap();
-        scan(&mut c2, dir.path(), None).unwrap();
+        scan(&mut c1, dir.path(), None, &RingRules::default()).unwrap();
+        scan(&mut c2, dir.path(), None, &RingRules::default()).unwrap();
         // Different generations must not leak into the digest.
-        scan(&mut c2, dir.path(), None).unwrap();
+        scan(&mut c2, dir.path(), None, &RingRules::default()).unwrap();
         let k1 = catalog_checksum(&c1).unwrap();
         let k2 = catalog_checksum(&c2).unwrap();
         assert!(!k1.is_empty());
         assert_eq!(k1, k2, "same tree must yield the same catalog checksum");
         // A content change must change the digest.
         std::fs::write(dir.path().join("knowledge/b.md"), "- gamma\n- delta prime\n").unwrap();
-        scan(&mut c1, dir.path(), None).unwrap();
+        scan(&mut c1, dir.path(), None, &RingRules::default()).unwrap();
         assert_ne!(catalog_checksum(&c1).unwrap(), k2);
     }
 
@@ -1629,7 +2058,7 @@ mod tests {
         let dir = brain(&[("knowledge/a.md", "royw fact\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let ro = open_ro(state.path()).unwrap();
         assert_eq!(recall(&ro, "royw", 5).unwrap().len(), 1);
         assert!(
@@ -1671,7 +2100,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let linked = linked_docs(&conn, &["knowledge/zfs.md".to_string()], 8).unwrap();
         let paths: Vec<&str> = linked.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"knowledge/hosts/shares.md"), "outgoing link followed");
@@ -1688,7 +2117,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let linked = linked_docs(&conn, &["knowledge/linker.md".to_string()], 8).unwrap();
         assert!(linked.is_empty(), "ambiguous stem must create no edge");
     }
@@ -1696,12 +2125,16 @@ mod tests {
     #[test]
     fn f32_blob_roundtrip_is_little_endian() {
         let v = vec![0.25f32, -1.5, 3.0];
-        let blob = vec_to_blob(&v);
+        let blob = vec_to_blob(&v, Precision::F32);
         assert_eq!(blob.len(), 12);
         assert_eq!(&blob[0..4], &0.25f32.to_le_bytes());
-        assert_eq!(blob_to_vec(&blob), v);
+        assert_eq!(blob_to_vec(&blob, Precision::F32), v);
         // corrupt trailing partial chunk is dropped, not misread
-        assert_eq!(blob_to_vec(&blob[..10]), vec![0.25f32, -1.5]);
+        assert_eq!(blob_to_vec(&blob[..10], Precision::F32), vec![0.25f32, -1.5]);
+        // f16 is little-endian too, and exact for these values
+        let blob = vec_to_blob(&v, Precision::F16);
+        assert_eq!(blob.len(), 6);
+        assert_eq!(blob_to_vec(&blob, Precision::F16), v);
     }
 
     #[test]
@@ -1741,64 +2174,227 @@ mod tests {
         assert_eq!(fused, vec![4, 9]);
     }
 
+    fn test_spec(dim: usize) -> VectorSpec {
+        VectorSpec { model: "test-model".into(), dim, precision: Precision::F16 }
+    }
+
+    fn embed_everything(conn: &Connection, spec: &VectorSpec, vector: &[f32]) {
+        for (hash, _) in hashes_without_vectors(conn, spec, 1000).unwrap() {
+            insert_vector(conn, &hash, spec, vector).unwrap();
+        }
+    }
+
+    #[test]
+    fn content_hash_is_the_full_digest_the_citation_truncates() {
+        // ONE hashing site: the citation is a prefix of the content address,
+        // so a vector keyed by hash always belongs to the cited block.
+        let h = content_hash("The  Quick   Fox");
+        assert_eq!(h.len(), 64, "full sha256 hex");
+        assert_eq!(h, content_hash("the quick fox"), "same normalization the citation uses");
+        assert_eq!(cite_id(3, "the quick fox"), format!("r3-{}", &h[..10]));
+        assert_eq!(cite_id(1, "the quick fox"), format!("r1-{}", &h[..10]), "ring labels, hash addresses");
+        assert_ne!(h, content_hash("the quick foxes"));
+    }
+
+    #[test]
+    fn f16_conversion_matches_the_ieee_oracle_bit_for_bit() {
+        // Expected bit patterns produced by an INDEPENDENT implementation
+        // (CPython's struct "e" format, IEEE binary16, round-to-nearest-even)
+        // — this is the check that the hand-written narrowing is a real f16
+        // and not merely self-consistent. Subnormals, the rounding floor
+        // (2.98e-8 ties to zero, 5.96e-8 to the smallest subnormal), the
+        // largest finite half, and the awkward decimal fractions are all in.
+        let cases: [(f32, u16); 25] = [
+            (0.0e+00, 0x0000),
+            (-0.0e+00, 0x8000),
+            (1.0e+00, 0x3c00),
+            (-1.0e+00, 0xbc00),
+            (5.0e-01, 0x3800),
+            (-3.125e-02, 0xa800),
+            (1.0e-04, 0x068e),
+            (-1.0e-04, 0x868e),
+            (6.0e-08, 0x0001),
+            (5.9604645e-08, 0x0001),
+            (2.9802322e-08, 0x0000),
+            (9.995117e-01, 0x3bff),
+            (3.3333334e-01, 0x3555),
+            (6.5504e+04, 0x7bff),
+            (-6.5504e+04, 0xfbff),
+            (6.1e-05, 0x03ff),
+            (6.0e-05, 0x03ef),
+            (1.0e-07, 0x0002),
+            (1.0e-01, 0x2e66),
+            (2.0e-01, 0x3266),
+            (7.0710677e-01, 0x39a8),
+            (9.765625e-04, 0x1400),
+            (1.0009766e+00, 0x3c01),
+            (2.4414062e-04, 0x0c00),
+            (1.1e-05, 0x00b9),
+        ];
+        for (value, expected) in cases {
+            let got = f32_to_f16(value);
+            assert_eq!(got, expected, "f32_to_f16({value:e}) = {got:#06x}, expected {expected:#06x}");
+            // And back: widening a half is exact, so the round trip is the
+            // half's own value, sign of zero included.
+            let back = f16_to_f32(got);
+            assert_eq!(
+                back.to_bits(),
+                f16_to_f32(expected).to_bits(),
+                "widening {expected:#06x} disagreed"
+            );
+        }
+        // Values beyond the half range saturate to infinity rather than
+        // wrapping into a finite lie.
+        assert_eq!(f32_to_f16(1e30), 0x7c00);
+        assert_eq!(f32_to_f16(-1e30), 0xfc00);
+        assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
+    }
+
+    #[test]
+    fn f16_blobs_halve_the_bytes_and_round_trip_within_tolerance() {
+        let v: Vec<f32> = (0..8).map(|i| (i as f32 - 3.5) / 16.0).collect();
+        let blob = vec_to_blob(&v, Precision::F16);
+        assert_eq!(blob.len(), v.len() * 2, "half floats, half the bytes");
+        for (a, b) in v.iter().zip(blob_to_vec(&blob, Precision::F16).iter()) {
+            assert!((a - b).abs() < 1e-3, "{a} -> {b}");
+        }
+        // f32 stays available and stays exact.
+        let blob32 = vec_to_blob(&v, Precision::F32);
+        assert_eq!(blob32.len(), v.len() * 4);
+        assert_eq!(blob_to_vec(&blob32, Precision::F32), v);
+        // The values a normalized component actually reaches, plus the edges.
+        for x in [0.0f32, 1.0, -1.0, 0.5, -0.03125, 1e-4, -1e-4, 6e-8] {
+            let back = blob_to_vec(&vec_to_blob(&[x], Precision::F16), Precision::F16)[0];
+            assert!((back - x).abs() <= 1e-3 * x.abs().max(1e-3), "{x} -> {back}");
+        }
+        // What actually matters: the ranking score survives the narrowing.
+        let mut a: Vec<f32> = (0..1024).map(|i| ((i % 17) as f32 - 8.0) / 9.0).collect();
+        let mut b: Vec<f32> = (0..1024).map(|i| ((i % 23) as f32 - 11.0) / 12.0).collect();
+        l2_normalize(&mut a);
+        l2_normalize(&mut b);
+        let exact = dot(&a, &b);
+        let narrowed = dot(
+            &blob_to_vec(&vec_to_blob(&a, Precision::F16), Precision::F16),
+            &blob_to_vec(&vec_to_blob(&b, Precision::F16), Precision::F16),
+        );
+        assert!((exact - narrowed).abs() < 1e-3, "cosine {exact} vs {narrowed}");
+    }
+
+    #[test]
+    fn corrupt_blobs_are_dropped_never_misread() {
+        // A trailing partial component means the blob is not what it claims.
+        assert!(blob_to_vec(&[0u8; 3], Precision::F16).len() == 1);
+        assert!(blob_to_vec(&[0u8; 5], Precision::F32).len() == 1);
+    }
+
     #[test]
     fn insert_normalizes_and_roundtrips_through_db() {
         let dir = brain(&[("knowledge/a.md", "- one\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
-        let missing = blocks_without_vectors(&conn, 10).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
+        let missing = hashes_without_vectors(&conn, &spec, 10).unwrap();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].1, "- one");
-        insert_vector(&conn, missing[0].0, &[3.0, 4.0]).unwrap();
+        assert_eq!(missing[0].0, content_hash("- one"), "the queue is keyed by content address");
+        insert_vector(&conn, &missing[0].0, &spec, &[3.0, 4.0]).unwrap();
         let blob: Vec<u8> = conn
-            .query_row("SELECT embedding FROM vectors WHERE block_id=?1", [missing[0].0], |r| r.get(0))
+            .query_row("SELECT embedding FROM vectors WHERE content_hash=?1", [&missing[0].0], |r| r.get(0))
             .unwrap();
-        let stored = blob_to_vec(&blob);
-        assert!((stored[0] - 0.6).abs() < 1e-6, "normalized at insert");
-        assert!((stored[1] - 0.8).abs() < 1e-6);
-        assert!(blocks_without_vectors(&conn, 10).unwrap().is_empty());
-        assert_eq!(vector_counts(&conn).unwrap(), (1, 1));
+        let stored = blob_to_vec(&blob, Precision::F16);
+        assert!((stored[0] - 0.6).abs() < 1e-3, "normalized at insert");
+        assert!((stored[1] - 0.8).abs() < 1e-3);
+        assert!(hashes_without_vectors(&conn, &spec, 10).unwrap().is_empty());
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (1, 1));
     }
 
     #[test]
-    fn model_change_drops_vectors() {
+    fn a_spec_change_drops_vectors_and_a_repeat_keeps_them() {
         let dir = brain(&[("knowledge/a.md", "- one\n- two\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
-        assert!(!ensure_embed_model(&conn, "nomic-v1").unwrap(), "first model: nothing to drop");
-        assert!(!ensure_embed_dim(&conn, 2).unwrap());
-        for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
-            insert_vector(&conn, id, &[1.0, 0.0]).unwrap();
-        }
-        assert_eq!(vector_counts(&conn).unwrap().0, 2);
-        assert!(!ensure_embed_model(&conn, "nomic-v1").unwrap(), "same model keeps vectors");
-        assert_eq!(vector_counts(&conn).unwrap().0, 2);
-        assert!(ensure_embed_model(&conn, "nomic-v2").unwrap(), "model change drops");
-        assert_eq!(vector_counts(&conn).unwrap().0, 0);
-        assert_eq!(blocks_without_vectors(&conn, 10).unwrap().len(), 2, "rebuild is first-class");
-        // dimension change behaves the same way
-        assert!(!ensure_embed_dim(&conn, 4).unwrap(), "dim was cleared by the model change");
-        for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
-            insert_vector(&conn, id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        }
-        assert!(ensure_embed_dim(&conn, 8).unwrap(), "dim change drops");
-        assert_eq!(vector_counts(&conn).unwrap().0, 0);
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
+        assert!(!ensure_vector_spec(&conn, &spec).unwrap(), "first run: nothing to drop");
+        embed_everything(&conn, &spec, &[1.0, 0.0]);
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (2, 2));
+        assert!(!ensure_vector_spec(&conn, &spec).unwrap(), "same spec keeps vectors");
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (2, 2));
+
+        let other_model = VectorSpec { model: "other".into(), ..spec.clone() };
+        assert!(ensure_vector_spec(&conn, &other_model).unwrap(), "model change drops");
+        assert_eq!(vector_coverage(&conn, &other_model).unwrap(), (0, 2));
+        embed_everything(&conn, &other_model, &[1.0, 0.0]);
+
+        let other_dim = VectorSpec { dim: 4, ..other_model.clone() };
+        assert!(ensure_vector_spec(&conn, &other_dim).unwrap(), "dimension change drops");
+        embed_everything(&conn, &other_dim, &[1.0, 0.0, 0.0, 0.0]);
+
+        let other_precision = VectorSpec { precision: Precision::F32, ..other_dim.clone() };
+        assert!(ensure_vector_spec(&conn, &other_precision).unwrap(), "precision change drops");
+        assert_eq!(vector_coverage(&conn, &other_precision).unwrap(), (0, 2));
+        assert_eq!(stored_vector_spec(&conn), Some(other_precision));
     }
 
     #[test]
-    fn rescan_drops_vectors_because_rowids_are_reused() {
+    fn rescan_preserves_vectors_for_unchanged_blocks() {
+        // THE regression: vectors used to be keyed by a volatile rowid, so
+        // every scan wiped the whole table and any markdown edit destroyed
+        // 100% of the embeddings. Content addressing makes an edit cost
+        // exactly the blocks that changed.
         let dir = brain(&[("knowledge/a.md", "- one\n- two\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
-        for (id, _) in blocks_without_vectors(&conn, 10).unwrap() {
-            insert_vector(&conn, id, &[1.0, 0.0]).unwrap();
-        }
-        assert_eq!(vector_counts(&conn).unwrap().0, 2);
-        scan(&mut conn, dir.path(), None).unwrap();
-        assert_eq!(vector_counts(&conn).unwrap().0, 0, "full rebuild must clear derived vectors");
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
+        ensure_vector_spec(&conn, &spec).unwrap();
+        embed_everything(&conn, &spec, &[1.0, 0.0]);
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (2, 2));
+
+        std::fs::write(dir.path().join("knowledge/a.md"), "- one\n- two\n- three\n").unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(
+            vector_coverage(&conn, &spec).unwrap(),
+            (2, 3),
+            "a full rebuild keeps every unchanged block's vector"
+        );
+        let missing = hashes_without_vectors(&conn, &spec, 10).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].1, "- three", "only the new block is queued");
+
+        // The incremental path must agree — it is the daemon's hot path.
+        embed_everything(&conn, &spec, &[0.0, 1.0]);
+        std::fs::write(dir.path().join("knowledge/a.md"), "- one\n- two\n- three\n- four\n").unwrap();
+        rescan_changed(&mut conn, dir.path(), None, &RingRules::default())
+            .unwrap()
+            .expect("small diff -> incremental");
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (3, 4));
+    }
+
+    #[test]
+    fn an_edited_block_re_enters_the_queue_and_its_stale_vector_is_pruned() {
+        let dir = brain(&[("knowledge/a.md", "- one\n- two\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
+        embed_everything(&conn, &spec, &[1.0, 0.0]);
+        let gone = content_hash("- two");
+
+        std::fs::write(dir.path().join("knowledge/a.md"), "- one\n- two, corrected\n").unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let missing = hashes_without_vectors(&conn, &spec, 10).unwrap();
+        assert_eq!(missing.len(), 1, "the edited block is queued again");
+        assert_eq!(missing[0].1, "- two, corrected");
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (1, 2));
+        let rows: i64 = conn.query_row("SELECT count(*) FROM vectors", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "the vector of a hash no longer present is pruned");
+        assert!(
+            conn.query_row("SELECT 1 FROM vectors WHERE content_hash=?1", [&gone], |r| r.get::<_, i64>(0))
+                .is_err(),
+            "the superseded vector is gone, not orphaned"
+        );
     }
 
     #[test]
@@ -1810,28 +2406,29 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
         let assign = |text_frag: &str, v: &[f32]| {
-            let id: i64 = conn
+            let hash: String = conn
                 .query_row(
-                    "SELECT id FROM blocks WHERE text LIKE '%' || ?1 || '%'",
+                    "SELECT hash FROM blocks WHERE text LIKE '%' || ?1 || '%'",
                     [text_frag],
                     |r| r.get(0),
                 )
                 .unwrap();
-            insert_vector(&conn, id, v).unwrap();
+            insert_vector(&conn, &hash, &spec, v).unwrap();
         };
         assign("pools", &[1.0, 0.0]);
         assign("stalwart", &[0.0, 1.0]);
         let mut q = vec![0.9f32, 0.1];
         l2_normalize(&mut q);
-        let hits = semantic_recall(&conn, &q, 10).unwrap();
+        let hits = semantic_recall(&conn, &spec, &q, 10, &[]).unwrap();
         assert_eq!(hits.len(), 2, "unembedded block cannot appear");
         assert!(hits[0].path.ends_with("zfs.md"), "closest vector first");
         assert!(hits[1].path.ends_with("mail.md"));
         assert!(hits[0].cite.starts_with("r3-"), "hits carry the normal citation shape");
         // limit applies
-        assert_eq!(semantic_recall(&conn, &q, 1).unwrap().len(), 1);
+        assert_eq!(semantic_recall(&conn, &spec, &q, 1, &[]).unwrap().len(), 1);
     }
 
     #[test]
@@ -1845,14 +2442,15 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
-        let mut stmt = conn.prepare("SELECT id FROM blocks ORDER BY id").unwrap();
-        let ids: Vec<i64> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
+        let mut stmt = conn.prepare("SELECT hash FROM blocks ORDER BY id").unwrap();
+        let hashes: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect();
         drop(stmt);
-        insert_vector(&conn, ids[0], &[1.0, 0.0]).unwrap(); // a.md: far from query
-        insert_vector(&conn, ids[1], &[0.0, 1.0]).unwrap(); // b.md: close to query
+        insert_vector(&conn, &hashes[0], &spec, &[1.0, 0.0]).unwrap(); // a.md: far from query
+        insert_vector(&conn, &hashes[1], &spec, &[0.0, 1.0]).unwrap(); // b.md: close to query
         let q = vec![0.0f32, 1.0];
-        let hits = hybrid_recall(&conn, "zfs", &q, 10, 2.0).unwrap();
+        let hits = hybrid_recall(&conn, &spec, "zfs", &q, 10, 2.0, &[]).unwrap();
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert!(paths.contains(&"knowledge/a.md"), "lexical-only hit present");
         assert!(paths.contains(&"knowledge/b.md"), "semantic-only hit present");
@@ -1877,7 +2475,7 @@ mod tests {
             .unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, brain.path(), Some(native.path())).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
         let hits = recall(&conn, "nossd", 5).unwrap();
         assert_eq!(hits.len(), 1, "one logical block, one hit");
         assert_eq!(hits[0].ring, 1, "the lowest-ring copy survives");
@@ -1946,7 +2544,7 @@ mod tests {
         std::fs::write(mem.join("MEMORY.md"), "- flumox\n").unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, brain.path(), Some(native.path())).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
         let hits = recall(&conn, "flumox", 2).unwrap();
         assert_eq!(hits.len(), 2, "suppression must not shrink the result count");
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
@@ -1964,7 +2562,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "shared statement", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].ring, 1);
@@ -1986,7 +2584,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let report = scan(&mut conn, dir.path(), None).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(report.skipped_high_ring, 2);
         assert_eq!(
             report.skipped,
@@ -2070,7 +2668,7 @@ mod tests {
         )]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "flurbium", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].snippet, "[ProjectX > Setup] Install the flurbium package.");
@@ -2088,7 +2686,7 @@ mod tests {
         )]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "serverx", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].snippet, "[Hosts > | Name | IP |] | serverx | 192.0.2.1 |");
@@ -2109,7 +2707,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "glorpnik", 10).unwrap();
         let ctx_only = hits
             .iter()
@@ -2135,7 +2733,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "restart", 5).unwrap();
         assert_eq!(hits.len(), 2, "different sections = different statements");
         assert!(hits.iter().all(|h| h.mirrors.is_empty()));
@@ -2156,7 +2754,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let linked = linked_docs(&conn, &["knowledge/linker.md".to_string()], 8).unwrap();
         let paths: Vec<&str> = linked.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"knowledge/a/readme2.md"), "parent/stem suffix resolves: {paths:?}");
@@ -2176,7 +2774,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "fenwick", 5).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].ring, 1, "top slot reserved for the ring 0-1 band");
@@ -2192,7 +2790,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "zelkova", 5).unwrap();
         assert_eq!(hits[0].ring, 3, "prior breaks the tie toward the lower ring");
         assert_eq!(hits[1].ring, 4);
@@ -2205,7 +2803,7 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let hits = recall(&conn, "korvat", 5).unwrap();
         assert_eq!(hits[0].ring, 4, "a strong lexical win is never overridden by the prior");
     }
@@ -2219,27 +2817,26 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        let r1 = scan(&mut conn, dir.path(), None).unwrap();
+        let r1 = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(r1.generation, 1);
-        // Vectors on every block: unchanged docs must keep theirs.
-        for (id, _) in blocks_without_vectors(&conn, 100).unwrap() {
-            insert_vector(&conn, id, &[1.0, 0.0]).unwrap();
-        }
-        let vectors_before = vector_counts(&conn).unwrap().0;
+        // Vectors on every block: unchanged CONTENT must keep theirs.
+        let spec = test_spec(2);
+        embed_everything(&conn, &spec, &[1.0, 0.0]);
+        let vectors_before = vector_coverage(&conn, &spec).unwrap().0;
 
         // Change one file, add one (with a wikilink), delete one.
         std::fs::write(dir.path().join("knowledge/b.md"), "- keep this\n- brand new fact\n").unwrap();
         std::fs::write(dir.path().join("knowledge/d.md"), "arrived later, see [[a]]\n").unwrap();
         std::fs::remove_file(dir.path().join("knowledge/c.md")).unwrap();
 
-        let r2 = rescan_changed(&mut conn, dir.path(), None).unwrap().expect("small diff → incremental");
+        let r2 = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().expect("small diff → incremental");
         assert_eq!(r2.generation, 2, "incremental commit advances the generation");
-        assert!(!stale(&conn, dir.path(), None).unwrap());
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
 
         // Byte-identical catalog vs an independent fresh derivation.
         let state2 = tempfile::tempdir().unwrap();
         let mut fresh = open(state2.path()).unwrap();
-        scan(&mut fresh, dir.path(), None).unwrap();
+        scan(&mut fresh, dir.path(), None, &RingRules::default()).unwrap();
         assert_eq!(
             catalog_checksum(&conn).unwrap(),
             catalog_checksum(&fresh).unwrap(),
@@ -2257,14 +2854,19 @@ mod tests {
         let linked = linked_docs(&conn, &["knowledge/d.md".to_string()], 8).unwrap();
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].0, "knowledge/a.md");
-        // Unchanged docs kept their vectors; changed/removed lost theirs.
-        let (vectors_after, _) = vector_counts(&conn).unwrap();
+        // Unchanged BLOCKS kept their vectors — including the untouched line
+        // of the doc that changed. Only genuinely new text needs embedding.
+        let (vectors_after, blocks_after) = vector_coverage(&conn, &spec).unwrap();
         let a_blocks = 3; // heading + 2 table rows
-        assert_eq!(vectors_after, a_blocks, "only the untouched doc's vectors survive");
-        assert!(vectors_before > vectors_after);
+        assert_eq!(vectors_after, a_blocks + 1, "a.md's blocks plus b.md's kept line");
+        assert_eq!(blocks_after, a_blocks + 3, "b.md's two lines and d.md's one");
+        assert_eq!(vectors_before, a_blocks + 2, "c.md's block was embedded too, then pruned");
+        let queued: Vec<String> =
+            hashes_without_vectors(&conn, &spec, 10).unwrap().into_iter().map(|(_, t)| t).collect();
+        assert_eq!(queued, vec!["- brand new fact", "arrived later, see [[a]]"]);
 
         // A no-op rescan commits nothing and keeps the generation.
-        let r3 = rescan_changed(&mut conn, dir.path(), None).unwrap().unwrap();
+        let r3 = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().unwrap();
         assert_eq!(r3.generation, 2, "fingerprint already current → no new commit");
         assert_eq!(generation(&conn), 2);
     }
@@ -2275,17 +2877,17 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
         // Never scanned: no basis.
-        assert!(rescan_changed(&mut conn, dir.path(), None).unwrap().is_none());
-        scan(&mut conn, dir.path(), None).unwrap();
+        assert!(rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().is_none());
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         // Different brain root: no basis.
         let other = brain(&[("knowledge/a.md", "alpha\n")]);
-        assert!(rescan_changed(&mut conn, other.path(), None).unwrap().is_none());
+        assert!(rescan_changed(&mut conn, other.path(), None, &RingRules::default()).unwrap().is_none());
         // A diff beyond the incremental cap falls back to the full scan.
         for i in 0..40 {
             std::fs::write(dir.path().join(format!("knowledge/bulk{i}.md")), "bulk\n").unwrap();
         }
-        assert!(rescan_changed(&mut conn, dir.path(), None).unwrap().is_none());
-        assert!(stale(&conn, dir.path(), None).unwrap(), "fallback leaves the full scan to do it");
+        assert!(rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().is_none());
+        assert!(stale(&conn, dir.path(), None, &RingRules::default()).unwrap(), "fallback leaves the full scan to do it");
     }
 
     #[test]
@@ -2296,23 +2898,23 @@ mod tests {
         ]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         assert!(recall(&conn, "zulqar", 5).unwrap().is_empty());
 
         // Promotion: the ring-5 marker is removed.
         std::fs::write(dir.path().join("knowledge/staged.md"), "promoted zulqar\n").unwrap();
         // Demotion: a public file becomes staged.
         std::fs::write(dir.path().join("knowledge/normal.md"), "---\nring: 5\n---\npublic wembly fact\n").unwrap();
-        let r = rescan_changed(&mut conn, dir.path(), None).unwrap().expect("incremental");
+        let r = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().expect("incremental");
         assert_eq!(r.skipped_high_ring, 1);
         assert_eq!(recall(&conn, "zulqar", 5).unwrap().len(), 1, "promoted file is indexed");
         assert!(recall(&conn, "wembly", 5).unwrap().is_empty(), "demoted file left the index");
-        assert!(!stale(&conn, dir.path(), None).unwrap(), "skipped-file stats are tracked too");
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap(), "skipped-file stats are tracked too");
         // The tracked skipped file changing again is still an incremental step.
         std::fs::write(dir.path().join("knowledge/normal.md"), "---\nring: 5\n---\nstill hidden, edited\n").unwrap();
-        let r = rescan_changed(&mut conn, dir.path(), None).unwrap().expect("incremental");
+        let r = rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().expect("incremental");
         assert_eq!(r.skipped_high_ring, 1);
-        assert!(!stale(&conn, dir.path(), None).unwrap());
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
     }
 
     #[test]
@@ -2320,12 +2922,12 @@ mod tests {
         let dir = brain(&[("knowledge/a.md", "alpha\n")]);
         let state = tempfile::tempdir().unwrap();
         let mut conn = open(state.path()).unwrap();
-        scan(&mut conn, dir.path(), None).unwrap();
-        assert!(!stale(&conn, dir.path(), None).unwrap());
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
         std::fs::write(dir.path().join("knowledge/a.md"), "alpha beta, much longer now\n").unwrap();
-        assert!(stale(&conn, dir.path(), None).unwrap());
-        scan(&mut conn, dir.path(), None).unwrap();
-        assert!(!stale(&conn, dir.path(), None).unwrap());
+        assert!(stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert!(!stale(&conn, dir.path(), None, &RingRules::default()).unwrap());
         assert_eq!(recall(&conn, "beta", 5).unwrap().len(), 1);
     }
 }

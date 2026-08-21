@@ -7,15 +7,310 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResidentEntry {
-    pub path: PathBuf,
-    /// Privilege ring of the file's statements (0 = invariants, 1 = policy).
-    /// Only rings 0-1 are resident; anything else is refused at load time.
+/// The outermost legal ring. 0-6 is the whole trust scale; a rule naming
+/// anything beyond it is a typo, not a policy, and is refused at load.
+pub const MAX_RING: u8 = 6;
+
+/// Ring a path gets when NO rule matches it. It is the curated-knowledge
+/// ring: an unclassified brain file is knowledge, never policy and never
+/// quarantine. A list that wants a different answer says so with a catch-all
+/// rule (empty prefix) of its own.
+pub const UNMATCHED_RING: u8 = 3;
+
+/// Path prefixes that can never be indexed, whatever the config says:
+/// credentials, session exhaust, and git internals. This is the boundary the
+/// whole trust model rests on, so it is compiled in rather than configured —
+/// `exclude_prefixes` can only ADD to it.
+const HARD_EXCLUDE_PREFIXES: &[&str] = &["mind/secrets/", "logs/"];
+
+/// One entry of the path -> ring taxonomy.
+///
+/// Matching is deliberately ORDERED and first-match-wins rather than
+/// longest-prefix: the file reads top to bottom in the order it fires, so a
+/// specific rule is simply placed above a general one and no one has to
+/// count characters to predict the outcome.
+///
+/// A prefix ending in `/` matches the whole subtree. A prefix without a
+/// trailing slash matches that exact path only, so `AGENT.md` never captures
+/// `AGENT.md.bak`. The empty prefix matches everything — that is how a list
+/// declares its own catch-all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RingRule {
+    pub prefix: String,
     pub ring: u8,
 }
 
-/// Ring-6 exhaust capture (PostToolUse/Stop -> exhaust.db).
+impl RingRule {
+    fn matches(&self, rel: &str) -> bool {
+        if self.prefix.is_empty() {
+            true
+        } else if self.prefix.ends_with('/') {
+            rel.starts_with(&self.prefix)
+        } else {
+            rel == self.prefix
+        }
+    }
+}
+
+/// The complete path taxonomy one scan works from: the ordered ring rules and
+/// the operator's own exclusions. Everything that needs to know "what ring is
+/// this path, and may it be indexed at all" takes one of these, so the
+/// mapping exists in exactly one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingRules {
+    pub rules: Vec<RingRule>,
+    pub exclude_prefixes: Vec<String>,
+}
+
+impl Default for RingRules {
+    fn default() -> Self {
+        RingRules {
+            rules: default_ring_rules(),
+            exclude_prefixes: default_exclude_prefixes(),
+        }
+    }
+}
+
+/// The name of the slice every document falls into when no configured slice
+/// claims it. Reserved: a configured slice may not take it, because then a
+/// path would have two truthful answers to "which slice is this?".
+pub const ROOT_SLICE: &str = "root";
+
+/// A named set of brain-relative prefixes.
+///
+/// Slices are the unit of composition and sharing: any set of markdown files,
+/// nestable, down to a single file. Nesting is IMPLICIT — a slice whose
+/// prefixes all sit under another's is inside it — so there is no parent
+/// field to keep in step with the paths.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SliceRule {
+    pub name: String,
+    pub prefixes: Vec<String>,
+}
+
+impl SliceRule {
+    /// The longest prefix of this slice that claims `rel`, if any. Length is
+    /// how "innermost" is decided, so it is returned rather than a bool.
+    fn claim(&self, rel: &str) -> Option<usize> {
+        self.prefixes
+            .iter()
+            .filter(|p| under_prefix(rel, p))
+            .map(|p| p.trim_end_matches('/').len())
+            .max()
+    }
+
+}
+
+/// The configured slices, validated once so every later lookup is total.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Slices {
+    rules: Vec<SliceRule>,
+}
+
+impl Slices {
+    /// Rejects the shapes that would make a later answer ambiguous rather
+    /// than carrying them into the index.
+    pub fn new(rules: Vec<SliceRule>) -> anyhow::Result<Slices> {
+        let mut seen = std::collections::HashSet::new();
+        for r in &rules {
+            let name = r.name.trim();
+            anyhow::ensure!(!name.is_empty(), "a slice must have a name");
+            anyhow::ensure!(
+                name != ROOT_SLICE,
+                "slice name {ROOT_SLICE:?} is reserved for documents no slice claims"
+            );
+            anyhow::ensure!(seen.insert(name.to_string()), "two slices are both named {name:?}");
+            anyhow::ensure!(!r.prefixes.is_empty(), "slice {name:?} claims no prefixes");
+            for p in &r.prefixes {
+                anyhow::ensure!(
+                    !p.trim().trim_end_matches('/').is_empty(),
+                    "slice {name:?} has an empty prefix, which would claim the whole tree"
+                );
+            }
+        }
+        Ok(Slices { rules })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.rules.iter().map(|r| r.name.as_str())
+    }
+
+    /// The INNERMOST slice claiming `rel`: the longest matching prefix wins,
+    /// and configuration order breaks a tie so the answer never depends on
+    /// iteration luck.
+    pub fn slice_for(&self, rel: &str) -> &str {
+        self.rules
+            .iter()
+            .filter_map(|r| r.claim(rel).map(|len| (len, r)))
+            // `reduce` keeping the incumbent on a tie, NOT `max_by_key`:
+            // max_by_key returns the LAST maximum, which would hand an
+            // equal-depth tie to the last declaration instead of the first
+            // and make the answer depend on where a slice was appended.
+            .reduce(|best, next| if next.0 > best.0 { next } else { best })
+            .map(|(_, r)| r.name.as_str())
+            .unwrap_or(ROOT_SLICE)
+    }
+
+    /// The path prefixes a query for `name` should match.
+    ///
+    /// `None` means "no filter": the root slice is the whole tree. A nested
+    /// slice's prefixes sit under its parent's by construction, so filtering
+    /// on the named slice's own prefixes already includes everything nested
+    /// inside it — there is no ancestry to walk. An unknown name yields an
+    /// empty set, so a typo returns nothing rather than everything.
+    pub fn prefixes_of(&self, name: &str) -> Option<&[String]> {
+        if name == ROOT_SLICE {
+            return None;
+        }
+        Some(
+            self.rules
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| r.prefixes.as_slice())
+                .unwrap_or(&[]),
+        )
+    }
+}
+
+/// True when `rel` is `prefix` itself or anything beneath it. Written against
+/// path components, not raw strings, so `drafts` never swallows `draftsman`;
+/// a trailing slash on the prefix is accepted and meaningless.
+fn under_prefix(rel: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return false; // an empty exclusion would exclude the world by accident
+    }
+    rel == prefix || rel.strip_prefix(prefix).is_some_and(|r| r.starts_with('/'))
+}
+
+/// Git internals ANYWHERE in the tree — a brain may hold repo clones, each
+/// with its own `.git`.
+fn in_git_dir(rel: &str) -> bool {
+    rel == ".git" || rel.starts_with(".git/") || rel.ends_with("/.git") || rel.contains("/.git/")
+}
+
+impl RingRules {
+    /// Ring for a brain-root-relative path: the first matching rule, else
+    /// [`UNMATCHED_RING`]. Pure — no filesystem, no frontmatter (a `ring: N`
+    /// key in the file overrides this afterwards, at scan time).
+    pub fn ring_for(&self, rel: &str) -> u8 {
+        self.rules.iter().find(|r| r.matches(rel)).map(|r| r.ring).unwrap_or(UNMATCHED_RING)
+    }
+
+    /// Whether a path must never enter any index or capture record. The hard
+    /// boundary first, the operator's own exclusions after it.
+    pub fn excluded(&self, rel: &str) -> bool {
+        let rel = rel.trim_end_matches('/');
+        in_git_dir(rel)
+            || HARD_EXCLUDE_PREFIXES.iter().any(|p| under_prefix(rel, p))
+            || self.exclude_prefixes.iter().any(|p| under_prefix(rel, p))
+    }
+
+    /// Directory form: true when nothing under `rel` can ever be indexed, so
+    /// a watcher can skip the whole subtree. It is the SAME predicate as
+    /// [`RingRules::excluded`] — the two used to be hand-maintained copies of
+    /// one list, which is exactly how a watcher drifts from its indexer.
+    pub fn excluded_dir(&self, rel: &str) -> bool {
+        self.excluded(rel)
+    }
+}
+
+/// The shipped taxonomy. Opinionated (it describes a conventional agent brain
+/// tree) but not baked in: replacing `ring_rules` in the config replaces it
+/// whole.
+fn default_ring_rules() -> Vec<RingRule> {
+    vec![
+        // The tree's own entry points: what every agent reads first.
+        RingRule { prefix: "AGENT.md".into(), ring: 1 },
+        RingRule { prefix: "README.md".into(), ring: 1 },
+        // Exactly the memory index — a topic file named e.g. OLD-MEMORY.md
+        // must not inherit ring 1 by suffix accident.
+        RingRule { prefix: "mind/memories/MEMORY.md".into(), ring: 1 },
+        // Distilled behavioral memories.
+        RingRule { prefix: "mind/memories/".into(), ring: 2 },
+        // Working state: queues and task notes.
+        RingRule { prefix: "todo/".into(), ring: 4 },
+        // Ring-5 staging candidates. The LOCATION decides, so a candidate
+        // whose frontmatter is stripped or hand-mangled is still never
+        // recallable — this exclusion cannot be edited away file by file.
+        RingRule { prefix: "staging/".into(), ring: 5 },
+        // Everything else is curated knowledge; see UNMATCHED_RING.
+    ]
+}
+
+/// Shipped exclusions ON TOP of the hard boundary: repo clones belong to the
+/// code index, and the archive is retired knowledge nobody should recall by
+/// accident. Both are conventions, so both are configurable.
+fn default_exclude_prefixes() -> Vec<String> {
+    vec!["projects/".into(), "knowledge/archive/".into()]
+}
+
+/// Where a resident entry may be injected. An entry with no scope at all is
+/// injected everywhere — which is what every config written before scopes
+/// existed keeps meaning.
+///
+/// `hosts` and `repos` are ORed: an entry listing both lands on any listed
+/// host AND in any listed repo, rather than only where the two coincide.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scope {
+    /// Machine names this entry belongs to.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Working-directory names (the repo, as the agent sees it) this entry
+    /// belongs to.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// Inject regardless of host and repo — an explicit "everywhere" that
+    /// survives someone later adding one host to the list.
+    #[serde(default)]
+    pub always: bool,
+}
+
+impl Scope {
+    /// No condition named at all.
+    pub fn is_unscoped(&self) -> bool {
+        self.hosts.is_empty() && self.repos.is_empty()
+    }
+
+    /// Whether this entry belongs in a session on `host`, working in `repo`.
+    pub fn matches(&self, host: &str, repo: Option<&str>) -> bool {
+        if self.always || self.is_unscoped() {
+            return true;
+        }
+        if self.hosts.iter().any(|h| host_matches(host, h)) {
+            return true;
+        }
+        repo.is_some_and(|r| self.repos.iter().any(|want| want == r))
+    }
+}
+
+/// A `hosts` entry matches the machine's node name exactly, or its first
+/// dot-label — so `build-box` still matches a `build-box.example.net` that
+/// reports its FQDN.
+fn host_matches(host: &str, want: &str) -> bool {
+    host == want || host.split('.').next() == Some(want)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResidentEntry {
+    pub path: PathBuf,
+    /// Privilege ring of the file's statements (0 = invariants, 1 = policy,
+    /// 2 = distilled behavior). Rings 0-1 may be injected everywhere; ring 2
+    /// only under a scope, because behavior memories are SELECTIVE by
+    /// definition — injecting the lot of them unconditionally is the
+    /// "resident set" this design replaced. Rings 3+ are recall-only and are
+    /// refused at load time.
+    pub ring: u8,
+    /// When this entry reaches a session. Absent = every session.
+    #[serde(default)]
+    pub scope: Scope,
+}
+
+/// Ring-6 exhaust capture (PostToolUse/Stop -> the tree's exhaust stream).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureConfig {
     /// On by default: exhaust is the raw material every later promotion is
@@ -32,6 +327,48 @@ impl Default for CaptureConfig {
 
 fn default_capture_enabled() -> bool {
     true
+}
+
+/// Stored width of one vector component. f16 halves the artifact (and the
+/// bytes every host has to move) at a cosine error far below the ranking's
+/// resolution — normalized components live in [-1, 1], where f16 keeps ~3
+/// decimal digits. f32 stays available for anyone who wants the exact
+/// endpoint output back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Precision {
+    #[default]
+    F16,
+    F32,
+}
+
+impl Precision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Precision::F16 => "f16",
+            Precision::F32 => "f32",
+        }
+    }
+
+    /// Bytes one component occupies on disk — the record stride of every
+    /// vector artifact.
+    pub fn width(self) -> usize {
+        match self {
+            Precision::F16 => 2,
+            Precision::F32 => 4,
+        }
+    }
+}
+
+/// The identity of a vector artifact: `(model, dim, precision)`. Every vector
+/// in the store and in the local cache belongs to exactly one of these, and a
+/// query only ever scores vectors of ITS spec — mixing models, widths or
+/// dimensions produces numbers that look like similarity and are not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorSpec {
+    pub model: String,
+    pub dim: usize,
+    pub precision: Precision,
 }
 
 /// Embeddings backend: any OpenAI-compatible `/embeddings` endpoint (a
@@ -62,6 +399,95 @@ pub struct EmbeddingsConfig {
     /// per batched item (see embed::batch_timeout).
     #[serde(default = "default_embed_timeout_secs")]
     pub timeout_secs: u64,
+    /// Vector width to ask the endpoint for and to store. Modern embedders
+    /// are Matryoshka-trained: the request carries `dimensions`, and a model
+    /// that ignores it gets truncated client-side and re-normalized. 1024 is
+    /// the default because a 4096-dim vector over this corpus is 8-16x
+    /// oversized — it dominated the index file and measurably slowed the
+    /// scan without buying ranking quality.
+    #[serde(default = "default_embed_dimensions")]
+    pub dimensions: usize,
+    /// Text prepended to a QUERY before embedding it, and to nothing else.
+    ///
+    /// Modern retrieval embedders are asymmetric: they are trained with an
+    /// instruction on the query side and raw text on the document side, and
+    /// they lose accuracy when both are embedded the same way. The exact
+    /// wording is the model's, so it is configuration rather than a constant
+    /// — E5 wants `"query: "`, Qwen3 wants an `Instruct:`/`Query:` pair.
+    ///
+    /// Measured on this corpus with qwen3-embed-8b, the documented Instruct
+    /// wording widened the margin between a relevant block and a distractor
+    /// from +0.082 to +0.128 cosine.
+    ///
+    /// There is deliberately NO document-side prefix. A query prefix changes
+    /// only this query; a document prefix would change every stored vector,
+    /// so it would have to become part of the artifact identity or two hosts
+    /// configured differently would write incompatible vectors into the same
+    /// shared file. That is a bigger change than a string.
+    #[serde(default)]
+    pub query_prefix: String,
+    /// Stored component width (see [`Precision`]).
+    #[serde(default)]
+    pub precision: Precision,
+}
+
+impl EmbeddingsConfig {
+    /// The artifact identity this configuration asks for.
+    pub fn spec(&self) -> VectorSpec {
+        VectorSpec {
+            model: self.model.clone(),
+            dim: self.dimensions,
+            precision: self.precision,
+        }
+    }
+}
+
+/// Cross-encoder reranking of an already-retrieved candidate list.
+///
+/// Retrieval (BM25, vectors, their fusion) scores a query against a document
+/// it has never seen beside it. A cross-encoder reads the two TOGETHER and is
+/// far better at it — but it costs a forward pass per candidate, so it can
+/// only ever run over a shortlist, never over the corpus. That is exactly the
+/// shape here: recall proposes, rerank reorders.
+///
+/// Off by default. It is a second endpoint and a second dependency, and the
+/// lexical answer must never require one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RerankConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL; `/rerank` is appended. Same SSRF guard as embeddings.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub model: String,
+    /// Exact hostnames/IPs exempted from the private-range refusal.
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+    /// NAME of the environment variable holding the API key, never the key.
+    #[serde(default)]
+    pub api_key_env: String,
+    #[serde(default = "default_rerank_timeout_secs")]
+    pub timeout_secs: u64,
+    /// How many top hits are sent to the cross-encoder. Everything past this
+    /// keeps its retrieval order and follows the reranked head, so raising it
+    /// buys quality at a linear cost in endpoint work.
+    #[serde(default = "default_rerank_candidates")]
+    pub candidates: usize,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        RerankConfig {
+            enabled: false,
+            endpoint: String::new(),
+            model: String::new(),
+            allow_hosts: Vec::new(),
+            api_key_env: String::new(),
+            timeout_secs: default_rerank_timeout_secs(),
+            candidates: default_rerank_candidates(),
+        }
+    }
 }
 
 impl Default for EmbeddingsConfig {
@@ -73,12 +499,27 @@ impl Default for EmbeddingsConfig {
             allow_hosts: Vec::new(),
             api_key_env: String::new(),
             timeout_secs: default_embed_timeout_secs(),
+            dimensions: default_embed_dimensions(),
+            query_prefix: String::new(),
+            precision: Precision::default(),
         }
     }
 }
 
 fn default_embed_timeout_secs() -> u64 {
     10
+}
+
+fn default_embed_dimensions() -> usize {
+    1024
+}
+
+fn default_rerank_timeout_secs() -> u64 {
+    20
+}
+
+fn default_rerank_candidates() -> usize {
+    40
 }
 
 /// The governance loop: Stop-side reminder producers plus instruction-decay
@@ -137,7 +578,8 @@ fn default_rrf_k() -> f64 {
 pub struct ServeConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// TCP listen address (e.g. "0.0.0.0:9737"). Absent = unix socket only.
+    /// TCP listen address (e.g. "0.0.0.0:9737"). Absent = the local control
+    /// channel only (see `crate::ipc`).
     #[serde(default)]
     pub bind: Option<String>,
     /// Host id stamped on every response. Defaults to the machine hostname.
@@ -182,14 +624,26 @@ pub struct Config {
     /// Hard cap on the injected digest, in characters.
     #[serde(default = "default_budget_chars")]
     pub budget_chars: usize,
-    /// Sessions kept in the injection ledger (writer-side retention).
-    #[serde(default = "default_ledger_max_sessions")]
-    pub ledger_max_sessions: usize,
+    /// Writer-side byte cap on THIS host's exhaust stream before it rotates
+    /// (`<brain_root>/logs/cfetch/exhaust-<host>.jsonl`). Two rotated
+    /// generations are kept, so the footprint per host is at most 3x this.
+    #[serde(default = "default_exhaust_max_bytes")]
+    pub exhaust_max_bytes: u64,
+    /// Same, for this host's ledger stream.
+    #[serde(default = "default_ledger_max_bytes")]
+    pub ledger_max_bytes: u64,
     /// Ring-6 exhaust capture.
     #[serde(default)]
     pub capture: CaptureConfig,
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub rerank: RerankConfig,
+    /// Named prefix sets, the unit of composition and sharing. Empty (the
+    /// default) means one implicit slice covering everything, which is
+    /// exactly today's behavior.
+    #[serde(default)]
+    pub slices: Vec<SliceRule>,
     #[serde(default)]
     pub recall: RecallConfig,
     /// Governance loop (reminder queue + cadence rule refresh).
@@ -201,30 +655,55 @@ pub struct Config {
     /// Client routing (none-tier host querying a serving host).
     #[serde(default)]
     pub client: ClientConfig,
+    /// The path -> ring taxonomy, in order; the FIRST matching rule wins.
+    /// Replacing this list replaces the shipped one whole.
+    #[serde(default = "default_ring_rules")]
+    pub ring_rules: Vec<RingRule>,
+    /// Extra path prefixes to keep out of the index, ON TOP of the hard
+    /// boundary (secrets, logs, `.git`), which no config can lift.
+    #[serde(default = "default_exclude_prefixes")]
+    pub exclude_prefixes: Vec<String>,
 }
 
 fn default_budget_chars() -> usize {
     6000
 }
 
-fn default_ledger_max_sessions() -> usize {
-    200
+/// 32 MiB of ring-6 exhaust per host before rotation — months of capture at
+/// typical line sizes, and small next to any brain tree.
+fn default_exhaust_max_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+
+/// The ledger books a few lines per turn, so a quarter of the exhaust cap
+/// covers far more history than the audit window ever asks for.
+fn default_ledger_max_bytes() -> u64 {
+    8 * 1024 * 1024
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             brain_root: paths::default_brain_root(),
-            resident: vec![ResidentEntry { path: PathBuf::from("AGENT.md"), ring: 1 }],
+            resident: vec![ResidentEntry {
+                path: PathBuf::from("AGENT.md"),
+                ring: 1,
+                scope: Scope::default(),
+            }],
             code_roots: Vec::new(),
             budget_chars: default_budget_chars(),
-            ledger_max_sessions: default_ledger_max_sessions(),
+            exhaust_max_bytes: default_exhaust_max_bytes(),
+            ledger_max_bytes: default_ledger_max_bytes(),
             capture: CaptureConfig::default(),
             embeddings: EmbeddingsConfig::default(),
+            rerank: RerankConfig::default(),
+            slices: Vec::new(),
             recall: RecallConfig::default(),
             governance: GovernanceConfig::default(),
             serve: ServeConfig::default(),
             client: ClientConfig::default(),
+            ring_rules: default_ring_rules(),
+            exclude_prefixes: default_exclude_prefixes(),
         }
     }
 }
@@ -251,12 +730,19 @@ impl Config {
         let cfg: Config = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
         for r in &cfg.resident {
-            if r.ring > 1 {
-                anyhow::bail!(
-                    "resident entry {} has ring {}; only rings 0-1 may be resident",
-                    r.path.display(),
-                    r.ring
-                );
+            match r.ring {
+                0 | 1 => {}
+                // Ring 2 is injectable, but only as policy: a scope, and not
+                // an `always` that would smuggle back the unconditional set.
+                2 if !r.scope.is_unscoped() && !r.scope.always => {}
+                2 => anyhow::bail!(
+                    "resident entry {} is ring 2: behavior memories are injected selectively —                      give it a scope (hosts/repos), or leave it to recall",
+                    r.path.display()
+                ),
+                n => anyhow::bail!(
+                    "resident entry {} has ring {n}; rings 0-1 may be resident anywhere, ring 2                      only under a scope, rings 3+ never",
+                    r.path.display()
+                ),
             }
         }
         if cfg.serve.enabled && cfg.client.serving.is_some() {
@@ -265,6 +751,15 @@ impl Config {
                  index, a none-tier client must open none"
             );
         }
+        for r in &cfg.ring_rules {
+            if r.ring > MAX_RING {
+                anyhow::bail!(
+                    "ring rule {:?} names ring {}; rings run 0-{MAX_RING}",
+                    r.prefix,
+                    r.ring
+                );
+            }
+        }
         if cfg.serve.bind.is_some() && cfg.serve.token_file.is_none() {
             anyhow::bail!(
                 "serve.bind requires serve.token_file: the TCP listener is bearer-token gated, \
@@ -272,6 +767,20 @@ impl Config {
             );
         }
         Ok(cfg)
+    }
+
+    /// The taxonomy this config describes, as one value to hand the indexer.
+    pub fn rings(&self) -> RingRules {
+        RingRules {
+            rules: self.ring_rules.clone(),
+            exclude_prefixes: self.exclude_prefixes.clone(),
+        }
+    }
+
+    /// The validated slice model. An invalid one is an error at the point of
+    /// use rather than a silently ignored config block.
+    pub fn slice_model(&self) -> anyhow::Result<Slices> {
+        Slices::new(self.slices.clone())
     }
 
     pub fn resolve(&self, p: &std::path::Path) -> PathBuf {
@@ -309,11 +818,59 @@ mod tests {
     }
 
     #[test]
-    fn resident_ring_above_one_is_refused() {
+    fn resident_ring_above_two_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.json");
         std::fs::write(&p, r#"{"resident": [{"path": "x.md", "ring": 3}]}"#).unwrap();
         assert!(Config::load_from(&p).is_err());
+        std::fs::write(&p, r#"{"resident": [{"path": "x.md", "ring": 5}]}"#).unwrap();
+        assert!(Config::load_from(&p).is_err());
+    }
+
+    #[test]
+    fn ring_two_is_resident_only_under_a_scope() {
+        // The selective-injection contract, enforced at load: a behavior
+        // memory reaches the sessions it is FOR, or it stays in recall.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+
+        std::fs::write(
+            &p,
+            r#"{"resident": [{"path": "b.md", "ring": 2, "scope": {"repos": ["widget"]}}]}"#,
+        )
+        .unwrap();
+        assert!(Config::load_from(&p).is_ok(), "a scoped ring-2 entry is the point");
+
+        std::fs::write(&p, r#"{"resident": [{"path": "b.md", "ring": 2}]}"#).unwrap();
+        let err = Config::load_from(&p).unwrap_err().to_string();
+        assert!(err.contains("selectively"), "the message must say why: {err}");
+
+        std::fs::write(
+            &p,
+            r#"{"resident": [{"path": "b.md", "ring": 2, "scope": {"always": true}}]}"#,
+        )
+        .unwrap();
+        assert!(
+            Config::load_from(&p).is_err(),
+            "`always` must not smuggle an unconditional ring-2 set back in"
+        );
+    }
+
+    #[test]
+    fn stream_caps_default_and_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
+        assert_eq!(cfg.exhaust_max_bytes, 32 * 1024 * 1024);
+        assert_eq!(cfg.ledger_max_bytes, 8 * 1024 * 1024);
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"exhaust_max_bytes": 1048576}"#).unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert_eq!(cfg.exhaust_max_bytes, 1048576);
+        assert_eq!(cfg.ledger_max_bytes, 8 * 1024 * 1024, "a partial file keeps the other default");
+        // A config written for the SQLite era still loads: the retired
+        // ledger_max_sessions key is simply ignored.
+        std::fs::write(&p, r#"{"ledger_max_sessions": 200, "resident": []}"#).unwrap();
+        assert!(Config::load_from(&p).is_ok());
     }
 
     #[test]
@@ -356,6 +913,44 @@ mod tests {
         // partial block keeps the timeout default
         std::fs::write(&p, r#"{"embeddings": {"enabled": true}}"#).unwrap();
         assert_eq!(Config::load_from(&p).unwrap().embeddings.timeout_secs, 10);
+    }
+
+    #[test]
+    fn embeddings_dimensions_and_precision_defaults_and_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from(&dir.path().join("absent.json")).unwrap();
+        assert_eq!(cfg.embeddings.dimensions, 1024, "default width: 1024, not the model native size");
+        assert_eq!(cfg.embeddings.precision, Precision::F16, "default: half floats");
+        assert_eq!(EmbeddingsConfig::default().dimensions, 1024, "Default impl must agree with serde");
+        assert_eq!(EmbeddingsConfig::default().precision, Precision::F16);
+
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"embeddings": {"dimensions": 512, "precision": "f32"}}"#).unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert_eq!(cfg.embeddings.dimensions, 512);
+        assert_eq!(cfg.embeddings.precision, Precision::F32);
+
+        // An unknown width is a typo, not a policy: refused at load.
+        std::fs::write(&p, r#"{"embeddings": {"precision": "bfloat16"}}"#).unwrap();
+        assert!(Config::load_from(&p).is_err(), "unknown precision must be loud");
+    }
+
+    #[test]
+    fn vector_spec_carries_model_dim_and_precision() {
+        let spec = EmbeddingsConfig {
+            model: "nomic".into(),
+            dimensions: 256,
+            precision: Precision::F32,
+            ..EmbeddingsConfig::default()
+        }
+        .spec();
+        assert_eq!(spec.model, "nomic");
+        assert_eq!(spec.dim, 256);
+        assert_eq!(spec.precision, Precision::F32);
+        assert_eq!(Precision::F16.width(), 2);
+        assert_eq!(Precision::F32.width(), 4);
+        assert_eq!(Precision::F16.as_str(), "f16");
+        assert_eq!(Precision::F32.as_str(), "f32");
     }
 
     #[test]
@@ -463,10 +1058,250 @@ mod tests {
     }
 
     #[test]
+    fn shipped_ring_rules_reproduce_the_historical_mapping() {
+        // Regression lock: the shipped default must assign exactly what the
+        // hardcoded taxonomy assigned before it became configuration.
+        let r = RingRules::default();
+        assert_eq!(r.ring_for("AGENT.md"), 1);
+        assert_eq!(r.ring_for("README.md"), 1);
+        assert_eq!(r.ring_for("mind/memories/MEMORY.md"), 1);
+        assert_eq!(r.ring_for("mind/memories/feedback_x.md"), 2);
+        assert_eq!(r.ring_for("todo/active/task/STATUS.md"), 4);
+        assert_eq!(r.ring_for("knowledge/hosts/example/storage.md"), 3);
+        // A non-slash prefix is an EXACT path, never a string prefix.
+        assert_eq!(r.ring_for("AGENT.md.bak"), 3);
+        assert_eq!(r.ring_for("docs/AGENT.md"), 3);
+    }
+
+    #[test]
+    fn first_matching_rule_wins_in_list_order() {
+        let rules = RingRules {
+            rules: vec![
+                RingRule { prefix: "notes/pinned/".into(), ring: 1 },
+                RingRule { prefix: "notes/".into(), ring: 4 },
+                RingRule { prefix: String::new(), ring: 2 },
+            ],
+            exclude_prefixes: Vec::new(),
+        };
+        assert_eq!(rules.ring_for("notes/pinned/a.md"), 1, "the specific rule stands first");
+        assert_eq!(rules.ring_for("notes/b.md"), 4);
+        assert_eq!(rules.ring_for("anything/else.md"), 2, "empty prefix is the catch-all");
+    }
+
+    #[test]
+    fn unmatched_paths_land_on_the_documented_fallback_ring() {
+        let rules = RingRules { rules: Vec::new(), exclude_prefixes: Vec::new() };
+        assert_eq!(rules.ring_for("whatever.md"), UNMATCHED_RING);
+        assert_eq!(UNMATCHED_RING, 3);
+    }
+
+    #[test]
+    fn custom_ring_rules_remap_a_fabricated_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"ring_rules": [
+                 {"prefix": "laws.md", "ring": 0},
+                 {"prefix": "handbook/", "ring": 1},
+                 {"prefix": "scratch/", "ring": 5},
+                 {"prefix": "", "ring": 4}
+               ]}"#,
+        )
+        .unwrap();
+        let r = Config::load_from(&p).unwrap().rings();
+        assert_eq!(r.ring_for("laws.md"), 0);
+        assert_eq!(r.ring_for("handbook/style.md"), 1);
+        assert_eq!(r.ring_for("scratch/dump.md"), 5);
+        assert_eq!(r.ring_for("anything.md"), 4);
+        // The shipped tree names carry no special meaning any more.
+        assert_eq!(r.ring_for("AGENT.md"), 4);
+        assert_eq!(r.ring_for("todo/x.md"), 4);
+    }
+
+    #[test]
+    fn ring_above_six_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"ring_rules": [{"prefix": "x/", "ring": 7}]}"#).unwrap();
+        let err = Config::load_from(&p).unwrap_err().to_string();
+        assert!(err.contains("ring 7"), "the message must name the bad ring: {err}");
+        std::fs::write(&p, r#"{"ring_rules": [{"prefix": "x/", "ring": 6}]}"#).unwrap();
+        assert!(Config::load_from(&p).is_ok(), "6 is the outermost legal ring");
+    }
+
+    #[test]
+    fn hard_exclusions_survive_an_override_attempt() {
+        // An operator may ADD exclusions; the credential/exhaust/git boundary
+        // is not theirs to remove.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"exclude_prefixes": [], "ring_rules": [
+                 {"prefix": "mind/secrets/", "ring": 0},
+                 {"prefix": "logs/", "ring": 0},
+                 {"prefix": ".git/", "ring": 0}
+               ]}"#,
+        )
+        .unwrap();
+        let r = Config::load_from(&p).unwrap().rings();
+        assert!(r.excluded("mind/secrets/tokens.yml"));
+        assert!(r.excluded("logs/session.log"));
+        assert!(r.excluded(".git/config"));
+        assert!(r.excluded("nested/repo/.git/config"), "a nested .git is git internals too");
+        assert!(r.excluded_dir("mind/secrets"));
+        assert!(r.excluded_dir("logs"));
+        // What IS configurable actually became configurable.
+        assert!(!r.excluded("projects/repo/notes.md"), "an emptied list stops excluding projects/");
+        assert!(!r.excluded("knowledge/archive/old.md"));
+    }
+
+    #[test]
+    fn shipped_exclusions_keep_projects_and_archive_out() {
+        let r = RingRules::default();
+        assert!(r.excluded("projects/repo/README.md"));
+        assert!(r.excluded("knowledge/archive/old.md"));
+        assert!(r.excluded_dir("projects"));
+        assert!(r.excluded_dir("knowledge/archive"));
+        assert!(!r.excluded("knowledge/live.md"));
+        assert!(!r.excluded(".gitignore"), "a dotfile is not the .git directory");
+    }
+
+    #[test]
+    fn operator_exclusions_add_to_the_hard_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"exclude_prefixes": ["drafts"]}"#).unwrap();
+        let r = Config::load_from(&p).unwrap().rings();
+        assert!(r.excluded("drafts/x.md"), "a slashless prefix still means the subtree");
+        assert!(r.excluded_dir("drafts"));
+        assert!(!r.excluded("draftsman.md"), "prefix matching stops at the path separator");
+        assert!(r.excluded("mind/secrets/x.yml"), "hard exclusions never depend on the list");
+    }
+
+    #[test]
+    fn scope_defaults_to_everywhere_and_matches_host_or_repo() {
+        let unscoped = Scope::default();
+        assert!(unscoped.matches("any-host", Some("any-repo")));
+        assert!(unscoped.matches("any-host", None));
+
+        let by_host = Scope { hosts: vec!["build-box".into()], ..Scope::default() };
+        assert!(by_host.matches("build-box", None));
+        assert!(by_host.matches("build-box.example.net", None), "the first label matches too");
+        assert!(!by_host.matches("laptop", Some("build-box")), "a host rule is not a repo rule");
+
+        let by_repo = Scope { repos: vec!["widget".into()], ..Scope::default() };
+        assert!(by_repo.matches("laptop", Some("widget")));
+        assert!(!by_repo.matches("laptop", Some("gadget")));
+        assert!(!by_repo.matches("laptop", None), "no cwd, no repo match");
+
+        let both = Scope { hosts: vec!["build-box".into()], repos: vec!["widget".into()], always: false };
+        assert!(both.matches("build-box", Some("gadget")), "hosts and repos are ORed");
+        assert!(both.matches("laptop", Some("widget")));
+        assert!(!both.matches("laptop", Some("gadget")));
+
+        let always = Scope { hosts: vec!["build-box".into()], repos: Vec::new(), always: true };
+        assert!(always.matches("laptop", None), "always wins over a narrower list");
+    }
+
+    #[test]
+    fn resident_entry_scope_parses_and_defaults_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"resident": [
+                 {"path": "a.md", "ring": 1},
+                 {"path": "b.md", "ring": 1, "scope": {"repos": ["widget"]}},
+                 {"path": "c.md", "ring": 0, "scope": {"hosts": ["build-box"], "always": true}}
+               ]}"#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert!(cfg.resident[0].scope.matches("any", None), "absent scope = everywhere");
+        assert_eq!(cfg.resident[1].scope.repos, vec!["widget".to_string()]);
+        assert!(cfg.resident[2].scope.always);
+    }
+
+    #[test]
     fn corrupt_config_is_an_error_not_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.json");
         std::fs::write(&p, "{ nope").unwrap();
         assert!(Config::load_from(&p).is_err());
+    }
+
+    // ---- slices
+
+    fn slice(name: &str, prefixes: &[&str]) -> SliceRule {
+        SliceRule {
+            name: name.into(),
+            prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_document_resolves_to_its_innermost_slice() {
+        let m = Slices::new(vec![
+            slice("work", &["knowledge"]),
+            slice("hosts", &["knowledge/hosts"]),
+        ])
+        .unwrap();
+        // Longest matching prefix wins, whatever order they are declared in.
+        assert_eq!(m.slice_for("knowledge/hosts/server/zfs.md"), "hosts");
+        assert_eq!(m.slice_for("knowledge/world/cloudflare.md"), "work");
+        assert_eq!(m.slice_for("mind/memories/x.md"), ROOT_SLICE);
+    }
+
+    #[test]
+    fn a_prefix_matches_path_components_never_substrings() {
+        let m = Slices::new(vec![slice("d", &["drafts"])]).unwrap();
+        assert_eq!(m.slice_for("drafts/a.md"), "d");
+        assert_eq!(m.slice_for("drafts"), "d");
+        assert_eq!(m.slice_for("draftsman/a.md"), ROOT_SLICE, "no substring claims");
+    }
+
+    #[test]
+    fn equal_length_claims_are_broken_by_configuration_order() {
+        // Two slices claiming the same depth must not depend on iteration
+        // luck: the earlier declaration wins, every time.
+        let m = Slices::new(vec![slice("first", &["a/b"]), slice("second", &["a/b"])]).unwrap();
+        assert_eq!(m.slice_for("a/b/c.md"), "first");
+    }
+
+    #[test]
+    fn a_query_for_a_slice_matches_everything_nested_inside_it() {
+        // `hosts` sits under `work`, so restricting to `work` must still
+        // reach it — that is the whole matryoshka.
+        let m = Slices::new(vec![
+            slice("work", &["knowledge"]),
+            slice("hosts", &["knowledge/hosts"]),
+        ])
+        .unwrap();
+        assert_eq!(m.prefixes_of("work"), Some(["knowledge".to_string()].as_slice()));
+        assert_eq!(m.prefixes_of(ROOT_SLICE), None, "the root slice restricts nothing");
+        assert_eq!(m.prefixes_of("typo"), Some([].as_slice()), "an unknown name matches nothing");
+    }
+
+    #[test]
+    fn ambiguous_or_world_claiming_slice_configurations_are_refused() {
+        assert!(Slices::new(vec![slice("", &["a"])]).is_err(), "unnamed");
+        assert!(Slices::new(vec![slice(ROOT_SLICE, &["a"])]).is_err(), "reserved name");
+        assert!(
+            Slices::new(vec![slice("x", &["a"]), slice("x", &["b"])]).is_err(),
+            "two slices with one name have no innermost answer"
+        );
+        assert!(Slices::new(vec![slice("x", &[])]).is_err(), "claims nothing");
+        assert!(Slices::new(vec![slice("x", &[""])]).is_err(), "an empty prefix claims the tree");
+        assert!(Slices::new(vec![slice("x", &["/"])]).is_err());
+    }
+
+    #[test]
+    fn no_slices_configured_is_one_implicit_slice() {
+        let m = Slices::new(Vec::new()).unwrap();
+        assert!(m.is_empty());
+        assert_eq!(m.slice_for("anything/at/all.md"), ROOT_SLICE);
+        assert_eq!(m.prefixes_of(ROOT_SLICE), None);
     }
 }

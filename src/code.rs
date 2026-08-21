@@ -201,7 +201,11 @@ enum WalkMsg {
 /// The normalized file-name stem and full path of a code file — the
 /// SQL-side match keys `find` filters on.
 fn norm_keys(path: &str) -> (String, String) {
-    let base = path.rsplit('/').next().unwrap_or(path);
+    // The argument is an ABSOLUTE operating-system path, so the basename must
+    // be taken with the platform's separator rules: `rsplit('/')` hands back
+    // the whole of `C:\repo\src\main.rs`, which would make every file-name
+    // key on Windows a full path and `find <name>` match nothing.
+    let base = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path);
     let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
     (norm_ident(stem), norm_ident(path))
 }
@@ -453,6 +457,34 @@ pub fn find(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<
 mod tests {
     use super::*;
 
+    /// Platform-agnostic path-suffix assertion: the code index stores
+    /// OS-NATIVE absolute paths (a Windows user wants `C:\repo\src\x.rs`,
+    /// not a unixism), so a test may not compare against a `/`-joined
+    /// literal — it would pass on unix and fail on Windows for a correct
+    /// index. Compare component-wise instead.
+    fn ends_with_path(haystack: &str, suffix: &str) -> bool {
+        let h: Vec<_> = std::path::Path::new(haystack).components().collect();
+        let s: Vec<_> = std::path::Path::new(suffix).components().collect();
+        h.len() >= s.len() && h[h.len() - s.len()..] == s[..]
+    }
+
+    #[test]
+    fn file_name_keys_are_taken_with_the_platform_separator() {
+        // A code root is walked as absolute OS paths. On unix the two forms
+        // agree; on Windows only `Path::file_name` finds the basename.
+        let (stem, full) = norm_keys("/repo/src/main.rs");
+        assert_eq!(stem, "main");
+        assert_eq!(full, norm_ident("/repo/src/main.rs"));
+        assert_eq!(
+            Path::new(r"C:\repo\src\main.rs")
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|b| b.rsplit_once('.').map_or(b, |(s, _)| s)),
+            if cfg!(windows) { Some("main") } else { Some(r"C:\repo\src\main") },
+            "the platform decides what a backslash means"
+        );
+    }
+
     #[test]
     fn rust_symbols_have_exact_tree_ranges() {
         let src = "pub fn alpha() {\n    let x = 1;\n}\n\nstruct Beta {\n    field: u8,\n}\n";
@@ -571,7 +603,7 @@ mod tests {
         // Path substring (directory name, not the stem): 10.
         let hits = find(&conn, "velmurano", 10).unwrap();
         let file_hit = hits.iter().find(|h| h.name.is_none()).expect("file hit listed");
-        assert!(file_hit.path.ends_with("velmurano/inner.rs"));
+        assert!(ends_with_path(&file_hit.path, "velmurano/inner.rs"));
         assert_eq!(file_hit.score, 10);
         // No match at all returns nothing (SQL-side filtering).
         assert!(find(&conn, "zzznothing", 10).unwrap().is_empty());
@@ -598,7 +630,7 @@ mod tests {
         assert_eq!((r1.files, r1.symbols), (60, 120));
         let hits = find(&conn, "sym_3_7", 5).unwrap();
         assert_eq!(hits[0].score, 100);
-        assert!(hits[0].path.ends_with("mod3/nested/file7.rs"));
+        assert!(ends_with_path(&hits[0].path, "mod3/nested/file7.rs"));
         // Unchanged rescan parses nothing; counts stay stable.
         let r2 = scan_code(&mut conn, &[dir.path().to_path_buf()]).unwrap();
         assert_eq!((r2.files, r2.symbols), (60, 0));

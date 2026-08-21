@@ -12,15 +12,24 @@ mod hook_io;
 mod hooks;
 mod index;
 mod install;
+mod ipc;
+mod jsonl;
 mod ledger;
 mod lockfile;
 mod markers;
 mod mcp;
+mod migrate;
 mod paths;
+mod pipeline;
+mod rerank;
 mod resident;
 mod serve;
 mod session_state;
+#[cfg(test)]
+mod testhttp;
+mod staging;
 mod transcript;
+mod vectors;
 
 use clap::{Parser, Subcommand};
 
@@ -74,7 +83,7 @@ enum Command {
         #[arg(long)]
         focus: Option<String>,
         /// Token budget the rendered map must fit
-        #[arg(long, default_value_t = 1500)]
+        #[arg(long, default_value_t = graph::DEFAULT_MAP_BUDGET_TOKENS)]
         budget_tokens: u64,
     },
     /// Search the brain (rings 0-4), BM25-ranked, with ring-prefixed citations
@@ -93,12 +102,21 @@ enum Command {
         /// Fuse BM25 and semantic rankings via reciprocal rank fusion
         #[arg(long)]
         hybrid: bool,
+        /// Restrict to one slice and everything nested inside it
+        #[arg(long)]
+        slice: Option<String>,
         #[arg(long, default_value_t = 8)]
         limit: usize,
         #[arg(long)]
         json: bool,
     },
-    /// Review ring-5 staging: auto-flagged exhaust (local only, never injected)
+    /// List the configured slices with what each one holds
+    Slices {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Review ring-5 staging: auto-flagged exhaust in the tree, shared across
+    /// hosts, never injected
     Staging {
         #[command(subcommand)]
         action: StagingAction,
@@ -133,9 +151,9 @@ enum StagingAction {
         json: bool,
     },
     /// Mark a candidate consumed (a distillation session has taken it)
-    Consume { id: i64 },
-    /// Drop a candidate from staging without consuming it
-    Dismiss { id: i64 },
+    Consume { id: String },
+    /// Move a candidate out of staging without promoting it
+    Dismiss { id: String },
 }
 
 #[derive(Subcommand)]
@@ -172,7 +190,8 @@ fn selfcheck() -> anyhow::Result<()> {
             println!("FAIL  brain root missing: {}", cfg.brain_root.display());
             hard_failures += 1;
         }
-        let digest = resident::build(cfg);
+        let scope = resident::SessionScope::current();
+        let digest = resident::build(cfg, &scope);
         if digest.text.is_empty() {
             println!("warn  resident digest is empty — nothing will be injected");
         } else {
@@ -185,6 +204,17 @@ fn selfcheck() -> anyhow::Result<()> {
                 println!("        {label}: {chars} chars");
             }
         }
+        if !digest.skipped_by_scope.is_empty() {
+            println!(
+                "ok    {} resident entr(ies) out of scope for host {}{}",
+                digest.skipped_by_scope.len(),
+                scope.host,
+                scope.repo.as_deref().map(|r| format!(" / repo {r}")).unwrap_or_default(),
+            );
+            for label in &digest.skipped_by_scope {
+                println!("        {label}: not injected here");
+            }
+        }
     }
 
     let state = paths::state_dir();
@@ -194,6 +224,30 @@ fn selfcheck() -> anyhow::Result<()> {
             println!("FAIL  state dir {}: {e}", state.display());
             hard_failures += 1;
         }
+    }
+
+    if let Some(cfg) = &cfg {
+        // Rings 5 and 6 are records in the TREE, not per-host state. Report
+        // where they are without creating them: a diagnostic must not be the
+        // thing that first writes into the brain.
+        let logs = paths::logs_dir(&cfg.brain_root);
+        let staging = paths::staging_dir(&cfg.brain_root);
+        let host = paths::host_id();
+        println!(
+            "ok    ring-6 exhaust + ledger: {} (this host writes as {host})",
+            logs.display()
+        );
+        println!(
+            "ok    ring-5 staging: {} ({} candidate(s) pending, all hosts)",
+            staging.display(),
+            staging::pending_count(&staging)
+        );
+        for note in ledger::read(&logs).unreadable {
+            println!("warn  ledger stream unreadable: {note}");
+        }
+    }
+    if let Some(note) = migrate::legacy_note(&state) {
+        println!("warn  {note}");
     }
 
     match daemon::call("ping", std::time::Duration::from_millis(300)) {
@@ -213,7 +267,7 @@ fn selfcheck() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                println!("ok    serving on the unix socket only (no serve.bind)");
+                println!("ok    serving on the local control channel only (no serve.bind)");
             }
         }
         if let Some(cs) = &cfg.client.serving {
@@ -268,7 +322,7 @@ fn scan(background: bool) -> anyhow::Result<()> {
     {
         let mut conn = index::open(&paths::state_dir())?;
         let native = paths::native_projects_root();
-        let report = index::scan(&mut conn, &cfg.brain_root, Some(&native))?;
+        let report = index::scan(&mut conn, &cfg.brain_root, Some(&native), &cfg.rings())?;
         println!(
             "indexed {} docs, {} blocks (generation {}, {} file(s) skipped as ring 5+)",
             report.docs, report.blocks, report.generation, report.skipped_high_ring
@@ -395,14 +449,19 @@ fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
-    let cfg = config::Config::load()?;
-    none_tier_guard(&cfg, "map")?;
-    let conn = index::open(&paths::state_dir())?;
-    let m = graph::map(&conn, &cfg.effective_code_roots(), focus, budget_tokens)?;
+/// Renders one repo map, whoever computed it. The serving host and the
+/// none-tier client print the SAME lines — only the coherence footer differs.
+/// `served_by` is the serving host's address when the map came over the wire:
+/// an empty remote index is not something the local host can fix by scanning.
+fn print_map(m: &serve::WireMap, focus: Option<&str>, served_by: Option<&str>) {
     if m.lines.is_empty() {
-        println!("code index is empty — run `cfetch scan` first");
-        return Ok(());
+        match served_by {
+            Some(addr) => println!(
+                "the code index on serving host {addr} is empty — scanning happens there, on the storage host"
+            ),
+            None => println!("code index is empty — run `cfetch scan` first"),
+        }
+        return;
     }
     if focus.is_some() && !m.focus_matched {
         eprintln!("note: --focus matched no path or symbol — showing the unpersonalized map");
@@ -413,6 +472,28 @@ fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
     if m.lines.len() < m.total_files {
         println!("… {} more file(s) beyond the token budget", m.total_files - m.lines.len());
     }
+}
+
+fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    // None-tier: the serving host's code index answers, exactly as for find.
+    // (scan and embed-index stay local — they write.)
+    if let Some(cs) = &cfg.client.serving {
+        let body = serde_json::json!({
+            "op": "map", "focus": focus, "budget_tokens": budget_tokens,
+        });
+        let resp = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
+        let m = resp
+            .map
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("serving host {} returned no map", cs.addr))?;
+        print_map(m, focus, Some(&cs.addr));
+        print_served_by(&resp);
+        return Ok(());
+    }
+    let conn = index::open(&paths::state_dir())?;
+    let m = graph::map(&conn, &cfg.effective_code_roots(), focus, budget_tokens)?;
+    print_map(&m.into(), focus, None);
     Ok(())
 }
 
@@ -471,6 +552,12 @@ fn recall_served(resp: &daemon::Response, id: Option<&str>, json: bool) -> anyho
         return Ok(());
     }
     let hits = resp.hits.clone().unwrap_or_default();
+    // The serving host's degradation is the caller's to see: it ranked on our
+    // behalf against endpoints we cannot reach, so if it fell back we would
+    // otherwise never know.
+    if let Some(note) = &resp.note {
+        eprintln!("cfetch recall: {note}");
+    }
     if json {
         let arr: Vec<_> = hits
             .iter()
@@ -486,7 +573,7 @@ fn recall_served(resp: &daemon::Response, id: Option<&str>, json: bool) -> anyho
             "{}",
             serde_json::json!({
                 "hits": arr, "origin": resp.origin, "generation": resp.generation,
-                "fresh": resp.fresh, "stale_note": resp.stale_note,
+                "fresh": resp.fresh, "stale_note": resp.stale_note, "note": resp.note,
             })
         );
     } else if hits.is_empty() {
@@ -511,15 +598,10 @@ fn recall_remote(
     expand: bool,
     semantic: bool,
     hybrid: bool,
+    slice: Option<&str>,
     limit: usize,
     json: bool,
 ) -> anyhow::Result<()> {
-    if semantic || hybrid {
-        anyhow::bail!(
-            "--semantic/--hybrid are not yet available over remote serving (host {})",
-            cs.addr
-        );
-    }
     if expand {
         eprintln!("note: --expand (linked docs) is not yet available over remote serving — showing hits only");
     }
@@ -529,7 +611,13 @@ fn recall_remote(
             if query.trim().is_empty() {
                 anyhow::bail!("empty query (pass search terms or --id <citation>)");
             }
-            serde_json::json!({"op": "recall", "query": query, "limit": limit})
+            // The serving host ranks: it holds the vectors and it is the one
+            // with an endpoint to embed the query against. A client that
+            // holds nothing is exactly who this is for.
+            serde_json::json!({
+                "op": "recall", "query": query, "limit": limit,
+                "semantic": semantic, "hybrid": hybrid, "slice": slice,
+            })
         }
     };
     let resp = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
@@ -543,12 +631,13 @@ fn recall(
     expand: bool,
     semantic: bool,
     hybrid: bool,
+    slice: Option<&str>,
     limit: usize,
     json: bool,
 ) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     if let Some(cs) = &cfg.client.serving {
-        return recall_remote(cs, query, id, expand, semantic, hybrid, limit, json);
+        return recall_remote(cs, query, id, expand, semantic, hybrid, slice, limit, json);
     }
     // On a serving host, plain recall/expand go through the local daemon's
     // drain barrier when it answers. The direct path below is an equally
@@ -571,7 +660,7 @@ fn recall(
         return recall_served(&resp, id, json);
     }
     let native = paths::native_projects_root();
-    let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native))?;
+    let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native), &cfg.rings())?;
 
     if let Some(cite) = id {
         let blocks = index::expand(&conn, cite)?;
@@ -598,11 +687,16 @@ fn recall(
     if query.trim().is_empty() {
         anyhow::bail!("empty query (pass search terms or --id <citation>)");
     }
-    let hits = if semantic || hybrid {
-        embed::semantic_hits(&cfg, &conn, query, limit, hybrid)?
-    } else {
-        index::recall(&conn, query, limit)?
-    };
+    // Semantic/hybrid answers carry their own degradation note: partial or
+    // absent vector coverage is reported, never hidden behind a result that
+    // silently fell back to lexical ranking.
+    // One ranking pipeline, shared with the serving daemon: the same query
+    // against the same tree must rank the same way whoever answers it.
+    let ranked = pipeline::ranked(&cfg, &conn, query, limit, semantic, hybrid, slice)?;
+    let (hits, note) = (ranked.hits, ranked.note);
+    if let Some(note) = &note {
+        eprintln!("cfetch recall: {note}");
+    }
     let linked = if expand && !hits.is_empty() {
         let top: Vec<String> = hits.iter().take(3).map(|h| h.path.clone()).collect();
         index::linked_docs(&conn, &top, 8)?
@@ -624,7 +718,12 @@ fn recall(
             .iter()
             .map(|(p, r)| serde_json::json!({"path": p, "ring": r}))
             .collect();
-        println!("{}", serde_json::json!({"hits": arr, "linked": links}));
+        // The note rides in the JSON too: an agent parsing stdout must see
+        // the degradation its human would have read on stderr.
+        println!(
+            "{}",
+            serde_json::json!({"hits": arr, "linked": links, "note": note})
+        );
     } else if hits.is_empty() {
         println!("no hits for \"{query}\"");
     } else {
@@ -646,48 +745,72 @@ fn recall(
     Ok(())
 }
 
-/// Ring-5 staging review. Read side only: flagging happens in the Stop hook's
-/// traps. Nothing here is ever injected into a session or synced off-host.
-fn staging(action: StagingAction) -> anyhow::Result<()> {
-    let conn = exhaust::open(&paths::state_dir())?;
+/// Ring-5 staging review over the shared tree. Flagging happens in the Stop
+/// hook's traps; this is the human side of the ladder. Candidates from EVERY
+/// host are listed, because the staging directory is one directory.
+fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let ex = exhaust::Exhaust::from_config(&cfg);
+    let state_dir = paths::state_dir();
+    // A legacy per-host exhaust.db is imported once, and said out loud.
+    if let Some(r) = migrate::import_legacy_exhaust(&state_dir, &ex)? {
+        println!(
+            "imported {} event(s) and {} ring-5 candidate(s) from {} into the tree",
+            r.events,
+            r.staged,
+            r.db.display()
+        );
+    }
+    let dir = ex.staging_dir.clone();
     match action {
         StagingAction::List { json } => {
-            let rows = exhaust::staging_list(&conn)?;
+            let rows = staging::list(&dir);
             if json {
                 let arr: Vec<_> = rows
                     .iter()
-                    .map(|r| {
-                        let payload: serde_json::Value = serde_json::from_str(&r.payload)
-                            .unwrap_or_else(|_| serde_json::Value::String(r.payload.clone()));
+                    .map(|c| {
                         serde_json::json!({
-                            "id": r.id, "reason": r.reason, "kind": r.kind,
-                            "session_id": r.session_id, "ts": r.ts, "payload": payload,
+                            "id": c.id, "reason": c.reason, "kind": c.kind,
+                            "session_id": c.session, "host": c.host, "ts": c.ts,
+                            "payload": c.payload,
                         })
                     })
                     .collect();
                 println!("{}", serde_json::json!(arr));
             } else if rows.is_empty() {
                 println!("staging is empty — no flagged exhaust awaiting review");
+                println!("  ({})", dir.display());
             } else {
-                for r in &rows {
-                    let session = r.session_id.get(..8).unwrap_or(&r.session_id);
-                    println!("#{}  {}  {}  session {}  {}", r.id, r.reason, r.kind, session, r.payload);
+                for c in &rows {
+                    let session = c.session.get(..8).unwrap_or(&c.session);
+                    println!(
+                        "{}  {}  {}  {}  session {}  {}",
+                        c.id, c.reason, c.kind, c.host, session, c.payload
+                    );
                 }
                 println!("\ndistill a candidate, then: cfetch staging consume <id> | dismiss <id>");
             }
         }
         StagingAction::Consume { id } => {
-            if exhaust::consume(&conn, id)? {
-                println!("consumed #{id}");
+            if staging::consume(&dir, &id)? {
+                // The file is gone, so the stream is what remembers the
+                // decision and keeps the trap from re-staging it.
+                let _ = ex.record_decision(&id, "consume");
+                println!("consumed {id}");
             } else {
-                anyhow::bail!("no staged candidate #{id} (never flagged, or already consumed/dismissed)");
+                anyhow::bail!(
+                    "no staged candidate {id} (never flagged, or already consumed/dismissed)"
+                );
             }
         }
         StagingAction::Dismiss { id } => {
-            if exhaust::dismiss(&conn, id)? {
-                println!("dismissed #{id}");
+            if staging::dismiss(&dir, &id)? {
+                let _ = ex.record_decision(&id, "dismiss");
+                println!("dismissed {id} (kept in {}/dismissed)", dir.display());
             } else {
-                anyhow::bail!("no staged candidate #{id} (never flagged, or already consumed/dismissed)");
+                anyhow::bail!(
+                    "no staged candidate {id} (never flagged, or already consumed/dismissed)"
+                );
             }
         }
     }
@@ -700,7 +823,8 @@ fn audit_cmd(json: bool) -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let report = audit::build(&audit::AuditPaths::defaults(), cfg.budget_chars, now);
+    let ledger = ledger::load_from(&paths::logs_dir(&cfg.brain_root));
+    let report = audit::build(&audit::AuditPaths::defaults(), &ledger, cfg.budget_chars, now);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -711,11 +835,22 @@ fn audit_cmd(json: bool) -> anyhow::Result<()> {
 
 fn status() -> anyhow::Result<()> {
     daemon::status()?;
-    let quarantines = ledger::quarantine_count(&paths::state_dir());
-    if quarantines > 0 {
-        println!("ledger: {quarantines} quarantined corrupt file(s) — torn writes occurred (ledger.json.corrupt-*)");
+    // Diagnostics must survive a broken config: the paths below fall back to
+    // the defaults rather than making `status` the second casualty.
+    let cfg = match config::Config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            println!("config: {e} — showing the default locations below");
+            config::Config::default()
+        }
+    };
+    let logs = paths::logs_dir(&cfg.brain_root);
+    let loaded = ledger::read(&logs);
+    for note in &loaded.unreadable {
+        println!("ledger: UNREADABLE stream {note}");
     }
-    let ledger = ledger::load();
+    let hosts: Vec<String> = loaded.hosts.iter().cloned().collect();
+    let ledger = loaded.ledger;
     let sessions = ledger.sessions.len();
     let injected: u64 = ledger
         .sessions
@@ -723,7 +858,12 @@ fn status() -> anyhow::Result<()> {
         .flat_map(|s| s.by_source.values())
         .map(|t| t.tokens_estimated)
         .sum();
-    println!("ledger: {sessions} session(s)");
+    println!(
+        "ledger: {sessions} session(s) from {} host(s){} in {}",
+        hosts.len(),
+        if hosts.is_empty() { String::new() } else { format!(" ({})", hosts.join(", ")) },
+        logs.display()
+    );
     println!("  estimated: ~{injected} tokens injected by cfetch (chars/3.5 heuristic)");
     // Measured truth from transcripts, side by side with the estimate — and
     // clearly labeled absent when the transcript could not be parsed.
@@ -763,7 +903,56 @@ fn status() -> anyhow::Result<()> {
             None => println!("delivery: unverifiable (transcript format drift)"),
         },
     }
+    // Ring 5/6 live in the tree, so their figures are the fleet's, not this
+    // machine's.
+    let ex = exhaust::Exhaust::from_config(&cfg);
+    let ring56 = ex.stats();
+    if ring56.staged_total > 0 {
+        let reasons = ring56
+            .staged_by_reason
+            .iter()
+            .map(|(r, n)| format!("{r}: {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "staging: {} ring-5 candidate(s) awaiting distillation [{reasons}] in {}",
+            ring56.staged_total,
+            ex.staging_dir.display()
+        );
+    } else {
+        println!("staging: no ring-5 candidates awaiting distillation");
+    }
+    println!(
+        "exhaust: {} of ring-6 stream in {}",
+        jsonl::human_bytes(ring56.bytes),
+        logs.display()
+    );
+    // Semantic coverage belongs in status, not only in a query's warning:
+    // an operator must be able to SEE that the vectors are missing before a
+    // ranking quietly falls back to lexical.
+    if cfg.embeddings.enabled {
+        match semantic_status(&cfg) {
+            Ok(line) => println!("{line}"),
+            Err(e) => println!("semantic: unavailable ({e})"),
+        }
+    }
+    // Same reasoning for reranking: an operator must see that the second
+    // stage is configured and reachable BEFORE a query quietly answers in
+    // retrieval order.
+    if cfg.rerank.enabled {
+        match rerank::RerankClient::new(&cfg.rerank) {
+            Ok(c) => println!(
+                "rerank: {} over the top {} hit(s)",
+                c.model(),
+                c.candidates()
+            ),
+            Err(e) => println!("rerank: unavailable ({e})"),
+        }
+    }
     let state = paths::state_dir();
+    if let Some(note) = migrate::legacy_note(&state) {
+        println!("{note}");
+    }
     let bytes: u64 = std::fs::read_dir(&state)
         .map(|rd| {
             rd.flatten()
@@ -775,6 +964,72 @@ fn status() -> anyhow::Result<()> {
         .unwrap_or(0);
     println!("state:  {} ({} KiB)", state.display(), bytes / 1024);
     Ok(())
+}
+
+/// Coverage of the configured embeddings spec, local cache and shared store
+/// side by side. A none-tier host reports the shared store alone — it holds
+/// no index to cover.
+/// Lists the slices and what each one holds.
+///
+/// Counts are derived from the indexed paths at call time, so what this
+/// prints is what a `--slice` query would actually match — a stored count
+/// could disagree with the configuration.
+fn slices(json: bool) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let model = cfg.slice_model()?;
+    let conn = index::open_ro(&paths::state_dir())?;
+    let docs = index::doc_block_counts(&conn)?;
+
+    // Every configured slice appears even when empty: a slice that claims
+    // nothing is a configuration mistake worth seeing, not an absence.
+    let mut order: Vec<String> = model.names().map(str::to_string).collect();
+    order.push(config::ROOT_SLICE.to_string());
+    let mut counts: std::collections::HashMap<&str, (usize, usize)> =
+        order.iter().map(|n| (n.as_str(), (0, 0))).collect();
+    for (path, blocks) in &docs {
+        let name = model.slice_for(path);
+        let e = counts.entry(name).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += blocks;
+    }
+
+    if json {
+        let arr: Vec<_> = order
+            .iter()
+            .map(|n| {
+                let (d, b) = counts.get(n.as_str()).copied().unwrap_or((0, 0));
+                serde_json::json!({"slice": n, "docs": d, "blocks": b})
+            })
+            .collect();
+        println!("{}", serde_json::json!({"slices": arr}));
+        return Ok(());
+    }
+    if model.is_empty() {
+        println!("no slices configured — the whole tree is one implicit slice");
+    }
+    for n in &order {
+        let (d, b) = counts.get(n.as_str()).copied().unwrap_or((0, 0));
+        let prefixes = match model.prefixes_of(n) {
+            None => "the whole tree, minus anything a slice claims".to_string(),
+            Some(p) => p.join(", "),
+        };
+        println!("{n}: {d} doc(s), {b} block(s) — {prefixes}");
+    }
+    Ok(())
+}
+
+fn semantic_status(cfg: &config::Config) -> anyhow::Result<String> {
+    let spec = cfg.embeddings.spec();
+    let shared = vectors::VectorStore::open(&cfg.brain_root, &spec)?.len();
+    if cfg.client.serving.is_some() {
+        return Ok(format!(
+            "semantic: no local index (none-tier) — shared store holds {shared} artifact(s) for {} at {} dims",
+            spec.model, spec.dim
+        ));
+    }
+    let conn = index::open_ro(&paths::state_dir())?;
+    let (embedded, total) = index::vector_coverage(&conn, &spec)?;
+    Ok(embed::coverage_status_line(&spec, embedded, total, shared))
 }
 
 fn main() {
@@ -819,15 +1074,22 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Slices { json } => {
+            if let Err(e) = slices(json) {
+                eprintln!("cfetch slices: {e:#}");
+                std::process::exit(1);
+            }
+        }
         Command::Staging { action } => {
-            if let Err(e) = staging(action) {
+            if let Err(e) = staging_cmd(action) {
                 eprintln!("cfetch staging: {e}");
                 std::process::exit(1);
             }
         }
         Command::Dashboard => {
-            let guard = config::Config::load().and_then(|c| none_tier_guard(&c, "dashboard"));
-            if let Err(e) = guard.and_then(|()| dashboard::run()) {
+            // No none-tier guard: the dashboard routes to the serving host
+            // like the rest of the read path.
+            if let Err(e) = dashboard::run() {
                 eprintln!("cfetch dashboard: {e}");
                 std::process::exit(1);
             }
@@ -856,8 +1118,17 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Recall { query, id, expand, semantic, hybrid, limit, json } => {
-            if let Err(e) = recall(&query.join(" "), id.as_deref(), expand, semantic, hybrid, limit, json) {
+        Command::Recall { query, id, expand, semantic, hybrid, slice, limit, json } => {
+            if let Err(e) = recall(
+                &query.join(" "),
+                id.as_deref(),
+                expand,
+                semantic,
+                hybrid,
+                slice.as_deref(),
+                limit,
+                json,
+            ) {
                 eprintln!("cfetch recall: {e}");
                 std::process::exit(1);
             }
