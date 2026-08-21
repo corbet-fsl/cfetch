@@ -3,6 +3,33 @@
 Notable changes per release. cfetch is young and moving fast; anything not
 listed here is a fix or an internal change with no effect on behavior.
 
+## Unreleased
+
+- **Document-side embedding prefixes, as part of the artifact identity.**
+  `embeddings.document_prefix` carries the instruction models like E5 and
+  EmbeddingGemma expect on documents. Because it changes every stored vector,
+  it is keyed into the shared artifact's filename and recorded exactly in its
+  header — two hosts configured differently write separate files rather than
+  appending incompatible vectors to one. Stores written before this exist
+  unchanged and keep working: no prefix line means raw documents, which is
+  what they hold.
+- **Invites and grants.** `cfetch invite <slice>` mints a one-time ticket,
+  `cfetch join <ticket>` redeems it, `cfetch grants` shows who holds what.
+  A ticket is an address plus a secret, NOT an authorization: the origin looks
+  the secret up in its own records, so a forged ticket buys nothing and a real
+  one can be pasted through any channel. The origin stores only the secret's
+  hash. An invite binds to the first host that redeems it, a retry from that
+  same host is not an error, and a second host is refused. Inside one storage
+  group — hosts sharing the tree — redemption needs no network at all.
+- **Host identity.** Each host now has a persistent iroh keypair, created on
+  first use, whose public half is the endpoint id peers will grant slices to.
+  `cfetch identity` prints it and `cfetch status` names it. The key lives in
+  the per-host state directory and never in the brain tree — a shared tree
+  would hand every host the same identity, making a grant to one machine a
+  grant to all of them. A key that cannot be read is an error rather than a
+  fresh identity, because regenerating would orphan every grant naming the old
+  one.
+
 ## 0.8.0
 
 - **Slices.** Named prefix sets over the tree, nestable, with `cfetch slices`
