@@ -1,11 +1,16 @@
+mod code;
 mod config;
 mod daemon;
+mod dashboard;
 mod heartbeat;
 mod hook_io;
 mod hooks;
 mod index;
 mod install;
 mod ledger;
+mod lockfile;
+mod markers;
+mod mcp;
 mod paths;
 mod resident;
 
@@ -39,8 +44,16 @@ enum Command {
         #[arg(long)]
         remove: bool,
     },
-    /// Rebuild the recall index from the brain tree
+    /// Rebuild the recall index and sync the code index
     Scan,
+    /// Locate a symbol or file in the code index, with exact line ranges
+    Find {
+        query: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Search the brain (rings 0-4), BM25-ranked, with ring-prefixed citations
     Recall {
         /// Search terms (word-prefix matched, OR-combined)
@@ -48,11 +61,18 @@ enum Command {
         /// Expand a citation id instead of searching
         #[arg(long)]
         id: Option<String>,
+        /// Also list docs wikilinked to the top hits (1-hop curated graph)
+        #[arg(long)]
+        expand: bool,
         #[arg(long, default_value_t = 8)]
         limit: usize,
         #[arg(long)]
         json: bool,
     },
+    /// Open the terminal dashboard: health, ledger, live recall
+    Dashboard,
+    /// Serve recall/find/expand over MCP (stdio) for any MCP client
+    Mcp,
     /// Verify the installation end to end; nonzero exit on hard failures
     Selfcheck,
     /// Show daemon, hook health, and state footprint
@@ -146,10 +166,46 @@ fn scan() -> anyhow::Result<()> {
         "indexed {} docs, {} blocks ({} file(s) skipped as ring 5+)",
         report.docs, report.blocks, report.skipped_high_ring
     );
+    let code = code::scan_code(&mut conn, &cfg.effective_code_roots())?;
+    println!("code: {} files, {} symbols (re)parsed", code.files, code.symbols);
     Ok(())
 }
 
-fn recall(query: &str, id: Option<&str>, limit: usize, json: bool) -> anyhow::Result<()> {
+fn find(query: &str, limit: usize, json: bool) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    let mut conn = index::open(&paths::state_dir())?;
+    code::scan_code(&mut conn, &cfg.effective_code_roots())?;
+    let hits = code::find(&conn, query, limit)?;
+    if json {
+        let arr: Vec<_> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "path": h.path, "name": h.name, "kind": h.kind,
+                    "lines": [h.start_line, h.end_line], "tokens_estimated": h.token_estimate,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!(arr));
+        return Ok(());
+    }
+    if hits.is_empty() {
+        println!("no hits for \"{query}\"");
+        return Ok(());
+    }
+    for h in &hits {
+        match (&h.name, &h.kind) {
+            (Some(name), Some(kind)) => println!(
+                "{}:{}-{}  {} {}  (~{} tok)",
+                h.path, h.start_line, h.end_line, kind, name, h.token_estimate
+            ),
+            _ => println!("{}  (file match)", h.path),
+        }
+    }
+    Ok(())
+}
+
+fn recall(query: &str, id: Option<&str>, expand: bool, limit: usize, json: bool) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     let native = paths::native_projects_root();
     let conn = index::ensure_fresh(&paths::state_dir(), &cfg.brain_root, Some(&native))?;
@@ -180,6 +236,12 @@ fn recall(query: &str, id: Option<&str>, limit: usize, json: bool) -> anyhow::Re
         anyhow::bail!("empty query (pass search terms or --id <citation>)");
     }
     let hits = index::recall(&conn, query, limit)?;
+    let linked = if expand && !hits.is_empty() {
+        let top: Vec<String> = hits.iter().take(3).map(|h| h.path.clone()).collect();
+        index::linked_docs(&conn, &top, 8)?
+    } else {
+        Vec::new()
+    };
     if json {
         let arr: Vec<_> = hits
             .iter()
@@ -190,13 +252,23 @@ fn recall(query: &str, id: Option<&str>, limit: usize, json: bool) -> anyhow::Re
                 })
             })
             .collect();
-        println!("{}", serde_json::json!(arr));
+        let links: Vec<_> = linked
+            .iter()
+            .map(|(p, r)| serde_json::json!({"path": p, "ring": r}))
+            .collect();
+        println!("{}", serde_json::json!({"hits": arr, "linked": links}));
     } else if hits.is_empty() {
         println!("no hits for \"{query}\"");
     } else {
         for h in &hits {
             println!("{} {}:{}-{} (ring {})", h.cite, h.path, h.start_line, h.end_line, h.ring);
             println!("    {}", h.snippet);
+        }
+        if !linked.is_empty() {
+            println!("\nlinked (curated wikilinks, 1 hop from top hits):");
+            for (p, r) in &linked {
+                println!("    {p} (ring {r})");
+            }
         }
         println!("\nexpand a hit: cfetch recall --id <citation>");
     }
@@ -205,6 +277,10 @@ fn recall(query: &str, id: Option<&str>, limit: usize, json: bool) -> anyhow::Re
 
 fn status() -> anyhow::Result<()> {
     daemon::status()?;
+    let quarantines = ledger::quarantine_count(&paths::state_dir());
+    if quarantines > 0 {
+        println!("ledger: {quarantines} quarantined corrupt file(s) — torn writes occurred (ledger.json.corrupt-*)");
+    }
     let ledger = ledger::load();
     let sessions = ledger.sessions.len();
     let injected: u64 = ledger
@@ -229,10 +305,19 @@ fn status() -> anyhow::Result<()> {
 }
 
 fn main() {
+    // Hook invocations bypass clap entirely: a parse failure would exit 2,
+    // which is the harness's BLOCKING code (a Stop hook exiting 2 traps the
+    // session in a loop). Hooks must reach hooks::run no matter what.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("hook") {
+        let event = argv.get(2).cloned().unwrap_or_default();
+        hooks::run(&event);
+        return;
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Hook { event } => {
-            // Never propagate errors to the harness; hooks::run records them.
+            // Unreachable in practice (pre-dispatch above), kept for --help.
             hooks::run(&event);
         }
         Command::Daemon { action } => {
@@ -253,6 +338,24 @@ fn main() {
                 eprintln!("cfetch install: {e}");
                 std::process::exit(1);
             }
+            if !remove
+                && let Err(e) = install::install_agents()
+            {
+                eprintln!("cfetch install (other agents): {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Dashboard => {
+            if let Err(e) = dashboard::run() {
+                eprintln!("cfetch dashboard: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Mcp => {
+            if let Err(e) = mcp::serve() {
+                eprintln!("cfetch mcp: {e}");
+                std::process::exit(1);
+            }
         }
         Command::Scan => {
             if let Err(e) = scan() {
@@ -260,8 +363,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Recall { query, id, limit, json } => {
-            if let Err(e) = recall(&query.join(" "), id.as_deref(), limit, json) {
+        Command::Find { query, limit, json } => {
+            if let Err(e) = find(&query, limit, json) {
+                eprintln!("cfetch find: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Recall { query, id, expand, limit, json } => {
+            if let Err(e) = recall(&query.join(" "), id.as_deref(), expand, limit, json) {
                 eprintln!("cfetch recall: {e}");
                 std::process::exit(1);
             }
