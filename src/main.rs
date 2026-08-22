@@ -4,10 +4,12 @@ mod config;
 mod daemon;
 mod dashboard;
 mod embed;
+mod engine;
 mod exhaust;
 mod govern;
 mod grant;
 mod graph;
+mod hardware;
 mod heartbeat;
 mod hook_io;
 mod hooks;
@@ -134,6 +136,11 @@ enum Command {
     },
     /// Show who has been granted which slice, and which invites are unused
     Grants {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Detect accelerators and name the variant this machine should run
+    Hardware {
         #[arg(long)]
         json: bool,
     },
@@ -285,6 +292,18 @@ fn selfcheck() -> anyhow::Result<()> {
     match daemon::call("ping", std::time::Duration::from_millis(300)) {
         Some(r) => println!("ok    daemon answers (v{})", r.version.unwrap_or_default()),
         None => println!("warn  daemon not running — hooks fall back to direct reads"),
+    }
+
+    if let Some(issues) = install::codex_registration_issues() {
+        if issues.is_empty() {
+            println!("ok    Codex integration current (AGENTS.md + native hooks + MCP)");
+            println!("note  Codex requires one-time hook approval in /hooks after changes");
+        } else {
+            for issue in issues {
+                println!("FAIL  Codex integration: {issue}");
+                hard_failures += 1;
+            }
+        }
     }
 
     if let Some(cfg) = &cfg {
@@ -1273,6 +1292,60 @@ fn main() {
             if let Err(e) = grants(json) {
                 eprintln!("cfetch grants: {e:#}");
                 std::process::exit(1);
+            }
+        }
+        Command::Hardware { json } => {
+            let found = hardware::detect();
+            let variant = hardware::recommended_variant(&found);
+            let sel = engine::select(&found);
+            let selected = serde_json::json!({
+                "device": sel.device.describe(),
+                "backend": sel.backend.name(),
+                "format": sel.backend.format(),
+            });
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "variant": variant,
+                        "os": hardware::os_token(),
+                        "x86_64_level": hardware::x86_64_level(),
+                        "compiled_backends": engine::compiled_backends()
+                            .iter().map(|b| b.name()).collect::<Vec<_>>(),
+                        "selected": selected,
+                        "devices": found.iter().map(|f| serde_json::json!({
+                            "device": f.device.describe(),
+                            "token": f.device.token(),
+                            "class": format!("{:?}", f.device.class()).to_lowercase(),
+                            "evidence": f.evidence,
+                            "usable": f.usable().is_ok(),
+                            "unusable_reason": f.usable().err().map(|e| e.reason()),
+                            "caveat": f.caveat(),
+                        })).collect::<Vec<_>>(),
+                    })
+                );
+            } else {
+                println!("detected, best first (policy: NPU > GPU > CPU):");
+                for f in &found {
+                    let mark = if f.usable().is_ok() { " " } else { "!" };
+                    println!("{mark} {:<26} {}", f.device.describe(), f.evidence);
+                    if let Err(why) = f.usable() {
+                        println!("    UNUSABLE: {}", why.reason());
+                    }
+                    if let Some(note) = f.caveat() {
+                        println!("    note: {note}");
+                    }
+                }
+                let engines: Vec<&str> =
+                    engine::compiled_backends().iter().map(|b| b.name()).collect();
+                println!("\nthis build contains: {}", engines.join(", "));
+                println!(
+                    "it will use:        {} via {} ({})",
+                    sel.device.describe(),
+                    sel.backend.name(),
+                    sel.backend.format()
+                );
+                println!("recommended variant: {variant}");
             }
         }
         Command::Identity { json } => {

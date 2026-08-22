@@ -128,10 +128,10 @@ impl Exhaust {
     }
 
     /// PostToolUse capture: Bash -> 'bash' (redacted command + norm + error
-    /// hint), Write|Edit|MultiEdit -> 'write' (path + resolved ring for brain
-    /// files), Read -> 'read'. Anything else, or missing fields, records
-    /// nothing. `brain_root` locates the brain for ring resolution, `rules`
-    /// the configured taxonomy that resolves it.
+    /// hint), Write|Edit|MultiEdit|apply_patch -> 'write' (path + resolved ring
+    /// for brain files), Read -> 'read'. Anything else, or missing fields,
+    /// records nothing. `brain_root` locates the brain for ring resolution,
+    /// `rules` the configured taxonomy that resolves it.
     pub fn capture_post_tool(
         &self,
         event: &HookEvent,
@@ -155,9 +155,11 @@ impl Exhaust {
                     }),
                 )
             }
-            Some("Write" | "Edit" | "MultiEdit") => {
-                let Some(path) = str_field("file_path") else { return Ok(()) };
-                self.record(session, "write", &write_payload(path, brain_root, rules))
+            Some("Write" | "Edit" | "MultiEdit" | "apply_patch") => {
+                for path in written_paths(event) {
+                    self.record(session, "write", &write_payload(&path, brain_root, rules))?;
+                }
+                Ok(())
             }
             Some("Read") => {
                 let Some(path) = str_field("file_path") else { return Ok(()) };
@@ -256,6 +258,51 @@ impl Exhaust {
             staged_by_reason: s.by_reason.into_iter().map(|(r, n)| (r, n as i64)).collect(),
             bytes: jsonl::footprint(&self.logs_dir, STREAM),
         }
+    }
+}
+
+/// Paths changed by the two hook dialects cfetch supports. Claude supplies a
+/// single `file_path`; Codex supplies its native apply_patch text in
+/// `tool_input.command`. Codex patches are rooted at the hook event's cwd, so
+/// relative paths are resolved before ring classification and capture.
+pub(crate) fn written_paths(event: &HookEvent) -> Vec<String> {
+    let Some(input) = event.tool_input.as_ref() else { return Vec::new() };
+    match event.tool_name.as_deref() {
+        Some("Write" | "Edit" | "MultiEdit") => input
+            .get("file_path")
+            .and_then(serde_json::Value::as_str)
+            .map(|path| vec![path.to_string()])
+            .unwrap_or_default(),
+        Some("apply_patch") => {
+            let Some(patch) = input.get("command").and_then(serde_json::Value::as_str) else {
+                return Vec::new();
+            };
+            let mut paths = Vec::new();
+            for line in patch.lines() {
+                let path = [
+                    "*** Add File: ",
+                    "*** Update File: ",
+                    "*** Delete File: ",
+                    "*** Move to: ",
+                ]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix));
+                let Some(path) = path.filter(|path| !path.is_empty()) else { continue };
+                let resolved = if Path::new(path).is_absolute() {
+                    PathBuf::from(path)
+                } else if let Some(cwd) = event.cwd.as_deref() {
+                    Path::new(cwd).join(path)
+                } else {
+                    PathBuf::from(path)
+                };
+                let resolved = resolved.to_string_lossy().to_string();
+                if !paths.contains(&resolved) {
+                    paths.push(resolved);
+                }
+            }
+            paths
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -816,6 +863,72 @@ mod tests {
             assert_eq!(r.value("payload").unwrap()["file_path"], WITHHELD);
         }
         assert_eq!(all[3].value("payload").unwrap()["file_path"], "/home/x/src/main.rs");
+    }
+
+    #[test]
+    fn codex_apply_patch_captures_every_changed_path_from_the_event_cwd() {
+        let f = fixture("h1");
+        let event = HookEvent {
+            session_id: Some("codex-session".into()),
+            cwd: Some(BRAIN.into()),
+            tool_name: Some("apply_patch".into()),
+            tool_input: Some(json!({"command": "*** Begin Patch\n*** Update File: knowledge/a.md\n*** Move to: knowledge/b.md\n*** Add File: /tmp/new.rs\n*** Delete File: mind/secrets/token.md\n*** End Patch"})),
+            ..Default::default()
+        };
+        f.cap(&event);
+
+        let all = f.records();
+        assert_eq!(all.len(), 4, "one write record per distinct patch target");
+        let actual = all[0].value("payload").unwrap()["file_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let expected = Path::new(BRAIN).join("knowledge/a.md");
+        assert_eq!(
+            Path::new(&actual).components().collect::<Vec<_>>(),
+            expected.components().collect::<Vec<_>>()
+        );
+        assert_eq!(all[0].value("payload").unwrap()["ring"], 3);
+        let actual = all[1].value("payload").unwrap()["file_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let expected = Path::new(BRAIN).join("knowledge/b.md");
+        assert_eq!(
+            Path::new(&actual).components().collect::<Vec<_>>(),
+            expected.components().collect::<Vec<_>>()
+        );
+        let actual = all[2].value("payload").unwrap()["file_path"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            Path::new(actual).components().collect::<Vec<_>>(),
+            Path::new("/tmp/new.rs").components().collect::<Vec<_>>()
+        );
+        assert_eq!(all[3].value("payload").unwrap()["file_path"], WITHHELD);
+    }
+
+    #[test]
+    fn codex_apply_patch_path_extraction_is_deduplicated_and_lenient() {
+        let event = HookEvent {
+            cwd: Some("/work".into()),
+            tool_name: Some("apply_patch".into()),
+            tool_input: Some(json!({"command": "*** Update File: src/lib.rs\n*** Update File: src/lib.rs\nnot a header"})),
+            ..Default::default()
+        };
+        let paths = written_paths(&event);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            Path::new(&paths[0]).components().collect::<Vec<_>>(),
+            Path::new("/work").join("src/lib.rs").components().collect::<Vec<_>>()
+        );
+
+        let missing = HookEvent {
+            tool_name: Some("apply_patch".into()),
+            tool_input: Some(json!({"patch": "different dialect"})),
+            ..Default::default()
+        };
+        assert!(written_paths(&missing).is_empty());
     }
 
     #[test]
