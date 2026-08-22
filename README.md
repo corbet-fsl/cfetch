@@ -95,7 +95,10 @@ storage: it is a network call away from the whole brain.
 
 ## Install
 
-Prebuilt binaries are attached to [GitHub releases](https://github.com/julian-corbet/cfetch/releases).
+Prebuilt archives are attached to [GitHub releases](https://github.com/julian-corbet/cfetch/releases).
+Each archive contains the binary, `LICENSE.md`, and the generated
+`THIRD-PARTY-LICENSES.txt` attribution bundle.
+
 From source:
 
 ```console
@@ -172,6 +175,14 @@ cfetch never bypasses that trust gate. Marker-fenced blocks and tagged entries
 leave your own settings untouched, and `cfetch install --remove` takes exactly
 ours back out. Restart the agent after changing MCP configuration so its tool
 inventory is rebuilt.
+
+On Codex, completed oversized Bash listings are structurally condensed before
+their result enters the next model turn. Build and test output is never
+rewritten. The full original is kept as a private file under
+`$CFETCH_STATE_DIR/condensed-output/` (or the default local state directory),
+with mode `0600` on Unix, and the condensed result carries its exact path.
+The recovery directory is capped at 64 MiB. Claude events never receive
+Codex's `continue:false` replacement signal.
 
 ## Configuration
 
@@ -442,6 +453,26 @@ $ cfetch recall --slice hosts backup
 - With no slices configured, nothing changes — the whole tree is one implicit
   slice.
 
+To share one, enable serving on the origin and keep its daemon running:
+
+```console
+origin$ cfetch invite hosts --mode ro
+cfetch-invite-2:...
+
+peer$ cfetch join 'cfetch-invite-2:...'
+peer$ cfetch recall --slice hosts backup
+```
+
+The ticket contains the origin's authenticated iroh endpoint address and a
+one-time secret. The origin stores only the secret hash; the peer stores only
+the successfully joined route. QUIC supplies the peer identity used to bind
+and check the grant, so an endpoint id claimed inside a request is never
+trusted. A ticket can still be redeemed locally when both hosts share the
+same tree; otherwise the running daemons exchange the same line-JSON query
+protocol over iroh. A slice grant permits `recall`, citation expansion,
+generation and checksum reads for that slice only—host control and unscoped
+code-index operations are refused.
+
 ### Reranking (`rerank`)
 
 Off by default, and independent of how the candidates were found — it improves
@@ -516,7 +547,10 @@ of a machine, so they live in `<brain_root>/state/cfetch/vectors/`
 modify, and redistribute cfetch for any purpose except offering a competing
 commercial product or service. Each release automatically becomes
 [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) two years after it
-ships.
+ships. Dependency licenses, copyright notices, and any upstream Apache NOTICE
+files are collected in [THIRD-PARTY-LICENSES.txt](THIRD-PARTY-LICENSES.txt).
+CI rejects dependencies outside the reviewed allow list and verifies that the
+generated bundle matches `Cargo.lock`.
 
 ## Contributing
 
