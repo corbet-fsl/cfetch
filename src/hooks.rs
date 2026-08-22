@@ -351,6 +351,63 @@ fn is_ranged(input: &serde_json::Value) -> bool {
 /// A file read visible through either Claude's structured Read tool or
 /// Codex's shell tool. The shell subset is deliberately strict: only a single
 /// `cat`, `head`, `tail`, or `sed` invocation with one final file operand is
+/// Does this shell command write something? Deliberately the MIRROR of the
+/// read parser's caution: that one refuses anything ambiguous because it names
+/// a path, while this one only ever increments a counter, so a false negative
+/// (an unrecognized write) costs a missed tally and a false positive would
+/// invent activity that never happened. Recognized: an unquoted `>`/`>>`
+/// redirect, and a leading program whose whole purpose is to modify the
+/// filesystem. `sed`/`perl` count only with an in-place flag.
+fn is_shell_write(command: &str) -> bool {
+    if has_unquoted_redirect(command) {
+        return true;
+    }
+    // Any segment of a pipeline or list may be the writer.
+    command.split(['|', ';', '\n']).any(|segment| {
+        let mut words = segment.split_whitespace().peekable();
+        while let Some(w) = words.peek() {
+            let w = *w;
+            if w == "sudo" || w == "env" || w == "time" || w == "nohup" || w.contains('=') {
+                words.next();
+            } else {
+                break;
+            }
+        }
+        let Some(prog) = words.next() else { return false };
+        let prog = std::path::Path::new(prog)
+            .file_name()
+            .and_then(|p| p.to_str())
+            .unwrap_or(prog);
+        match prog {
+            "tee" | "cp" | "mv" | "rm" | "rmdir" | "mkdir" | "touch" | "install" | "dd"
+            | "truncate" | "ln" | "chmod" | "chown" | "patch" | "rsync" | "shred" | "unlink" => true,
+            // In-place only: a plain `sed`/`perl` filters to stdout.
+            "sed" | "perl" => words.any(|w| w == "-i" || w.starts_with("-i.") || w == "--in-place"),
+            _ => false,
+        }
+    })
+}
+
+/// `>` or `>>` outside single or double quotes. A quoted `>` is data — most
+/// commonly a here-doc body or an echoed string — not a redirect.
+fn has_unquoted_redirect(command: &str) -> bool {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    for c in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '>' if !single && !double => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// recognized, never a pipeline, redirect, substitution, or compound command.
 fn read_invocation(event: &HookEvent) -> Option<(String, bool)> {
     let tool = event.tool_name.as_deref()?;
@@ -549,6 +606,9 @@ fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
                 if let Err(e) = post_tool_cadence(&state_dir, &cfg, event) {
                     first_err.get_or_insert(e);
                 }
+                if let Err(e) = post_tool_budget(&state_dir, &cfg, event) {
+                    first_err.get_or_insert(e);
+                }
             }
             Err(e) => first_err = Some(e),
         }
@@ -571,6 +631,66 @@ fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
 
 /// Session read/write tracking: full reads recorded with the file's mtime;
 /// writes clear the read record (post-edit content is new content).
+/// Paths this event wrote, across both shapes: Codex's `apply_patch` carries
+/// them inside the patch body, the write tools name one directly.
+fn written_targets(event: &HookEvent) -> Vec<String> {
+    match event.tool_name.as_deref() {
+        Some("apply_patch") => exhaust::written_paths(event),
+        Some("Write" | "Edit" | "MultiEdit" | "NotebookEdit") => event
+            .tool_input
+            .as_ref()
+            .and_then(|input| {
+                input
+                    .get("file_path")
+                    .or_else(|| input.get("notebook_path"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// A brain file that outgrew its token budget costs every session that loads
+/// it, for as long as it stays that size — so the warning belongs at the write,
+/// where the author is still holding the context to act on it. One line, once
+/// per file per session, never a block.
+fn post_tool_budget(state_dir: &Path, cfg: &Config, event: &HookEvent) -> anyhow::Result<()> {
+    if event.is_subagent() {
+        return Ok(());
+    }
+    let budget = cfg.governance.state_file_budget_tokens;
+    if budget == 0 {
+        return Ok(());
+    }
+    for path in written_targets(event) {
+        // Only the brain's own files: cfetch governs what it will be asked to
+        // load, not the size of the user's source tree.
+        if !Path::new(&path).starts_with(&cfg.brain_root) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let tokens = crate::hook_io::estimate_tokens(usize::try_from(meta.len()).unwrap_or(usize::MAX));
+        if tokens <= budget {
+            continue;
+        }
+        let name = Path::new(&path)
+            .strip_prefix(&cfg.brain_root)
+            .unwrap_or(Path::new(&path))
+            .display()
+            .to_string();
+        let _ = session_state::update(state_dir, event.session(), |st| {
+            st.queue_reminder(
+                &format!("budget:{path}"),
+                &format!(
+                    "[cfetch: {name} is ~{tokens} tokens, over the {budget}-token budget for one brain file — split it or distil it; every session that loads it pays this]"
+                ),
+            );
+        });
+    }
+    Ok(())
+}
+
 fn post_tool_track(event: &HookEvent) -> anyhow::Result<()> {
     if event.is_subagent() {
         return Ok(());
@@ -581,6 +701,16 @@ fn post_tool_track(event: &HookEvent) -> anyhow::Result<()> {
     let state_dir = paths::state_dir();
     match tool {
         "Read" | "Bash" => {
+            if tool == "Bash"
+                && input
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_shell_write)
+            {
+                let _ = session_state::update(&state_dir, event.session(), |st| {
+                    st.record_shell_write();
+                });
+            }
             let Some((path, ranged)) = read_invocation(event) else { return Ok(()) };
             if ranged {
                 return Ok(());
@@ -674,6 +804,103 @@ fn precompact(event: &HookEvent) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn budget_event(session: &str, path: &std::path::Path) -> HookEvent {
+        serde_json::from_value(serde_json::json!({
+            "session_id": session,
+            "tool_name": "Write",
+            "tool_input": {"file_path": path.to_string_lossy()},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_oversized_brain_file_is_named_once_with_its_size_and_a_remedy() {
+        let brain = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let big = brain.path().join("knowledge/huge.md");
+        std::fs::create_dir_all(big.parent().unwrap()).unwrap();
+        std::fs::write(&big, "x".repeat(40_000)).unwrap();
+        let cfg = Config { brain_root: brain.path().to_path_buf(), ..Config::default() };
+        let event = budget_event("s-budget", &big);
+
+        post_tool_budget(state.path(), &cfg, &event).unwrap();
+        // Drain the way UserPromptSubmit does — through `update`, so the
+        // shown-key survives. Draining a loaded copy would throw it away and
+        // the once-per-file guarantee would look broken when it is not.
+        let mut texts = Vec::new();
+        let _ = crate::session_state::update(state.path(), "s-budget", |st| {
+            texts = st.drain_reminders();
+        });
+        assert_eq!(texts.len(), 1, "exactly one warning: {texts:?}");
+        assert!(texts[0].contains("knowledge/huge.md"), "{}", texts[0]);
+        assert!(texts[0].contains("tokens"), "the size must be stated: {}", texts[0]);
+        assert!(texts[0].contains("split it or distil it"), "a remedy is required: {}", texts[0]);
+
+        // Same file again in the same session must not warn twice.
+        post_tool_budget(state.path(), &cfg, &event).unwrap();
+        let mut again = Vec::new();
+        let _ = crate::session_state::update(state.path(), "s-budget", |st| {
+            again = st.drain_reminders();
+        });
+        assert!(again.is_empty(), "the warning fired twice for one file: {again:?}");
+    }
+
+    #[test]
+    fn a_small_file_and_a_file_outside_the_brain_are_both_silent() {
+        let brain = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let cfg = Config { brain_root: brain.path().to_path_buf(), ..Config::default() };
+
+        let small = brain.path().join("small.md");
+        std::fs::write(&small, "x".repeat(100)).unwrap();
+        post_tool_budget(state.path(), &cfg, &budget_event("s-small", &small)).unwrap();
+        assert!(crate::session_state::load(state.path(), "s-small").drain_reminders().is_empty());
+
+        // cfetch governs what it will be asked to load, not the user's source.
+        let outside = tempfile::tempdir().unwrap();
+        let theirs = outside.path().join("vendor.rs");
+        std::fs::write(&theirs, "x".repeat(40_000)).unwrap();
+        post_tool_budget(state.path(), &cfg, &budget_event("s-out", &theirs)).unwrap();
+        assert!(crate::session_state::load(state.path(), "s-out").drain_reminders().is_empty());
+    }
+
+    #[test]
+    fn a_zero_budget_disables_the_check() {
+        let brain = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let big = brain.path().join("huge.md");
+        std::fs::write(&big, "x".repeat(40_000)).unwrap();
+        let cfg = Config {
+            brain_root: brain.path().to_path_buf(),
+            governance: crate::config::GovernanceConfig {
+                state_file_budget_tokens: 0,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        post_tool_budget(state.path(), &cfg, &budget_event("s-zero", &big)).unwrap();
+        assert!(crate::session_state::load(state.path(), "s-zero").drain_reminders().is_empty());
+    }
+
+    #[test]
+    fn shell_writes_are_recognized_without_naming_the_target() {
+        // Redirects, in either form.
+        assert!(is_shell_write("cat x > /tmp/out"));
+        assert!(is_shell_write("printf hi >> log.txt"));
+        // Programs whose purpose is to modify the filesystem, incl. in a pipe.
+        assert!(is_shell_write("sudo cp a b"));
+        assert!(is_shell_write("echo hi | tee file"));
+        assert!(is_shell_write("mkdir -p /tmp/x"));
+        assert!(is_shell_write("sed -i 's/a/b/' f"));
+        // A quoted '>' is data, not a redirect.
+        assert!(!is_shell_write("echo \'a > b\'"));
+        assert!(!is_shell_write("grep \"a > b\" file"));
+        // Read-only commands, and sed without an in-place flag.
+        assert!(!is_shell_write("cat file"));
+        assert!(!is_shell_write("sed 's/a/b/' f"));
+        assert!(!is_shell_write("ls -la"));
+    }
+
     use super::*;
     use crate::config::CaptureConfig;
     use serde_json::json;
@@ -889,7 +1116,7 @@ mod tests {
                 scope: crate::config::Scope::default(),
                 weight: None,
             }],
-            governance: crate::config::GovernanceConfig { enabled, reinject_every },
+            governance: crate::config::GovernanceConfig { enabled, reinject_every, ..Default::default() },
             ..Config::default()
         }
     }
