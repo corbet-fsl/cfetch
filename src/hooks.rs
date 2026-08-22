@@ -87,12 +87,32 @@ fn resident_with_deadline(cfg: &Config, scope: &SessionScope) -> String {
     rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default()
 }
 
+/// The state half of SessionStart: decides from the start reason whether the
+/// arriving conversation inherits this session's records or starts without
+/// them, and clears the file when it does not. Split out from the injection
+/// half so the decision can be exercised without a config or a daemon.
+fn session_start_state(state_dir: &Path, event: &HookEvent) -> session_state::StartKind {
+    let kind = session_state::StartKind::parse(event.start_reason());
+    // The session id cannot make this call: the harness keeps one id across
+    // compaction and resume, so the file routinely outlives the conversation
+    // that wrote it. Only the reason distinguishes the two.
+    if kind.resets_state() {
+        let _ = session_state::update(state_dir, event.session(), |st| st.reset());
+    }
+    kind
+}
+
 fn session_start(event: &HookEvent) -> anyhow::Result<()> {
     // Subagents inherit fresh context on purpose; the resident set is for the
     // primary session (a fork re-injecting rings would double-pay the budget).
     if event.is_subagent() {
         return Ok(());
     }
+
+    // Before anything is injected: a session start that begins a new
+    // conversation must not leave the previous one's read history and spent
+    // reminder caps standing for the rest of this session.
+    let start = session_start_state(&paths::state_dir(), event);
 
     let mut emit = Emit::new("SessionStart");
 
@@ -117,14 +137,14 @@ fn session_start(event: &HookEvent) -> anyhow::Result<()> {
         Err(_) => String::new(),
     };
 
-    let reason = event.start_reason();
     if !digest.is_empty() {
-        if reason == "compact" || reason == "resume" {
-            emit.add_context(format!(
+        match start.continuation_label() {
+            // Memory arriving in the middle of a conversation needs its cause
+            // named, or the model reads the repeat as new instruction.
+            Some(reason) => emit.add_context(format!(
                 "[cfetch resident memory (rings 0-1), re-injected after {reason}]\n{digest}"
-            ));
-        } else {
-            emit.add_context(format!("[cfetch resident memory (rings 0-1)]\n{digest}"));
+            )),
+            None => emit.add_context(format!("[cfetch resident memory (rings 0-1)]\n{digest}")),
         }
     }
 
@@ -262,14 +282,56 @@ fn prune_condensed_outputs(dir: &Path, keep: &Path, max_bytes: u64) -> anyhow::R
     Ok(())
 }
 
+/// Condenses a completed Bash result for a harness whose PostToolUse carries
+/// the tool response as an OBJECT — Claude Code and every client that copied
+/// its hook envelope (Gemini, Qwen). Codex is the exception: it sends a bare
+/// string and takes its replacement through `continue:false` instead.
+///
+/// The returned value MIRRORS the received response and changes only `stdout`.
+/// A fresh object of the apparently-right shape is silently discarded, and so
+/// is a value that drops a field the tool emitted — see
+/// [`crate::hook_io::HookSpecificOutput::updated_tool_output`]. stderr is
+/// never touched: an error must reach the model verbatim.
+fn object_condensed_output(
+    state_dir: &Path,
+    event: &HookEvent,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    // Codex is identified by turn_id plus a string response; this path is for
+    // everyone else, so both must be absent.
+    if event.turn_id.is_some() || event.tool_name.as_deref() != Some("Bash") {
+        return Ok(None);
+    }
+    let Some(response) = event.tool_response.as_ref().and_then(serde_json::Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(stdout) = response.get("stdout").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(command) = event
+        .tool_input
+        .as_ref()
+        .and_then(|input| input.get("command"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    if u64::try_from(stdout.len()).unwrap_or(u64::MAX) > CONDENSED_OUTPUT_MAX_BYTES {
+        return Ok(None);
+    }
+    let Some(pointer) = preserve_full_output(state_dir, event, command, stdout)? else {
+        return Ok(None);
+    };
+    let mut replacement = response.clone();
+    replacement.insert("stdout".to_string(), serde_json::Value::String(pointer));
+    Ok(Some(serde_json::Value::Object(replacement)))
+}
+
 /// Condenses a completed Codex Bash result and preserves the full original in
 /// private local state. Current Codex PostToolUse input is identifiable by the
 /// required `turn_id` plus a string `tool_response`; Claude does not get the
 /// `continue:false` replacement output because it interprets that universal
 /// field as an instruction to stop the agent.
 fn codex_condensed_output(state_dir: &Path, event: &HookEvent) -> anyhow::Result<Option<String>> {
-    use sha2::Digest as _;
-
     if event.turn_id.is_none() || event.tool_name.as_deref() != Some("Bash") {
         return Ok(None);
     }
@@ -287,17 +349,34 @@ fn codex_condensed_output(state_dir: &Path, event: &HookEvent) -> anyhow::Result
     if u64::try_from(output.len()).unwrap_or(u64::MAX) > CONDENSED_OUTPUT_MAX_BYTES {
         return Ok(None);
     }
+    preserve_full_output(state_dir, event, command, output)
+}
+
+/// Condense, write the original to private local state, and return the
+/// condensed text with a pointer to it. `None` when condensation was not
+/// worthwhile — the caller then leaves the output alone.
+///
+/// Shared by every harness: the decision of WHAT to condense and what to keep
+/// must not vary by client, or the same command yields different context
+/// depending on who asked.
+fn preserve_full_output(
+    state_dir: &Path,
+    event: &HookEvent,
+    command: &str,
+    output: &str,
+) -> anyhow::Result<Option<String>> {
+    use sha2::Digest as _;
+
     let condensed = condense::condense(command, output);
     if !condensed.was_condensed() {
         return Ok(None);
     }
-
     let artifact_identity = format!(
-            "{}\0{}\0{}\0{}",
-            event.session(),
-            event.turn_id.as_deref().unwrap_or_default(),
-            event.tool_use_id.as_deref().unwrap_or_default(),
-            output
+        "{}\0{}\0{}\0{}",
+        event.session(),
+        event.turn_id.as_deref().unwrap_or_default(),
+        event.tool_use_id.as_deref().unwrap_or_default(),
+        output
     );
     let id = format!("{:x}", sha2::Sha256::digest(artifact_identity.as_bytes()));
     let path = state_dir.join("condensed-output").join(format!("{id}.txt"));
@@ -363,21 +442,11 @@ fn is_shell_write(command: &str) -> bool {
         return true;
     }
     // Any segment of a pipeline or list may be the writer.
-    command.split(['|', ';', '\n']).any(|segment| {
-        let mut words = segment.split_whitespace().peekable();
-        while let Some(w) = words.peek() {
-            let w = *w;
-            if w == "sudo" || w == "env" || w == "time" || w == "nohup" || w.contains('=') {
-                words.next();
-            } else {
-                break;
-            }
-        }
-        let Some(prog) = words.next() else { return false };
-        let prog = std::path::Path::new(prog)
-            .file_name()
-            .and_then(|p| p.to_str())
-            .unwrap_or(prog);
+    // Segment separators shared by bash, zsh and fish. fish spells its
+    // conjunctions `and`/`or` as well as `&&`/`||`, but both reduce to
+    // whitespace-separated segments once split on these.
+    command.split(['|', ';', '\n', '&']).any(|segment| {
+        let Some((prog, mut words)) = condense::leading_program(segment) else { return false };
         match prog {
             "tee" | "cp" | "mv" | "rm" | "rmdir" | "mkdir" | "touch" | "install" | "dd"
             | "truncate" | "ln" | "chmod" | "chown" | "patch" | "rsync" | "shred" | "unlink" => true,
@@ -616,9 +685,24 @@ fn post_tool(event: &HookEvent) -> anyhow::Result<()> {
     if let Err(e) = post_tool_track(event) {
         first_err.get_or_insert(e);
     }
-    if let Some(replacement) = replacement {
+    // Exactly one of these can apply: Codex is identified by turn_id plus a
+    // string response and takes `continue:false`; every object-shaped harness
+    // takes hookSpecificOutput.updatedToolOutput instead.
+    let object_replacement = match object_condensed_output(&state_dir, event) {
+        Ok(v) => v,
+        Err(e) => {
+            first_err.get_or_insert(e);
+            None
+        }
+    };
+    if replacement.is_some() || object_replacement.is_some() {
         let mut emit = Emit::new("PostToolUse");
-        emit.replace_tool_output(replacement);
+        if let Some(replacement) = replacement {
+            emit.replace_tool_output(replacement);
+        }
+        if let Some(value) = object_replacement {
+            emit.replace_claude_tool_output(value);
+        }
         let emitted = emit.finish();
         let cfg = Config::load().ok();
         LedgerSink::of(cfg.as_ref()).book(event.session(), "output-condensation", emitted);
@@ -804,6 +888,94 @@ fn precompact(event: &HookEvent) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The replacement must MIRROR the received response and change only
+    /// stdout. A fresh object of the apparently-right shape is discarded by
+    /// the harness, and silently — so every field the tool emitted, including
+    /// ones cfetch does not understand, has to survive.
+    #[test]
+    fn the_replacement_mirrors_every_field_and_changes_only_stdout() {
+        let state = tempfile::tempdir().unwrap();
+        let flood = (0..400).map(|i| format!("src/f{i}.rs:{i}: hit")).collect::<Vec<_>>().join("\n");
+        let event: HookEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "s-obj",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu_x",
+            "tool_input": {"command": "grep -rn hit src/"},
+            "tool_response": {
+                "stdout": flood,
+                "stderr": "a warning",
+                "interrupted": false,
+                "isImage": false,
+                "some_future_field": {"nested": 1}
+            }
+        })).unwrap();
+
+        let out = object_condensed_output(state.path(), &event).unwrap().expect("condensed");
+        let obj = out.as_object().unwrap();
+        // Only stdout changed.
+        assert_ne!(obj["stdout"].as_str().unwrap(), flood);
+        assert!(obj["stdout"].as_str().unwrap().contains("preserved at"));
+        // stderr is never touched — an error must reach the model verbatim.
+        assert_eq!(obj["stderr"], "a warning");
+        // Fields cfetch knows nothing about must survive, or the harness drops
+        // the whole replacement.
+        assert_eq!(obj["interrupted"], false);
+        assert_eq!(obj["isImage"], false);
+        assert_eq!(obj["some_future_field"]["nested"], 1);
+    }
+
+    /// Codex sends a bare string and takes continue:false; this path must not
+    /// fire for it, or both channels would try to replace the same result.
+    #[test]
+    fn the_object_path_declines_codex_shaped_events() {
+        let state = tempfile::tempdir().unwrap();
+        let event: HookEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "s-codex",
+            "turn_id": "t1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "grep -rn x ."},
+            "tool_response": "x".repeat(60_000),
+        })).unwrap();
+        assert!(object_condensed_output(state.path(), &event).unwrap().is_none());
+    }
+
+    /// The program parser selects the condensation strategy, so a prefix it
+    /// does not know silently downgrades a known family to Generic. These are
+    /// the forms zsh and fish users actually type.
+    #[test]
+    fn shell_prefixes_beyond_bash_still_find_the_program() {
+        use crate::condense::{classify, Family};
+        // zsh
+        assert_eq!(classify("noglob cargo test"), Family::Verification);
+        assert_eq!(classify("nocorrect cargo build"), Family::Verification);
+        // fish and POSIX
+        assert_eq!(classify("command cargo test"), Family::Verification);
+        assert_eq!(classify("builtin cd /tmp"), classify("cd /tmp"));
+        assert_eq!(classify("exec cargo test"), Family::Verification);
+        // BSD sudo, and the scheduling wrappers
+        assert_eq!(classify("doas cargo test"), Family::Verification);
+        assert_eq!(classify("nice -n 19 cargo test"), Family::Verification);
+        assert_eq!(classify("stdbuf -oL cargo test"), Family::Verification);
+        // env assignment, still the subcommand off the same iterator
+        assert_eq!(classify("RUST_LOG=debug cargo test"), Family::Verification);
+    }
+
+    #[test]
+    fn shell_write_detection_survives_zsh_and_fish_forms() {
+        // zsh clobber and both-stream redirects
+        assert!(is_shell_write("cargo build >| out.log"));
+        assert!(is_shell_write("cargo build &> out.log"));
+        // fish conjunctions reduce to segments
+        assert!(is_shell_write("mkdir -p /tmp/x && touch /tmp/x/a"));
+        // prefixes the shared parser now steps over
+        assert!(is_shell_write("doas rm -rf /tmp/x"));
+        assert!(is_shell_write("command cp a b"));
+        assert!(is_shell_write("noglob mv a b"));
+        // still not fooled by quoted redirects or read-only commands
+        assert!(!is_shell_write("echo \'a > b\'"));
+        assert!(!is_shell_write("command cat file"));
+    }
+
     fn budget_event(session: &str, path: &std::path::Path) -> HookEvent {
         serde_json::from_value(serde_json::json!({
             "session_id": session,
@@ -880,6 +1052,83 @@ mod tests {
         };
         post_tool_budget(state.path(), &cfg, &budget_event("s-zero", &big)).unwrap();
         assert!(crate::session_state::load(state.path(), "s-zero").drain_reminders().is_empty());
+    }
+
+    fn start_event(session: &str, reason: &str) -> HookEvent {
+        HookEvent {
+            session_id: Some(session.into()),
+            reason: Some(reason.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A session file as a working conversation leaves it: something read,
+    /// something written, caps spent, warnings disarmed by a compaction.
+    fn seed_conversation(dir: &Path, session: &str) {
+        let mut st = session_state::SessionState::default();
+        st.record_read("/a.rs", 100);
+        st.record_write("/b.rs");
+        st.warned.insert("/a.rs".into());
+        st.shown_keys.insert("status".into());
+        st.compacted = true;
+        st.tool_events = 7;
+        session_state::store(dir, session, &st);
+    }
+
+    #[test]
+    fn a_cleared_conversation_starts_without_the_previous_one_s_records() {
+        let state = tempfile::tempdir().unwrap();
+        seed_conversation(state.path(), "s-clear");
+        session_start_state(state.path(), &start_event("s-clear", "clear"));
+
+        let mut st = session_state::load(state.path(), "s-clear");
+        assert!(st.reads.is_empty(), "the read history belongs to the conversation that is gone");
+        assert!(st.written.is_empty(), "so does the write history");
+        assert_eq!(st.tool_events, 0);
+        assert!(!st.compacted, "the new conversation has not been compacted");
+        assert!(st.queue_reminder("status", "nudge"), "the spent caps are returned");
+    }
+
+    #[test]
+    fn resume_and_compaction_continue_the_conversation_they_arrive_in() {
+        for reason in ["resume", "compact"] {
+            let state = tempfile::tempdir().unwrap();
+            seed_conversation(state.path(), "s");
+            session_start_state(state.path(), &start_event("s", reason));
+
+            let mut st = session_state::load(state.path(), "s");
+            assert_eq!(st.reads.len(), 1, "{reason} must not forget what was already read");
+            assert!(st.compacted, "{reason} must not re-arm what compaction disarmed");
+            assert!(!st.queue_reminder("status", "nudge"), "{reason} keeps spent caps spent");
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_start_reason_keeps_what_it_cannot_judge() {
+        let state = tempfile::tempdir().unwrap();
+        seed_conversation(state.path(), "s-unknown");
+        session_start_state(state.path(), &start_event("s-unknown", "rewound"));
+        assert_eq!(
+            session_state::load(state.path(), "s-unknown").reads.len(),
+            1,
+            "an unknown reason must take the recoverable branch, not the destructive one"
+        );
+    }
+
+    #[test]
+    fn the_historical_source_field_drives_the_same_decision() {
+        let state = tempfile::tempdir().unwrap();
+        seed_conversation(state.path(), "s-legacy");
+        let event = HookEvent {
+            session_id: Some("s-legacy".into()),
+            source: Some("startup".into()),
+            ..Default::default()
+        };
+        session_start_state(state.path(), &event);
+        assert!(
+            session_state::load(state.path(), "s-legacy").reads.is_empty(),
+            "the older field spelling names the same start"
+        );
     }
 
     #[test]

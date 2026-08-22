@@ -1,8 +1,12 @@
 # cfetch
 
-A second brain for coding agents: kernel-style privilege rings over one global
-knowledge tree — unconditional hook injection, ranked retrieval with cited
-memories, and a code index, in one Rust binary.
+[![CI](https://github.com/corbet-labs/cfetch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/corbet-labs/cfetch/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/corbet-labs/cfetch?display_name=tag)](https://github.com/corbet-labs/cfetch/releases/latest)
+[![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSE.md)
+
+A cited, trust-tiered memory layer for Claude Code, Codex, Gemini and other AI
+agents, built on plain Markdown and Rust. It combines hook injection, ranked
+retrieval, automatic capture and a code index in one binary.
 
 Your agent's accumulated knowledge (rules, decisions, facts, working state)
 lives as plain markdown in a single git-tracked tree (by default `~/agents`).
@@ -94,7 +98,11 @@ storage: it is a network call away from the whole brain.
   injection ledger, live recall.
 - **`cfetch selfcheck` / `cfetch status`** — verify the installation end to
   end; surface silently-failing hooks instead of letting the brain die
-  unnoticed for weeks.
+  unnoticed for weeks. Every reporting surface compares the hooks cfetch
+  registered at install time against the ones that have actually reported, so
+  a hook that has never fired reads as UNOBSERVED rather than as healthy — and
+  an index nobody has scanned, a ledger nobody has written and a staging queue
+  nothing has ever examined all say so instead of printing a zero.
 
 ## Install
 
@@ -104,21 +112,31 @@ embedded in the executable. Current archives are explicitly named `remote`
 because they use the configured embeddings endpoint; accelerator names are not
 published until their inference runtime is actually linked and tested.
 
-Prebuilt archives are attached to [GitHub releases](https://github.com/julian-corbet/cfetch/releases).
+Prebuilt archives are attached to [GitHub releases](https://github.com/corbet-labs/cfetch/releases).
 Each archive contains the binary, `LICENSE.md`, and the generated
 `THIRD-PARTY-LICENSES.txt` attribution bundle.
 
-From source:
+Package-manager installs:
 
 ```console
-# cargo (any platform with Rust 1.95+)
-cargo install --git https://github.com/julian-corbet/cfetch
+# Homebrew (macOS and Linux)
+brew tap corbet-labs/cfetch
+brew install cfetch
+
+# Arch Linux (AUR)
+paru -S cfetch-agent
 
 # nix (flake; x86_64-linux and aarch64-linux)
-nix profile install github:julian-corbet/cfetch
+nix profile install github:corbet-labs/cfetch
+```
 
-# Arch Linux
-git clone https://github.com/julian-corbet/cfetch
+From source, on any platform with Rust 1.95 or later:
+
+```console
+cargo install --git https://github.com/corbet-labs/cfetch
+
+# or build the Arch package directly
+git clone https://github.com/corbet-labs/cfetch
 cd cfetch/packaging/arch && makepkg -si
 ```
 
@@ -544,6 +562,47 @@ r1-3f9c04a2d8 AGENT.md:101-104 (ring 1)
     Native filesystem backup only — never file-level tools between ZFS datasets ...
 ```
 
+### The precision gate (`recall.gate`)
+
+Off by default. Retrieval OR-joins the query's terms on purpose, so a six-word
+question still finds the block that phrased it differently — and a block
+sharing one ordinary word with the query comes back too. This is the stage
+that refuses it.
+
+```json
+{
+  "recall": {
+    "gate": { "min_terms": 2 }
+  }
+}
+```
+
+`min_terms` is how many DISTINCT non-stopword query terms a hit must carry. It
+is clamped to the number the query actually has, so a one-word query is never
+gated against itself, and `0` or `1` means no gate at all.
+
+```console
+$ cfetch recall zfs snapshot retention policy
+cfetch recall: precision gate dropped 1 hit(s) carrying under 2 of the query's 4 term(s)
+r3-8c1a44f0d2 knowledge/hosts/server/storage.md:31-33 (ring 3)
+    [Storage > Snapshots] zfs snapshot retention runs nightly and prunes ...
+```
+
+- A term counts when a word of the hit STARTS WITH it — the same prefix rule
+  retrieval asks FTS5 for, so the gate never contradicts what proposed the hit.
+  The whole block is weighed, not the one-line snippet.
+- The gate runs LAST, after every stage that orders, and before the answer is
+  cut to `--limit`. Retrieval widens to twice the limit while it is armed, so
+  hits that pass refill the slots the dropped ones free.
+- It never empties an answer: when nothing reaches the floor, the best-ranked
+  hit comes back anyway. An operator who cannot tell a gate from an empty brain
+  is worse off than one holding a weak hit they can dismiss themselves.
+- It weighs lexical overlap, so it stands down for `--semantic`, `--hybrid` and
+  any reranked answer — a vector hit that shares no word with the query is what
+  semantic recall is FOR — and says on stderr that it did.
+- Every removal is reported, on stderr and as `note` in `--json`. A gate that
+  quietly swallows a hit you expected is worse than the hit it suppressed.
+
 ## What lives where
 
 The tree is the only storage of record, and that includes the automatic half
@@ -592,3 +651,7 @@ to know up front:
 - cfetch is a clean-room implementation of mechanisms studied in two AGPL
   projects. Do not copy or closely paraphrase code from them (or any other
   incompatibly-licensed work) into a contribution.
+
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). Use
+the structured issue forms for [support](SUPPORT.md), and report suspected
+vulnerabilities through the private process in [SECURITY.md](SECURITY.md).
