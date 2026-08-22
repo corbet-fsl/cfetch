@@ -81,6 +81,14 @@ pub(crate) fn rel_doc_path(rel: &Path) -> String {
     normalize_separators(&rel.to_string_lossy(), std::path::MAIN_SEPARATOR)
 }
 
+/// Whether a doc path names a file in Claude Code's native auto-memory store
+/// rather than the brain tree. The `native:` tag is the only thing that
+/// separates the two stores downstream of the scan, and each store has its
+/// own contract — a clamped ring, and its own link dialect.
+fn is_native(doc_path: &str) -> bool {
+    doc_path.starts_with("native:")
+}
+
 /// THE taxonomy entry point: the configured location default for a
 /// brain-root-relative path. Frontmatter `ring: N` still overrides it at
 /// scan time. Everything that needs a path's ring — the scan, the watcher,
@@ -90,12 +98,37 @@ pub fn default_ring(rel: &str, rules: &RingRules) -> u8 {
     rules.ring_for(rel)
 }
 
+/// Directory names whose markdown is installed or generated, never authored.
+///
+/// Built in rather than configurable, because a file under one of these is
+/// machine output wherever the tree lives and nobody would choose to recall
+/// it. `exclude_prefixes` could not express it anyway: those prefixes anchor
+/// at the brain root, and a dependency tree appears at arbitrary depth — a
+/// documentation vault built with a static-site generator is an npm project,
+/// so one `npm install` inside it buries the operator's own notes under
+/// thousands of package READMEs that are prose-shaped, plausible, and enough
+/// to dominate FTS for ordinary words.
+///
+/// Deliberately NOT here: `build`, `dist`, `target`, `vendor`. Those are
+/// credible topic names in a knowledge tree, and a built-in nobody can switch
+/// off would make an operator's own notes silently unrecallable — a far worse
+/// failure than indexing a generated copy of prose that mirror dedup already
+/// collapses.
+const GENERATED_DIRS: &[&str] = &["node_modules", "__pycache__"];
+
+/// Whether any path component names a [`GENERATED_DIRS`] tree. Component-wise,
+/// not substring: `knowledge/node_modules-migration.md` is a real note.
+fn under_generated_dir(rel: &str) -> bool {
+    rel.trim_end_matches('/').split('/').any(|c| GENERATED_DIRS.contains(&c))
+}
+
 /// Paths that must never enter the index: the compiled-in boundary (secrets,
 /// logs, git internals) plus the operator's `exclude_prefixes` — by default
 /// `projects/` (repo clones, owned by the code index) and
-/// `knowledge/archive/` (retired knowledge, not recallable by accident).
+/// `knowledge/archive/` (retired knowledge, not recallable by accident) —
+/// plus the generated-directory built-ins.
 fn excluded(rel: &str, rules: &RingRules) -> bool {
-    rules.excluded(rel)
+    rules.excluded(rel) || under_generated_dir(rel)
 }
 
 /// Directory form of [`excluded`]: true when nothing under `rel` can ever be
@@ -103,7 +136,7 @@ fn excluded(rel: &str, rules: &RingRules) -> bool {
 /// serves both forms — the watch set is the index set by construction, never
 /// by two hand-maintained lists agreeing.
 pub(crate) fn excluded_dir(rel: &str, rules: &RingRules) -> bool {
-    rules.excluded_dir(rel)
+    rules.excluded_dir(rel) || under_generated_dir(rel)
 }
 
 /// Secret-shaped file names are refused even outside mind/secrets/ — capture
@@ -116,6 +149,29 @@ fn secret_shaped(rel: &str) -> bool {
         || base.starts_with(".env")
         || base.ends_with(".pem")
         || base.ends_with(".key")
+}
+
+/// Longest line, in bytes, that can still be something a person wrote.
+///
+/// Measured rather than guessed: across a real brain of thousands of files
+/// the longest hand-authored line was a wide memory-index table row at ~3 KB,
+/// and nothing came within a factor of two of this cap. The shapes on the
+/// other side — a minified bundle pasted into a page, a base64 data URI, a
+/// one-line data dump saved as `.md` — sit orders of magnitude above it.
+const MAX_PROSE_LINE: usize = 8 * 1024;
+
+/// Whether a statement is generated rather than written.
+///
+/// Such a statement is not merely useless in recall, it is corrosive: FTS5
+/// tokenizes it into thousands of terms, so it becomes a candidate for
+/// almost any query while carrying no meaning, and it would claim an
+/// embedding of its own. Bytes, not characters, because bytes are what the
+/// tokenizer and the embedder are charged for.
+///
+/// One pass over a body already in memory — the walk that reads the file
+/// pays nothing extra for this.
+fn generated_blob(body: &str) -> bool {
+    body.lines().any(|l| l.len() > MAX_PROSE_LINE)
 }
 
 /// Parses a leading `---` frontmatter for `ring: N`. Returns (ring override,
@@ -183,6 +239,57 @@ pub fn wikilinks(text: &str) -> Vec<String> {
                 out.push(target.to_ascii_lowercase());
             }
             rest = &after[end + 2..];
+        }
+    }
+    out
+}
+
+/// Extracts `[label](target.md)` targets, in the same shape [`wikilinks`]
+/// returns them: link title and `#anchor` dropped, `./` prefix stripped,
+/// lowercased, fenced code skipped.
+///
+/// This is the NATIVE store's dialect, not the brain's. The brain is an
+/// Obsidian vault whose edges are wikilinks and whose resolution keeps
+/// brain-lint parity; Claude Code's memory store has no wikilinks at all —
+/// its index file points at its entries with ordinary markdown links. Reading
+/// one dialect per store is what keeps those pointers from being edges nobody
+/// can see, without inventing edges in the vault.
+///
+/// Only `.md` targets are taken: one rule that keeps images and web links out
+/// of the pointer set. Whatever survives it and still resolves to no indexed
+/// doc yields no edge, exactly as an unresolvable wikilink does.
+pub fn markdown_links(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        match fence {
+            Some(open) => {
+                if fence_closes(t, open) {
+                    fence = None;
+                }
+                continue;
+            }
+            None => {
+                if let Some(open) = fence_open(t) {
+                    fence = Some(open);
+                    continue;
+                }
+            }
+        }
+        let mut rest = line;
+        while let Some(start) = rest.find("](") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find(')') else { break };
+            let target = &after[..end];
+            rest = &after[end + 1..];
+            // `[a](b.md "Title")`: the title is not part of the target.
+            let target = target.split_whitespace().next().unwrap_or("");
+            let target = target.split('#').next().unwrap_or("");
+            let target = target.strip_prefix("./").unwrap_or(target);
+            if target.ends_with(".md") {
+                out.push(target.to_ascii_lowercase());
+            }
         }
     }
     out
@@ -486,6 +593,129 @@ fn stat_of(meta: &std::fs::Metadata) -> (u64, u64) {
     (mtime, meta.len())
 }
 
+/// Per-directory overlay that scopes a subtree out of cfetch WITHOUT hiding
+/// it from git. Gitignore syntax, gitignore precedence, its own file name:
+/// until this existed `.gitignore` was the only file-based control the
+/// walkers read, so keeping generated markdown out of the brain index — or a
+/// vendored subtree out of the code index — meant untracking it first.
+pub const IGNORE_FILE: &str = ".cfetchignore";
+
+/// THE walker every enumeration of a tree is built from: the brain scan, the
+/// code scan, and the serving watcher alike.
+///
+/// The ignore policy lives here and nowhere else on purpose. The watch set
+/// must stay exactly the index set — a directory the watcher skips is a
+/// directory whose writes never wake the daemon, which is silent staleness,
+/// the one failure serving mode refuses — and an overlay honored by one
+/// walker but not another would reintroduce that drift one `.cfetchignore`
+/// at a time. Callers add their own traversal concerns (parallelism,
+/// `filter_entry`) on top of what is returned.
+pub fn tree_walker(root: &Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        // Highest precedence of every ignore source, and read whether or not
+        // the tree is a git checkout — a brain that is not a repo can be
+        // scoped too.
+        .add_custom_ignore_filename(IGNORE_FILE)
+        .follow_links(false);
+    builder
+}
+
+/// Whether the indexer would actually READ this brain-relative path:
+/// markdown, past the exclusion boundary, not secret-shaped. The scan and
+/// the cost census below both come through here, so "what would be indexed"
+/// has one answer instead of two lists that agree until they don't.
+pub(crate) fn indexable_doc(rel: &str, rules: &RingRules) -> bool {
+    rel.ends_with(".md") && !excluded(rel, rules) && !secret_shaped(rel)
+}
+
+/// A directory holding at least 9/10 of everything the indexer reads IS the
+/// index, not a subtree of it: excluding it would not scope cfetch, it would
+/// switch it off. Such a directory is never offered as a candidate — on a
+/// tree whose whole corpus sits under one `knowledge/`, the only honest
+/// answer is that there is nothing to scope out.
+const WHOLE_TREE_NUM: usize = 9;
+const WHOLE_TREE_DEN: usize = 10;
+
+/// Where the index's cost actually sits: how many files the INDEXER would
+/// read under each directory of the tree.
+///
+/// The measure is deliberately neither bytes on disk nor directory size. A
+/// 40 GiB directory of build artifacts costs the index nothing — the walker
+/// passes over every file in it — while a 3 MiB directory of generated
+/// markdown costs a doc, a watch and a block set per file, and is what makes
+/// a tree outgrow the watch budget. Advice derived from `du` would name the
+/// first and never the second.
+#[derive(Debug, Default)]
+pub struct DocCensus {
+    total: usize,
+    /// Directory prefix (no trailing slash) -> indexable docs beneath it.
+    /// Keyed by directory rather than by file, so a tree of any size costs a
+    /// map the size of its directory count.
+    by_prefix: std::collections::HashMap<String, usize>,
+}
+
+impl DocCensus {
+    /// Counts one indexable doc against every directory that contains it.
+    pub fn record(&mut self, rel: &str) {
+        self.total += 1;
+        for (i, _) in rel.match_indices('/') {
+            *self.by_prefix.entry(rel[..i].to_string()).or_default() += 1;
+        }
+    }
+
+    /// Everything the indexer would read, tree-wide.
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// The subtrees worth scoping out: DISJOINT directories, each holding at
+    /// least `min_share` of what the indexer reads, heaviest first.
+    ///
+    /// Depth decides whether an answer is useful at all. "`knowledge/` holds
+    /// 60%" is not advice — nobody can exclude their knowledge tree — while
+    /// "`knowledge/archive/2019/` holds 55% of everything" is something to
+    /// act on. So the deepest directory that clears the bar wins and its
+    /// ancestors are dropped, and a directory that already IS the index (see
+    /// [`WHOLE_TREE_NUM`]) is never named at all. Disjointness is what makes
+    /// the numbers readable: no doc is counted in two candidates.
+    pub fn concentrations(&self, min_share: f64) -> Vec<(String, usize)> {
+        let threshold = ((self.total as f64) * min_share).ceil().max(1.0) as usize;
+        // Deepest first, so a nested directory claims its cost before any
+        // ancestor is considered for the same docs.
+        let mut candidates: Vec<(&String, usize)> =
+            self.by_prefix.iter().map(|(p, &n)| (p, n)).collect();
+        candidates.sort_by(|a, b| depth_of(b.0).cmp(&depth_of(a.0)).then_with(|| a.0.cmp(b.0)));
+        let mut claimed: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for (prefix, count) in candidates {
+            let already_named = claimed.get(prefix.as_str()).copied().unwrap_or(0);
+            if already_named > 0
+                || count < threshold
+                || count * WHOLE_TREE_DEN >= self.total * WHOLE_TREE_NUM
+            {
+                continue;
+            }
+            out.push((prefix.clone(), count));
+            for (i, _) in prefix.match_indices('/') {
+                *claimed.entry(&prefix[..i]).or_default() += count;
+            }
+        }
+        // Count first, path second: the same tree must always yield the same
+        // advice, and a HashMap hands its entries back in no order at all.
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+}
+
+/// Directory nesting depth of a `/`-separated prefix; `knowledge` is 0.
+fn depth_of(prefix: &str) -> usize {
+    prefix.matches('/').count()
+}
+
 /// Brain tree + (optionally) Claude Code's native auto-memory stores.
 /// Native memory (`<native_root>/<project-slug>/memory/*.md`) is indexed as
 /// ring 2 with doc paths `native:<slug>/<file>` — cfetch reads and surfaces
@@ -496,11 +726,7 @@ fn collect_files(
     rules: &RingRules,
 ) -> Vec<SourceFile> {
     let mut out = Vec::new();
-    let walker = ignore::WalkBuilder::new(brain_root)
-        .hidden(true)
-        .git_ignore(true)
-        .follow_links(false)
-        .build();
+    let walker = tree_walker(brain_root).build();
     for entry in walker.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
@@ -508,7 +734,7 @@ fn collect_files(
         }
         let Ok(rel) = entry.path().strip_prefix(brain_root) else { continue };
         let rel = rel_doc_path(rel);
-        if !rel.ends_with(".md") || excluded(&rel, rules) || secret_shaped(&rel) {
+        if !indexable_doc(&rel, rules) {
             continue;
         }
         let (mtime, size) = stat_of(&meta);
@@ -636,8 +862,10 @@ fn chain_text(chain: &[(u8, String)]) -> String {
 
 /// Inserts one source file's rows — doc, blocks (with heading-chain context),
 /// FTS rows, wikilink targets — or records it in `skipped_docs` when its ring
-/// is 5+. Shared by the full scan and the incremental rescan so both derive
-/// byte-identical catalogs from the same tree.
+/// is 5+. Generated statements ([`generated_blob`]) are dropped individually
+/// while the rest of their file is indexed normally. Shared by the full scan
+/// and the incremental rescan so both derive byte-identical catalogs from the
+/// same tree.
 fn insert_doc(
     tx: &rusqlite::Transaction<'_>,
     src: &SourceFile,
@@ -646,9 +874,10 @@ fn insert_doc(
 ) -> anyhow::Result<()> {
     let (fm_ring, fm_lines) = frontmatter_ring(raw);
     let mut ring = fm_ring.unwrap_or(src.default_ring);
+    let native = is_native(&src.doc_path);
     // The native store's contract ring is 2: honor demotion to 5+ (skip),
     // never self-promotion into the resident/policy rings.
-    if src.doc_path.starts_with("native:") {
+    if native {
         ring = ring.max(2);
     }
     if ring > MAX_INDEXED_RING {
@@ -668,7 +897,8 @@ fn insert_doc(
         rusqlite::params![src.doc_path, ring, src.mtime as i64, src.size as i64],
     )?;
     let doc_id = tx.last_insert_rowid();
-    for target in wikilinks(&blanked) {
+    let targets = if native { markdown_links(&blanked) } else { wikilinks(&blanked) };
+    for target in targets {
         tx.execute(
             "INSERT INTO doc_links(doc_id, target) VALUES(?1, ?2)",
             rusqlite::params![doc_id, target],
@@ -717,6 +947,14 @@ fn insert_doc(
             chain_key = chain_text(&chain);
             ctx = chain_key.clone();
         }
+        // Refused AFTER the chain and table bookkeeping above, never before:
+        // every neighboring statement then keeps byte-identical context, so
+        // a blob appearing beside a paragraph can never move that
+        // paragraph's citation. Refusing the statement and not the file also
+        // keeps a knowledge page that embeds one data URI fully recallable.
+        if generated_blob(&body) {
+            continue;
+        }
         let hash = content_hash(&body);
         let cite = cite_from_hash(ring, &hash);
         tx.prepare_cached(
@@ -737,8 +975,10 @@ fn insert_doc(
 /// is registered under ALL its path suffixes (stem, parent/stem, …, full
 /// path; `.md` stripped, lowercased) and a target resolves only when its key
 /// is unambiguous — a slash-qualified target resolves a stem collision
-/// (brain-lint parity). A pure function of (docs, doc_links): full and
-/// incremental scans converge on identical edges.
+/// (brain-lint parity). A native-store link is tried against its own
+/// project's directory first, because a markdown link is a relative path.
+/// A pure function of (docs, doc_links): full and incremental scans converge
+/// on identical edges.
 fn resolve_links(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
     tx.execute("DELETE FROM links", [])?;
     let mut by_suffix: std::collections::HashMap<String, Option<i64>> =
@@ -759,15 +999,32 @@ fn resolve_links(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
             }
         }
     }
-    let pending: Vec<(i64, String)> = {
-        let mut stmt = tx.prepare("SELECT doc_id, target FROM doc_links")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let pending: Vec<(i64, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT dl.doc_id, d.path, dl.target FROM doc_links dl JOIN docs d ON d.id = dl.doc_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
         rows.filter_map(Result::ok).collect()
     };
-    for (from_doc, target) in pending {
+    for (from_doc, from_path, target) in pending {
         let key = target.strip_suffix(".md").unwrap_or(&target);
-        if let Some(Some(to_doc)) = by_suffix.get(key)
-            && *to_doc != from_doc
+        // A markdown link is a RELATIVE path by definition: `[x](y.md)` in
+        // one project's memory index means THAT project's y.md. Every project
+        // in the native store names the same generic files, so the vault-wide
+        // stem key is ambiguous exactly where the pointers matter, and the
+        // whole index would resolve to nothing on any host with more than one
+        // project. The vault keeps stem resolution untouched: there a name is
+        // global, and brain-lint reads the same edges from the same rule.
+        let sibling = is_native(&from_path)
+            .then(|| from_path.to_ascii_lowercase())
+            .and_then(|p| p.rsplit_once('/').map(|(dir, _)| format!("{dir}/{key}")));
+        let resolved = sibling
+            .and_then(|k| by_suffix.get(&k).copied().flatten())
+            .or_else(|| by_suffix.get(key).copied().flatten());
+        if let Some(to_doc) = resolved
+            && to_doc != from_doc
         {
             tx.execute(
                 "INSERT INTO links(from_doc, to_doc) VALUES(?1, ?2)",
@@ -1732,6 +1989,150 @@ mod path_shape_tests {
 }
 
 #[cfg(test)]
+mod scoping_tests {
+    use super::*;
+
+    #[test]
+    fn cfetchignore_scopes_a_subtree_out_of_the_brain_scan() {
+        let brain = tempfile::tempdir().unwrap();
+        let root = brain.path();
+        std::fs::create_dir_all(root.join("knowledge/generated")).unwrap();
+        std::fs::write(root.join("knowledge/real.md"), "# real\n").unwrap();
+        std::fs::write(root.join("knowledge/generated/api.md"), "# generated\n").unwrap();
+        // Nothing here is gitignored, and nothing may become gitignored: the
+        // generated docs are committed on purpose. Before the overlay there
+        // was no way to express "index everything but this".
+        std::fs::write(root.join(".cfetchignore"), "knowledge/generated/\n").unwrap();
+
+        let docs: Vec<String> = collect_files(root, None, &RingRules::default())
+            .into_iter()
+            .map(|f| f.doc_path)
+            .collect();
+        assert_eq!(docs, vec!["knowledge/real.md".to_string()]);
+    }
+
+    #[test]
+    fn cfetchignore_cannot_reopen_the_hard_exclusion_boundary() {
+        let brain = tempfile::tempdir().unwrap();
+        let root = brain.path();
+        std::fs::create_dir_all(root.join("mind/secrets")).unwrap();
+        std::fs::create_dir_all(root.join("mind/memories")).unwrap();
+        std::fs::write(root.join("mind/secrets/token.md"), "# token\n").unwrap();
+        std::fs::write(root.join("mind/memories/how.md"), "# how\n").unwrap();
+        std::fs::write(root.join("keep.md"), "# keep\n").unwrap();
+        // Gitignore syntax carries negation, so the overlay can be written to
+        // ASK for secrets back. It gets `mind/` excluded and nothing else:
+        // the boundary is applied after the walk, not by it.
+        std::fs::write(root.join(".cfetchignore"), "mind/\n!mind/secrets/\n").unwrap();
+
+        let docs: Vec<String> = collect_files(root, None, &RingRules::default())
+            .into_iter()
+            .map(|f| f.doc_path)
+            .collect();
+        assert_eq!(docs, vec!["keep.md".to_string()]);
+    }
+
+    #[test]
+    fn writes_under_a_scoped_out_subtree_do_not_churn_the_index() {
+        let brain = tempfile::tempdir().unwrap();
+        let root = brain.path();
+        std::fs::create_dir_all(root.join("scratch")).unwrap();
+        std::fs::write(root.join("keep.md"), "# keep\n").unwrap();
+        std::fs::write(root.join(".cfetchignore"), "scratch/\n").unwrap();
+        let rules = RingRules::default();
+        let before = tree_fingerprint(root, None, &rules);
+
+        // The staleness basis is the same file list, so scoping a subtree out
+        // buys more than a smaller catalog: a directory that churns every few
+        // seconds stops forcing rebuilds of everything else.
+        std::fs::write(root.join("scratch/churn.md"), "# churn\n").unwrap();
+        assert_eq!(
+            tree_fingerprint(root, None, &rules),
+            before,
+            "a write under a scoped-out subtree must not make the catalog stale"
+        );
+        std::fs::write(root.join("keep.md"), "# keep, expanded\n").unwrap();
+        assert_ne!(tree_fingerprint(root, None, &rules), before, "an indexed write still must");
+    }
+
+    /// Fixture: 20 generated API docs, a real knowledge subtree, some
+    /// memories, and a directory of binaries that outweighs all of it on
+    /// disk by three orders of magnitude.
+    fn mixed_census() -> DocCensus {
+        let rules = RingRules::default();
+        let mut census = DocCensus::default();
+        // The heavy directory the index never opens: not one entry of it is
+        // recordable, whatever it weighs.
+        for i in 0..4 {
+            assert!(!indexable_doc(&format!("bulk/blob{i}.bin"), &rules));
+        }
+        for i in 0..20 {
+            let rel = format!("knowledge/generated/api/p{i}.md");
+            assert!(indexable_doc(&rel, &rules));
+            census.record(&rel);
+        }
+        for i in 0..5 {
+            census.record(&format!("knowledge/hosts/h{i}.md"));
+        }
+        for i in 0..4 {
+            census.record(&format!("mind/memories/m{i}.md"));
+        }
+        census.record("AGENT.md");
+        census
+    }
+
+    #[test]
+    fn census_ranks_by_what_the_indexer_reads_not_by_bytes_on_disk() {
+        let census = mixed_census();
+        assert_eq!(census.total(), 30);
+        let hits = census.concentrations(0.15);
+        // Disjoint and deepest: the generated docs are named where they sit,
+        // and no candidate contains another.
+        assert_eq!(
+            hits,
+            vec![
+                ("knowledge/generated/api".to_string(), 20),
+                ("knowledge/hosts".to_string(), 5),
+            ]
+        );
+        // `knowledge/` holds 25 of 30 and is still not the answer: naming it
+        // would tell the operator to exclude their whole knowledge tree.
+        assert!(hits.iter().all(|(p, _)| p != "knowledge"));
+        // Nothing on the ranking came from disk usage.
+        assert!(hits.iter().all(|(p, _)| !p.starts_with("bulk")));
+    }
+
+    #[test]
+    fn census_names_the_parent_when_the_cost_is_spread_across_it() {
+        let mut census = DocCensus::default();
+        for quarter in 0..4 {
+            for note in 0..5 {
+                census.record(&format!("todo/done/q{quarter}/n{note}.md"));
+            }
+        }
+        for i in 0..10 {
+            census.record(&format!("knowledge/hosts/h{i}.md"));
+        }
+        // No child of `todo/done` clears the bar alone, so `todo/done` is the
+        // deepest honest name — descending further would advise excluding one
+        // quarter and leaving three behind.
+        assert_eq!(census.concentrations(0.5), vec![("todo/done".to_string(), 20)]);
+    }
+
+    #[test]
+    fn a_tree_that_is_all_one_subtree_yields_no_advice_at_all() {
+        let mut census = DocCensus::default();
+        for area in ["hosts", "world", "projects", "coding", "health", "finance", "career"] {
+            census.record(&format!("knowledge/{area}/one.md"));
+        }
+        // `knowledge/` holds everything and every child is equal. There is
+        // nothing to scope out, and "exclude your entire brain" is worse than
+        // saying nothing at all.
+        assert!(census.concentrations(0.15).is_empty(), "{:?}", census.concentrations(0.15));
+    }
+}
+
+#[cfg(test)]
 mod tests {
 
     #[test]
@@ -2005,6 +2406,124 @@ mod tests {
     }
 
     #[test]
+    fn installed_dependency_trees_are_never_indexed() {
+        // A documentation vault built with a static-site generator is an npm
+        // project: `npm install` inside the brain drops thousands of package
+        // READMEs into it, at arbitrary depth, and every one of them is
+        // markdown the extension gate happily takes.
+        let dir = brain(&[
+            ("node_modules/left-pad/README.md", "hurbeck pads a string\n"),
+            ("site/node_modules/dep/README.md", "hurbeck nested copy\n"),
+            ("scripts/__pycache__/notes.md", "quelber cached\n"),
+            ("knowledge/node_modules-migration.md", "vantrel dropping the dep tree\n"),
+            ("knowledge/live.md", "kavender fact\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 2, "only the two authored knowledge files");
+        assert!(recall(&conn, "hurbeck", 5).unwrap().is_empty(), "at any depth");
+        assert!(recall(&conn, "quelber", 5).unwrap().is_empty());
+        assert_eq!(
+            recall(&conn, "vantrel", 5).unwrap().len(),
+            1,
+            "a note ABOUT the dep tree is not in it: components, not substrings"
+        );
+        // The watcher derives its subtrees from the directory form, so the
+        // two predicates must agree or the daemon watches what it cannot index.
+        assert!(excluded_dir("node_modules", &RingRules::default()));
+        assert!(excluded_dir("site/node_modules/", &RingRules::default()));
+    }
+
+    #[test]
+    fn build_output_directories_stay_indexable_on_purpose() {
+        // The names a code scanner blocklists are credible knowledge topics
+        // here, and a built-in nobody can switch off would make an operator's
+        // own notes silently unrecallable. Duplicated prose is mirror dedup's
+        // problem, not the walk's.
+        let dir = brain(&[
+            ("knowledge/build/pipeline.md", "shellac the build story\n"),
+            ("knowledge/vendor/terms.md", "shellac the vendor terms\n"),
+            ("knowledge/target/goals.md", "shellac this year's targets\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 3);
+        assert_eq!(recall(&conn, "shellac", 5).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn lockfiles_and_agent_config_directories_never_reach_the_walk() {
+        // Verification lock for the two hygiene classes this index gets for
+        // free: lockfiles are not markdown, and agent-config directories are
+        // hidden. Both are load-bearing — an agent's own instruction files
+        // outrank real knowledge on any importance signal — so pin them
+        // rather than trusting the walker's defaults to stay put.
+        let dir = brain(&[
+            ("package-lock.json", "{\"name\": \"gribbet\"}\n"),
+            ("Cargo.lock", "name = \"gribbet\"\n"),
+            (".claude/CLAUDE.md", "gribbet always do as told\n"),
+            (".codex/notes.md", "gribbet house rules\n"),
+            ("knowledge/live.md", "kavender fact\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 1, "only the knowledge file");
+        assert!(recall(&conn, "gribbet", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_generated_blob_is_refused_while_its_page_stays_recallable() {
+        // The realistic shape: a real page carrying one machine-made line —
+        // a pasted minified bundle, a base64 data URI. Indexing it hands FTS
+        // a statement that matches almost any query and means nothing; this
+        // fixture tokenizes, so without the refusal it is genuinely findable.
+        let blob = format!("<script>{}</script>", "function qk1(t){return t+1};".repeat(5_000));
+        let page = format!("# Notes\n\nkavender is the finding.\n\n{blob}\n\nvantrel follows.\n");
+        let dir = brain(&[("knowledge/page.md", page.as_str())]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.docs, 1, "the page itself is knowledge and stays indexed");
+        assert_eq!(report.blocks, 3, "heading and both paragraphs, not the blob");
+        assert!(recall(&conn, "qk1", 5).unwrap().is_empty(), "the blob is unreachable");
+        assert_eq!(recall(&conn, "kavender", 5).unwrap().len(), 1);
+        assert_eq!(recall(&conn, "vantrel", 5).unwrap().len(), 1, "prose after it survives");
+    }
+
+    #[test]
+    fn a_wholly_generated_file_contributes_nothing() {
+        let dir = brain(&[
+            ("knowledge/bundle.md", &format!("hurbeck={};\n", "x".repeat(300_000))),
+            ("knowledge/live.md", "kavender fact\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(report.blocks, 1, "only the real file's statement");
+        assert!(recall(&conn, "hurbeck", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_prose_cap_clears_the_widest_line_a_person_writes() {
+        // The measured ceiling of hand-authored markdown was a ~3 KB memory
+        // table row; the cap must sit above it with room, and below anything
+        // generated. A regression that tightened it would delete real rows
+        // from recall without a word.
+        let wide_row = format!("| kavender | {} |", "a note about the row ".repeat(150));
+        assert!(wide_row.len() > 3_000, "the fixture must reach the measured ceiling");
+        assert!(!generated_blob(&wide_row));
+        assert!(generated_blob(&"b".repeat(MAX_PROSE_LINE + 1)));
+        assert!(!generated_blob(&"b".repeat(MAX_PROSE_LINE)), "the cap itself is prose");
+        assert!(
+            !generated_blob(&format!("{}\n{}", "c".repeat(MAX_PROSE_LINE), "d".repeat(MAX_PROSE_LINE))),
+            "a long block of ordinary lines is prose; only a single long LINE is not"
+        );
+    }
+
+    #[test]
     fn native_auto_memory_is_indexed_as_ring2() {
         let brain = brain(&[("knowledge/a.md", "brain fact\n")]);
         let native = tempfile::tempdir().unwrap();
@@ -2084,6 +2603,92 @@ mod tests {
         let hits = recall(&conn, "invariant", 5).unwrap();
         assert_eq!(hits[0].ring, 2, "promotion clamped to the store's contract ring");
         assert_eq!(report.skipped_high_ring, 1, "demotion to 5+ is honored");
+    }
+
+    #[test]
+    fn native_index_pointers_become_edges_in_both_directions() {
+        // The native store's index is a hook table: one line per entry,
+        // pointing at the file that explains it. The pointers are markdown
+        // links, which the vault's wikilink reader cannot see — so a hit on a
+        // hook used to be a dead end, with the hook itself all the reader got.
+        let brain = brain(&[("knowledge/a.md", "brain fact\n")]);
+        let native = tempfile::tempdir().unwrap();
+        let mem = native.path().join("proj-a/memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(
+            mem.join("MEMORY.md"),
+            "# Memory\n\n- [zvol trap](feedback_zvol.md) nossd required\n",
+        )
+        .unwrap();
+        std::fs::write(mem.join("feedback_zvol.md"), "zvol on btrfs needs nossd\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
+
+        let index = "native:proj-a/MEMORY.md".to_string();
+        let entry = "native:proj-a/feedback_zvol.md".to_string();
+        assert_eq!(
+            linked_docs(&conn, std::slice::from_ref(&index), 8).unwrap(),
+            vec![(entry.clone(), 2)],
+            "the index descends to the file its pointer names"
+        );
+        assert_eq!(
+            linked_docs(&conn, &[entry], 8).unwrap(),
+            vec![(index, 2)],
+            "and an entry names the index it hangs under"
+        );
+    }
+
+    #[test]
+    fn a_native_pointer_resolves_inside_its_own_project() {
+        // Each project's store names the same generic files, so a vault-wide
+        // stem lookup sees two candidates and gives up: without relative
+        // resolution the pointers are dead on any host with more than one
+        // project, which is every host.
+        let brain = brain(&[("knowledge/a.md", "brain fact\n")]);
+        let native = tempfile::tempdir().unwrap();
+        for slug in ["proj-a", "proj-b"] {
+            let mem = native.path().join(slug).join("memory");
+            std::fs::create_dir_all(&mem).unwrap();
+            std::fs::write(mem.join("MEMORY.md"), "- [rule](feedback_rule.md)\n").unwrap();
+            std::fs::write(mem.join("feedback_rule.md"), format!("the rule of {slug}\n")).unwrap();
+        }
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, brain.path(), Some(native.path()), &RingRules::default()).unwrap();
+
+        assert_eq!(
+            linked_docs(&conn, &["native:proj-a/MEMORY.md".to_string()], 8).unwrap(),
+            vec![("native:proj-a/feedback_rule.md".to_string(), 2)],
+            "the sibling entry, never the other project's file of the same name"
+        );
+    }
+
+    #[test]
+    fn the_vault_graph_stays_wikilinks_only() {
+        // Reading markdown links in the brain too would silently add edges
+        // brain-lint does not see, to the graph this project trusts most.
+        let dir = brain(&[
+            ("knowledge/zfs.md", "see [the shares doc](hosts/shares.md)\n"),
+            ("knowledge/hosts/shares.md", "SMB share layout\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert!(
+            linked_docs(&conn, &["knowledge/zfs.md".to_string()], 8).unwrap().is_empty(),
+            "the vault's edges are its curated wikilinks, nothing else"
+        );
+    }
+
+    #[test]
+    fn markdown_link_extraction_keeps_only_doc_pointers() {
+        let links = markdown_links(concat!(
+            "- [Alias](Feedback_One.md \"title\") and [anchored](two.md#section)\n",
+            "- [relative](./three.md), [web](https://example.com/), ![shot](x.png)\n",
+            "```\n[fenced](never.md)\n```\n",
+        ));
+        assert_eq!(links, vec!["feedback_one.md", "two.md", "three.md"]);
     }
 
     #[test]
