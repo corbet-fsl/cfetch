@@ -1,5 +1,5 @@
-//! Ratatui terminal dashboard: read-only view of the brain's health plus a
-//! live recall pane. One screen, no daemon required.
+//! Ratatui terminal dashboard: read-only brain health, live recall, and the
+//! supervised maintenance inbox. One TUI, no daemon required.
 //!
 //! The numbers come from whatever holds this host's index: the LOCAL index on
 //! a storage host, the SERVING host on a none-tier one. It opens a local index
@@ -13,13 +13,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 
 use crate::config::{ClientServingConfig, Config};
-use crate::{daemon, exhaust, heartbeat, index, ledger, paths, serve};
+use crate::maintenance_inbox::{Inbox, Tone};
+use crate::{daemon, exhaust, heartbeat, index, ledger, maintenance, paths, runtime_status, serve};
 
 /// Remote budget for the dashboard's own calls. Deliberately shorter than the
 /// CLI's: this screen refreshes on a timer and must not freeze on a slow drain
@@ -90,6 +91,7 @@ enum IndexView {
 }
 
 struct Stats {
+    runtime: runtime_status::RuntimeStatusV1,
     daemon_version: Option<String>,
     /// Expected-versus-observed, never a bare failure count: a hook that has
     /// never fired must not share a rendering with one that runs cleanly.
@@ -101,6 +103,8 @@ struct Stats {
     index: IndexView,
     staging_total: i64,
     staging_by_reason: Vec<(String, i64)>,
+    maintenance_pending: usize,
+    maintenance_applied: usize,
     exhaust_bytes: u64,
 }
 
@@ -148,6 +152,7 @@ fn gather(cfg: &Config, source: &Source, state: &Path) -> Stats {
     // Read-only, fail-silent: an absent tree simply reports zeros.
     let staging = exhaust::Exhaust::from_config(cfg).stats();
     Stats {
+        runtime: runtime_status::refresh_static().unwrap_or_else(|_| runtime_status::load_cached()),
         daemon_version: daemon::call("ping", Duration::from_millis(200)).and_then(|r| r.version),
         hooks: heartbeat::liveness_in(state),
         sessions: l.sessions.len(),
@@ -161,6 +166,8 @@ fn gather(cfg: &Config, source: &Source, state: &Path) -> Stats {
         index: index_view(source),
         staging_total: staging.staged_total,
         staging_by_reason: staging.staged_by_reason,
+        maintenance_pending: maintenance::pending_count(cfg),
+        maintenance_applied: maintenance::applied_count(cfg),
         exhaust_bytes: staging.bytes,
     }
 }
@@ -210,7 +217,18 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
         Some(v) => Span::styled(format!("daemon v{v} ●"), Style::default().fg(Color::Green)),
         None => Span::styled("daemon down ○", Style::default().fg(Color::Red)),
     };
+    let runtime_style = match s.runtime.service.state {
+        runtime_status::ServiceState::Ready => Style::default().fg(Color::Green),
+        runtime_status::ServiceState::Degraded => Style::default().fg(Color::Yellow),
+        runtime_status::ServiceState::Unavailable => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
+    };
     let mut lines = vec![
+        Line::from(Span::styled(
+            runtime_status::render_line_with_width(&s.runtime, Some(180)),
+            runtime_style,
+        )),
         Line::from(vec![
             daemon_span,
             index_span(&s.index),
@@ -237,7 +255,10 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
             .collect::<Vec<_>>()
             .join(", ");
         Line::from(Span::styled(
-            format!("staging: {} candidate(s) [{reasons}]", s.staging_total),
+            format!(
+                "staging: {} candidate(s) [{reasons}]   maintenance: {} pending / {} applied",
+                s.staging_total, s.maintenance_pending, s.maintenance_applied
+            ),
             Style::default().fg(Color::Yellow),
         ))
     } else if s.exhaust_bytes == 0 {
@@ -245,13 +266,23 @@ fn header_lines(s: &Stats) -> Vec<Line<'static>> {
         // exhaust anywhere in the tree, nothing has ever run the flagging
         // traps, so this zero is the absence of a measurement.
         Line::from(Span::styled(
-            "staging: 0 candidates — UNOBSERVED: no ring-6 exhaust has ever been written, so nothing has been examined"
-                .to_string(),
+            format!(
+                "staging: 0 candidates — UNOBSERVED: no ring-6 exhaust written   maintenance: {} pending / {} applied",
+                s.maintenance_pending, s.maintenance_applied
+            ),
+            Style::default().fg(Color::Yellow),
+        ))
+    } else if s.maintenance_pending > 0 || s.maintenance_applied > 0 {
+        Line::from(Span::styled(
+            format!(
+                "staging: 0 candidates (measured)   maintenance: {} pending / {} applied",
+                s.maintenance_pending, s.maintenance_applied
+            ),
             Style::default().fg(Color::Yellow),
         ))
     } else {
         Line::from(Span::styled(
-            "staging: 0 candidates (measured)".to_string(),
+            "staging: 0 candidates (measured)   maintenance: 0 pending / 0 applied".to_string(),
             Style::default().fg(Color::DarkGray),
         ))
     });
@@ -294,30 +325,48 @@ fn recall_hits(source: &Source, query: &str, limit: usize) -> anyhow::Result<Vec
 }
 
 struct App {
+    pane: Pane,
     query: String,
     hits: Vec<serve::WireHit>,
     status: String,
+    inbox: Inbox,
 }
 
-fn draw(f: &mut Frame, stats: &Stats, app: &App) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Recall,
+    Maintenance,
+}
+
+impl Pane {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Recall => Self::Maintenance,
+            Self::Maintenance => Self::Recall,
+        }
+    }
+}
+
+fn tone_style(tone: Tone) -> Style {
+    match tone {
+        Tone::Normal => Style::default(),
+        Tone::Muted => Style::default().fg(Color::DarkGray),
+        Tone::Good => Style::default().fg(Color::Green),
+        Tone::Warning => Style::default().fg(Color::Yellow),
+        Tone::Error => Style::default().fg(Color::Red),
+        Tone::Accent => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    }
+}
+
+fn draw_recall(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6),
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-
-    f.render_widget(
-        Paragraph::new(header_lines(stats)).block(Block::default().borders(Borders::ALL).title(" cfetch ")),
-        chunks[0],
-    );
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(area);
     f.render_widget(
         Paragraph::new(app.query.as_str())
             .block(Block::default().borders(Borders::ALL).title(" recall (type + Enter) ")),
-        chunks[1],
+        chunks[0],
     );
     let items: Vec<ListItem> = app
         .hits
@@ -337,10 +386,91 @@ fn draw(f: &mut Frame, stats: &Stats, app: &App) {
         .collect();
     f.render_widget(
         List::new(items).block(Block::default().borders(Borders::ALL).title(format!(" {} ", app.status))),
-        chunks[2],
+        chunks[1],
+    );
+}
+
+fn draw_maintenance(f: &mut Frame, area: Rect, inbox: &Inbox) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(area);
+    let rows: Vec<ListItem> = inbox
+        .rows()
+        .into_iter()
+        .map(|row| {
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!(" {:<9} ", row.badge), tone_style(row.tone)),
+                    Span::styled(row.summary, Style::default().fg(Color::Gray)),
+                ]),
+                Line::from(Span::styled(format!("   {}", row.id), Style::default().fg(Color::DarkGray))),
+            ])
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(inbox.selected());
+    f.render_stateful_widget(
+        List::new(rows)
+            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", inbox.status)))
+            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_symbol("›"),
+        chunks[0],
+        &mut state,
+    );
+
+    let detail = inbox
+        .detail
+        .lines
+        .iter()
+        .map(|line| Line::from(Span::styled(line.text.clone(), tone_style(line.tone))))
+        .collect::<Vec<_>>();
+    f.render_widget(
+        Paragraph::new(detail)
+            .block(Block::default().borders(Borders::ALL).title(inbox.detail.title.clone()))
+            .wrap(Wrap { trim: false })
+            .scroll((inbox.detail_scroll, 0)),
+        chunks[1],
+    );
+}
+
+fn draw(f: &mut Frame, stats: &Stats, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    f.render_widget(
+        Paragraph::new(header_lines(stats)).block(Block::default().borders(Borders::ALL).title(" cfetch ")),
+        chunks[0],
     );
     f.render_widget(
-        Paragraph::new(" Enter search · Backspace edit · Esc/Ctrl-C quit ").style(Style::default().fg(Color::DarkGray)),
+        Tabs::new(["Recall", "Maintenance inbox"])
+            .select(match app.pane {
+                Pane::Recall => 0,
+                Pane::Maintenance => 1,
+            })
+            .block(Block::default().borders(Borders::ALL).title(" Tab switches view "))
+            .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        chunks[1],
+    );
+    match app.pane {
+        Pane::Recall => draw_recall(f, chunks[2], app),
+        Pane::Maintenance => draw_maintenance(f, chunks[2], &app.inbox),
+    }
+    let help = match app.pane {
+        Pane::Recall => " Tab inbox · Enter search · Backspace edit · Esc/Ctrl-C quit ",
+        Pane::Maintenance => {
+            " Tab recall · ↑/↓ or j/k select · PgUp/PgDn scroll · r refresh · Esc/Ctrl-C quit "
+        }
+    };
+    f.render_widget(
+        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         chunks[3],
     );
 }
@@ -365,7 +495,14 @@ pub fn run() -> anyhow::Result<()> {
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
 
-    let mut app = App { query: String::new(), hits: Vec::new(), status: "no query yet".into() };
+    let can_verify_locally = cfg.client.serving.is_none();
+    let mut app = App {
+        pane: Pane::Recall,
+        query: String::new(),
+        hits: Vec::new(),
+        status: "no query yet".into(),
+        inbox: Inbox::load(&cfg, can_verify_locally),
+    };
     let mut stats = gather(&cfg, &source, &state);
     let mut last_refresh = std::time::Instant::now();
 
@@ -383,10 +520,14 @@ pub fn run() -> anyhow::Result<()> {
                 if !key.is_press() {
                     continue;
                 }
+                if key.code == KeyCode::Tab {
+                    app.pane = app.pane.toggle();
+                    continue;
+                }
                 match key.code {
                     KeyCode::Esc => break Ok(()),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break Ok(()),
-                    KeyCode::Enter => {
+                    KeyCode::Enter if app.pane == Pane::Recall => {
                         match recall_hits(&source, &app.query, 20) {
                             Ok(hits) => {
                                 app.status = format!("{} hit(s) for \"{}\"", hits.len(), app.query);
@@ -395,10 +536,33 @@ pub fn run() -> anyhow::Result<()> {
                             Err(e) => app.status = format!("recall failed: {e}"),
                         }
                     }
-                    KeyCode::Backspace => {
+                    KeyCode::Backspace if app.pane == Pane::Recall => {
                         app.query.pop();
                     }
-                    KeyCode::Char(c) => app.query.push(c),
+                    KeyCode::Char(c) if app.pane == Pane::Recall => app.query.push(c),
+                    KeyCode::Down | KeyCode::Char('j') if app.pane == Pane::Maintenance => {
+                        app.inbox.select_next(&cfg, can_verify_locally);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if app.pane == Pane::Maintenance => {
+                        app.inbox.select_previous(&cfg, can_verify_locally);
+                    }
+                    KeyCode::Home if app.pane == Pane::Maintenance => {
+                        app.inbox.select_first(&cfg, can_verify_locally);
+                    }
+                    KeyCode::End if app.pane == Pane::Maintenance => {
+                        app.inbox.select_last(&cfg, can_verify_locally);
+                    }
+                    KeyCode::PageDown if app.pane == Pane::Maintenance => {
+                        app.inbox.scroll_down(12);
+                    }
+                    KeyCode::PageUp if app.pane == Pane::Maintenance => {
+                        app.inbox.scroll_up(12);
+                    }
+                    KeyCode::Char('r') if app.pane == Pane::Maintenance => {
+                        app.inbox.refresh(&cfg, can_verify_locally);
+                        stats = gather(&cfg, &source, &state);
+                        last_refresh = std::time::Instant::now();
+                    }
                     _ => {}
                 }
             }
@@ -506,6 +670,7 @@ mod tests {
     #[test]
     fn header_shows_the_serving_origin_and_generation() {
         let s = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: Some("0.5.0".into()),
             hooks: all_reporting(),
             sessions: 0,
@@ -518,9 +683,12 @@ mod tests {
             },
             staging_total: 0,
             staging_by_reason: Vec::new(),
+            maintenance_pending: 0,
+            maintenance_applied: 0,
             exhaust_bytes: 0,
         };
         let text = flat_text(&header_lines(&s));
+        assert!(text.contains("cfetch ● memory:local"), "{text}");
         assert!(text.contains("served by storage-1"), "{text}");
         assert!(text.contains("generation 91"), "{text}");
         // A stale remote answer must say so rather than look authoritative.
@@ -534,6 +702,7 @@ mod tests {
     #[test]
     fn header_reports_failing_hooks_and_unreadable_streams() {
         let s = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: None,
             hooks: liveness(&[
                 (
@@ -552,6 +721,8 @@ mod tests {
             index: local_index(),
             staging_total: 0,
             staging_by_reason: Vec::new(),
+            maintenance_pending: 0,
+            maintenance_applied: 0,
             exhaust_bytes: 0,
         };
         let text = flat_text(&header_lines(&s));
@@ -571,6 +742,7 @@ mod tests {
         // called the lot healthy, so a hook that had never fired since
         // install was indistinguishable from one that had just succeeded.
         let base = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: Some("0.5.0".into()),
             hooks: liveness(&[("session-start", heartbeat::HookState::Healthy { last_ok: 1 })]),
             sessions: 0,
@@ -579,6 +751,8 @@ mod tests {
             index: local_index(),
             staging_total: 0,
             staging_by_reason: Vec::new(),
+            maintenance_pending: 0,
+            maintenance_applied: 0,
             exhaust_bytes: 12,
         };
         let lines = header_lines(&base);
@@ -613,6 +787,7 @@ mod tests {
         // Generation 0 is "never scanned". Rendering its counts would print
         // "0 blocks", which reads as a brain with nothing in it.
         let never = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: Some("0.5.0".into()),
             hooks: all_reporting(),
             sessions: 0,
@@ -628,6 +803,8 @@ mod tests {
             },
             staging_total: 0,
             staging_by_reason: Vec::new(),
+            maintenance_pending: 0,
+            maintenance_applied: 0,
             exhaust_bytes: 4096,
         };
         let text = flat_text(&header_lines(&never));
@@ -655,6 +832,7 @@ mod tests {
     #[test]
     fn zero_staging_with_no_exhaust_on_disk_is_unobserved() {
         let base = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: Some("0.5.0".into()),
             hooks: all_reporting(),
             sessions: 0,
@@ -663,6 +841,8 @@ mod tests {
             index: local_index(),
             staging_total: 0,
             staging_by_reason: Vec::new(),
+            maintenance_pending: 0,
+            maintenance_applied: 0,
             exhaust_bytes: 0,
         };
         let text = flat_text(&header_lines(&base));
@@ -677,6 +857,7 @@ mod tests {
     #[test]
     fn header_shows_staging_counts_and_exhaust_footprint() {
         let s = Stats {
+            runtime: runtime_status::RuntimeStatusV1::default(),
             daemon_version: Some("0.5.0".into()),
             hooks: all_reporting(),
             sessions: 0,
@@ -696,6 +877,8 @@ mod tests {
                 ("recurring-failure".into(), 2),
                 ("hot-file".into(), 1),
             ],
+            maintenance_pending: 2,
+            maintenance_applied: 1,
             exhaust_bytes: 4321 * 1024,
         };
         let lines = header_lines(&s);
@@ -707,6 +890,7 @@ mod tests {
             "got: {text}"
         );
         assert!(text.contains("exhaust: 4.2 MiB"), "got: {text}");
+        assert!(text.contains("maintenance: 2 pending / 1 applied"), "got: {text}");
         let staging_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("staging:")))

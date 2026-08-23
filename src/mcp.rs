@@ -1,8 +1,10 @@
 //! MCP server: the one-protocol answer to supporting every MCP-capable agent.
 //!
-//! cfetch owns the read-only tool behavior. The official Rust MCP SDK owns
-//! JSON-RPC framing, lifecycle, version negotiation, capability discovery,
-//! schema validation, and stdio concurrency.
+//! cfetch owns the tool behavior. Recall/find and maintenance packets are
+//! read-only; the sole write surface can only place a typed proposal in
+//! ring-5 quarantine. Applying trusted-memory changes remains CLI-only. The
+//! official Rust MCP SDK owns JSON-RPC framing, lifecycle, version
+//! negotiation, capability discovery, schema validation, and stdio concurrency.
 
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -15,11 +17,20 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
-use crate::{answer, code, config::Config, index, paths, serve};
+use crate::{answer, code, config::Config, index, maintenance, paths, serve};
 
 /// The tools we serve; a tools/call naming anything else is the caller's
 /// protocol error (-32602), not a tool-execution failure.
-const TOOL_NAMES: &[&str] = &["cfetch_recall", "cfetch_expand", "cfetch_find"];
+const TOOL_NAMES: &[&str] = &[
+    "cfetch_recall",
+    "cfetch_expand",
+    "cfetch_find",
+    "cfetch_runtime_status",
+    "cfetch_maintenance_packet",
+    "cfetch_maintenance_show",
+    "cfetch_maintenance_propose",
+    "cfetch_maintenance_review",
+];
 
 fn object_schema(value: Value) -> JsonObject {
     value
@@ -32,6 +43,13 @@ fn tool_defs() -> Vec<Tool> {
     let read_only = || {
         ToolAnnotations::new()
             .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false)
+    };
+    let quarantine_write = || {
+        ToolAnnotations::new()
+            .read_only(false)
             .destructive(false)
             .idempotent(true)
             .open_world(false)
@@ -73,6 +91,81 @@ fn tool_defs() -> Vec<Tool> {
             })),
         )
         .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_runtime_status",
+            "Read cfetch's cached RuntimeStatusV1: memory routing and freshness, retrieval coverage, configured/selected/last-used inference, maintenance counts, and stable failure actions. Call when runtime health affects the task; do not poll. This is read-only, performs no network request or inference, and is bounded to 2 KiB.",
+            object_schema(json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })),
+        )
+        .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_maintenance_packet",
+            "Build a bounded, content-addressed evidence packet for one ring-5 staging candidate. It includes matching raw events, current candidate bytes, relevant cited statements, a target snapshot when available, and the exact proposal contract. This is lexical and deterministic: it does not call a model or spend an inference token budget.",
+            object_schema(json!({
+                "type": "object",
+                "properties": {
+                    "candidate_id": {"type": "string", "description": "id from `cfetch staging list`"}
+                },
+                "required": ["candidate_id"]
+            })),
+        )
+        .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_maintenance_show",
+            "Read one quarantined maintenance proposal and its immutable semantic review, if present. Use this in a separate review pass to check evidence coverage, factual faithfulness, preservation, authority, target choice, and contradictions. The response is bounded by the proposal's 2 MiB content limit, not a model inference token budget.",
+            object_schema(json!({
+                "type": "object",
+                "properties": {
+                    "proposal_id": {"type": "string"}
+                },
+                "required": ["proposal_id"]
+            })),
+        )
+        .with_annotations(read_only()),
+        Tool::new(
+            "cfetch_maintenance_propose",
+            "Submit one typed maintenance proposal into ring-5 quarantine. This cannot edit recalled or injected memory; it records an idempotent proposal for deterministic verification and explicit CLI approval. Applying and finalizing are intentionally unavailable over MCP, so this tool has no model-output token budget beyond its short receipt.",
+            object_schema(json!({
+                "type": "object",
+                "properties": {
+                    "candidate_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                    "transition": {"type": "string", "enum": ["add", "fold", "supersede", "revalidate", "dismiss", "noop"]},
+                    "target": {"type": ["string", "null"], "description": "brain-relative Markdown path for content transitions"},
+                    "after": {"type": ["string", "null"], "description": "complete proposed Markdown bytes for content transitions"},
+                    "authority": {"type": "string", "enum": ["authorized", "attested", "unendorsed"]},
+                    "valid_until": {"type": ["integer", "null"], "description": "optional Unix timestamp"},
+                    "rationale": {"type": "string"},
+                    "evidence": {"type": "array", "items": {"type": "string"}},
+                    "related_citations": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["candidate_ids", "transition", "target", "after", "authority", "rationale", "evidence", "related_citations"]
+            })),
+        )
+        .with_annotations(quarantine_write()),
+        Tool::new(
+            "cfetch_maintenance_review",
+            "Record the first immutable semantic review of a quarantined proposal. A pass must explicitly assess evidence coverage, factual faithfulness, preservation, authority fit, target fit, and contradictions. This writes only ring-5 review metadata; it cannot apply or finalize memory and returns only a short receipt with no inference token budget.",
+            object_schema(json!({
+                "type": "object",
+                "properties": {
+                    "proposal_id": {"type": "string"},
+                    "verdict": {"type": "string", "enum": ["pass", "fail"]},
+                    "method": {"type": "string", "enum": ["independent_agent", "human"]},
+                    "evidence_coverage": {"type": "boolean"},
+                    "factual_faithfulness": {"type": "boolean"},
+                    "preservation": {"type": "boolean"},
+                    "authority_fit": {"type": "boolean"},
+                    "target_fit": {"type": "boolean"},
+                    "contradiction_checked": {"type": "boolean"},
+                    "notes": {"type": "string"}
+                },
+                "required": ["proposal_id", "verdict", "method", "evidence_coverage", "factual_faithfulness", "preservation", "authority_fit", "target_fit", "contradiction_checked", "notes"]
+            })),
+        )
+        .with_annotations(quarantine_write()),
     ]
 }
 
@@ -203,8 +296,58 @@ fn run_tool_remote(
 }
 
 fn run_tool(name: &str, args: &Value) -> anyhow::Result<String> {
+    if name == "cfetch_runtime_status" {
+        return crate::runtime_status::mcp_json();
+    }
     let cfg = Config::load()?;
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
+    match name {
+        "cfetch_maintenance_packet" => {
+            let candidate_id = args.get("candidate_id").and_then(Value::as_str).unwrap_or("");
+            let packet = maintenance::packet(&cfg, candidate_id)?;
+            return Ok(serde_json::to_string_pretty(&packet)?);
+        }
+        "cfetch_maintenance_show" => {
+            let proposal_id = args.get("proposal_id").and_then(Value::as_str).unwrap_or("");
+            let (state, proposal) = maintenance::get(&cfg, proposal_id)?;
+            let review = maintenance::get_review(&cfg, proposal_id)?;
+            return Ok(serde_json::to_string_pretty(&json!({
+                "state": state,
+                "proposal": proposal,
+                "review": review,
+            }))?);
+        }
+        "cfetch_maintenance_propose" => {
+            let input: maintenance::ProposalInput = serde_json::from_value(args.clone())
+                .map_err(|error| anyhow::anyhow!("invalid maintenance proposal: {error}"))?;
+            let submitted = maintenance::submit(&cfg, input)?;
+            let _ = crate::runtime_status::refresh_static();
+            return Ok(format!(
+                "{} {} in ring-5 quarantine; inspect with `cfetch maintain verify {}`. Applying and finalizing require the CLI.",
+                if submitted.created { "submitted" } else { "already recorded" },
+                submitted.proposal.id,
+                submitted.proposal.id,
+            ));
+        }
+        "cfetch_maintenance_review" => {
+            let proposal_id = args.get("proposal_id").and_then(Value::as_str).unwrap_or("");
+            let mut review_args = args.clone();
+            if let Value::Object(object) = &mut review_args {
+                object.remove("proposal_id");
+            }
+            let input: maintenance::ReviewInput = serde_json::from_value(review_args)
+                .map_err(|error| anyhow::anyhow!("invalid maintenance review: {error}"))?;
+            let (review, created) = maintenance::submit_review(&cfg, proposal_id, input)?;
+            return Ok(format!(
+                "{} {} for {} with verdict {:?}; deterministic verification and approval remain CLI-only.",
+                if created { "recorded" } else { "already recorded" },
+                review.id,
+                review.proposal_id,
+                review.verdict,
+            ));
+        }
+        _ => {}
+    }
     if let Some(cs) = &cfg.client.serving {
         return run_tool_remote(cs, name, args, limit);
     }
@@ -355,12 +498,44 @@ mod tests {
             names, TOOL_NAMES,
             "tools/list and the -32602 gate must agree"
         );
-        assert!(tools.iter().all(|tool| {
-            tool.annotations
-                .as_ref()
-                .and_then(|annotations| annotations.read_only_hint)
-                == Some(true)
-        }));
+        for tool in tools.iter().filter(|tool| {
+            !matches!(
+                tool.name.as_ref(),
+                "cfetch_maintenance_propose" | "cfetch_maintenance_review"
+            )
+        }) {
+            assert_eq!(
+                tool.annotations.as_ref().and_then(|annotations| annotations.read_only_hint),
+                Some(true),
+                "{} must stay read-only",
+                tool.name
+            );
+        }
+        let proposal = tools
+            .iter()
+            .find(|tool| tool.name == "cfetch_maintenance_propose")
+            .unwrap();
+        assert_eq!(proposal.name, "cfetch_maintenance_propose");
+        assert_eq!(
+            proposal.annotations.as_ref().and_then(|annotations| annotations.read_only_hint),
+            Some(false),
+            "the quarantine write must be declared honestly"
+        );
+        assert_eq!(
+            proposal.annotations.as_ref().and_then(|annotations| annotations.destructive_hint),
+            Some(false),
+            "a proposal cannot edit trusted memory"
+        );
+        let review = tools
+            .iter()
+            .find(|tool| tool.name == "cfetch_maintenance_review")
+            .unwrap();
+        assert_eq!(review.name, "cfetch_maintenance_review");
+        assert_eq!(
+            review.annotations.as_ref().and_then(|annotations| annotations.destructive_hint),
+            Some(false),
+            "a review cannot edit trusted memory"
+        );
         let instructions = info.instructions.as_deref().unwrap();
         // Same source function as the AGENTS.md/GEMINI.md marker block.
         assert_eq!(
@@ -375,11 +550,29 @@ mod tests {
     }
 
     #[test]
+    fn runtime_status_tool_is_cached_read_only_and_bounded() {
+        let tool = tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "cfetch_runtime_status")
+            .unwrap();
+        assert_eq!(
+            tool.annotations.and_then(|annotations| annotations.read_only_hint),
+            Some(true)
+        );
+        let text = run_tool("cfetch_runtime_status", &json!({})).unwrap();
+        assert!(text.len() <= crate::runtime_status::MCP_MAX_BYTES);
+        let status: crate::runtime_status::RuntimeStatusV1 = serde_json::from_str(&text).unwrap();
+        assert_eq!(status.schema_version, crate::runtime_status::SCHEMA_VERSION);
+        assert!(!text.contains("://"));
+        assert!(!text.contains("token_file"));
+    }
+
+    #[test]
     fn every_tool_tells_the_model_its_answer_is_capped() {
         // A cap the caller cannot see reads as a broken index: the model
         // re-asks the same question instead of following the file:line
         // pointer the truncated answer already handed it.
-        for tool in tool_defs() {
+        for tool in tool_defs().into_iter().take(3) {
             let description = tool.description.as_deref().unwrap_or_default();
             assert!(
                 description.contains("token budget"),

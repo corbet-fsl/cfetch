@@ -36,6 +36,7 @@ mod config;
 mod daemon;
 mod dashboard;
 mod embed;
+mod embedding_profile;
 mod exhaust;
 mod fsutil;
 mod govern;
@@ -53,6 +54,8 @@ mod jsonl;
 mod ledger;
 mod lockfile;
 mod markers;
+mod maintenance;
+mod maintenance_inbox;
 mod mcp;
 mod migrate;
 mod net;
@@ -62,6 +65,7 @@ mod paths;
 mod pipeline;
 mod rerank;
 mod resident;
+mod runtime_status;
 mod serve;
 mod session_state;
 #[cfg(test)]
@@ -110,6 +114,9 @@ enum Command {
         /// Remove cfetch's managed entries instead of adding them
         #[arg(long)]
         remove: bool,
+        /// Replace an existing foreign Claude status line instead of preserving it
+        #[arg(long, conflicts_with = "remove")]
+        replace_status_line: bool,
     },
     /// Rebuild the recall index and sync the code index
     Scan {
@@ -201,6 +208,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print the immutable embedding and network compatibility contract
+    EmbeddingProfile {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show this host's network identity (created on first use)
     Identity {
         #[arg(long)]
@@ -216,6 +228,12 @@ enum Command {
     Staging {
         #[command(subcommand)]
         action: StagingAction,
+    },
+    /// Supervised AI maintenance: evidence packets, quarantined proposals,
+    /// deterministic verification, and explicit promotion into rings 2-3
+    Maintain {
+        #[command(subcommand)]
+        action: MaintainAction,
     },
     /// Ask the ring-6 exhaust whether a command has failed here before, how
     /// often, on which hosts, and whether it ever recovered
@@ -233,7 +251,7 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         batch: usize,
     },
-    /// Open the terminal dashboard: health, ledger, live recall
+    /// Open the terminal dashboard: health, recall, and maintenance inbox
     /// A/B bench: paired cfetch-on / cfetch-off sessions, read from
     /// transcript ground truth — cache dimensions plus the bash re-run rate
     Bench {
@@ -260,8 +278,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show daemon, hook health, and state footprint
-    Status,
+    /// Show runtime routing, inference, maintenance, and detailed diagnostics
+    Status {
+        /// Print the stable RuntimeStatusV1 contract
+        #[arg(long, conflicts_with = "line")]
+        json: bool,
+        /// Print one cached, terminal-width-aware line (no network or inference)
+        #[arg(long, conflicts_with = "json")]
+        line: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -275,6 +300,60 @@ enum StagingAction {
     Consume { id: String },
     /// Move a candidate out of staging without promoting it
     Dismiss { id: String },
+}
+
+#[derive(Subcommand)]
+enum MaintainAction {
+    /// Build a bounded evidence packet for an agent to analyze
+    Packet {
+        candidate_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit a typed proposal into ring-5 quarantine (reads stdin by default)
+    Submit {
+        #[arg(long, value_name = "JSON")]
+        file: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record one independent semantic review (reads stdin by default)
+    Review {
+        id: String,
+        #[arg(long, value_name = "JSON")]
+        file: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List maintenance proposals and their lifecycle state
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one proposal exactly as cfetch recorded it
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revalidate evidence, authority, target bytes, and trust boundaries
+    Verify {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply the exact verified bytes; remains reversible until finalization
+    Apply {
+        id: String,
+        #[arg(long, value_name = "TOKEN")]
+        approval_token: String,
+    },
+    /// Restore the captured bytes of an applied, unfinalized proposal
+    Revert { id: String },
+    /// Reject a proposal without dismissing its source candidate
+    Reject { id: String },
+    /// Finish only after git HEAD contains the exact applied bytes
+    Finalize { id: String },
 }
 
 #[derive(Subcommand)]
@@ -1363,6 +1442,213 @@ fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn maintain_cmd(action: MaintainAction) -> anyhow::Result<()> {
+    let cfg = config::Config::load()?;
+    match action {
+        MaintainAction::Packet { candidate_id, json } => {
+            let packet = maintenance::packet(&cfg, &candidate_id)?;
+            if json {
+                println!("{}", serde_json::to_string(&packet)?);
+            } else {
+                println!("maintenance evidence packet for {}", packet.candidate.candidate.id);
+                println!(
+                    "  candidate evidence: {}  raw events: {}{}",
+                    packet.candidate.evidence_id,
+                    packet.events.len(),
+                    if packet.events_truncated { " (bounded; more matched)" } else { "" }
+                );
+                if !packet.unreadable_streams.is_empty() {
+                    println!("  WARNING: {} exhaust stream(s) unreadable", packet.unreadable_streams.len());
+                }
+                if let Some(target) = &packet.target_snapshot {
+                    println!(
+                        "  current target: {} (ring {}, {})",
+                        target.path,
+                        target.ring,
+                        if target.exists { "present" } else { "absent" }
+                    );
+                }
+                println!("  relevant statements: {}", packet.relevant_statements.len());
+                for statement in &packet.relevant_statements {
+                    println!(
+                        "    {}  {}:{}-{}  ring {}",
+                        statement.cite,
+                        statement.path,
+                        statement.start_line,
+                        statement.end_line,
+                        statement.ring
+                    );
+                }
+                if let Some(note) = &packet.context_note {
+                    println!("  note: {note}");
+                }
+                println!("\nAgent input (complete, machine-readable):");
+                println!("{}", serde_json::to_string_pretty(&packet)?);
+                println!(
+                    "\nSubmit a proposal: cfetch maintain submit --file proposal.json\n\
+                     The submission stays in ring 5; only `maintain apply` can cross inward."
+                );
+            }
+        }
+        MaintainAction::Submit { file, json } => {
+            use std::io::Read as _;
+            let mut text = String::new();
+            match file.as_deref() {
+                Some(path) if path != std::path::Path::new("-") => {
+                    text = std::fs::read_to_string(path)
+                        .with_context(|| format!("read proposal input {}", path.display()))?;
+                }
+                _ => {
+                    std::io::stdin()
+                        .read_to_string(&mut text)
+                        .context("read proposal JSON from stdin")?;
+                }
+            }
+            let input: maintenance::ProposalInput =
+                serde_json::from_str(&text).context("decode proposal JSON")?;
+            let result = maintenance::submit(&cfg, input)?;
+            if json {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                println!(
+                    "{} {} in ring-5 quarantine",
+                    if result.created { "submitted" } else { "already recorded" },
+                    result.proposal.id
+                );
+                println!(
+                    "review it independently: cfetch maintain review {} --file review.json",
+                    result.proposal.id
+                );
+            }
+        }
+        MaintainAction::Review { id, file, json } => {
+            use std::io::Read as _;
+            let mut text = String::new();
+            match file.as_deref() {
+                Some(path) if path != std::path::Path::new("-") => {
+                    text = std::fs::read_to_string(path)
+                        .with_context(|| format!("read review input {}", path.display()))?;
+                }
+                _ => {
+                    std::io::stdin()
+                        .read_to_string(&mut text)
+                        .context("read review JSON from stdin")?;
+                }
+            }
+            let input: maintenance::ReviewInput =
+                serde_json::from_str(&text).context("decode review JSON")?;
+            let (review, created) = maintenance::submit_review(&cfg, &id, input)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"created": created, "review": review})
+                );
+            } else {
+                println!(
+                    "{} {} for {} ({:?})",
+                    if created { "recorded" } else { "already recorded" },
+                    review.id,
+                    review.proposal_id,
+                    review.verdict
+                );
+                println!("verify it: cfetch maintain verify {}", review.proposal_id);
+            }
+        }
+        MaintainAction::List { json } => {
+            let proposals = maintenance::list(&cfg);
+            if json {
+                println!("{}", serde_json::to_string(&proposals)?);
+            } else if proposals.is_empty() {
+                println!("no maintenance proposals");
+            } else {
+                for proposal in proposals {
+                    println!(
+                        "{}  {:<9}  {:<10}  {}  [{}]",
+                        proposal.id,
+                        proposal.state,
+                        format!("{:?}", proposal.transition).to_ascii_lowercase(),
+                        proposal.target.as_deref().unwrap_or("no memory write"),
+                        proposal.candidates.join(", ")
+                    );
+                }
+            }
+        }
+        MaintainAction::Show { id, json } => {
+            let (state, proposal) = maintenance::get(&cfg, &id)?;
+            let review = maintenance::get_review(&cfg, &id)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"state": state, "proposal": proposal, "review": review})
+                );
+            } else {
+                println!("proposal {} ({state})", proposal.id);
+                println!("{}", serde_json::to_string_pretty(&proposal)?);
+                match review {
+                    Some(review) => {
+                        println!("\nsemantic review {}:", review.id);
+                        println!("{}", serde_json::to_string_pretty(&review)?);
+                    }
+                    None => println!("\nsemantic review: not recorded"),
+                }
+            }
+        }
+        MaintainAction::Verify { id, json } => {
+            let report = maintenance::verify(&cfg, &id)?;
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                for check in &report.checks {
+                    println!("{}  {:<20} {}", if check.ok { "ok  " } else { "FAIL" }, check.name, check.detail);
+                }
+                if let Some(diff) = &report.diff {
+                    println!("\nexact proposed diff:\n{diff}");
+                }
+                if report.valid {
+                    println!("verified {}", report.proposal_id);
+                    println!("approval token: {}", report.approval_token.as_deref().unwrap_or_default());
+                    println!(
+                        "apply exactly this revision: cfetch maintain apply {} --approval-token {}",
+                        report.proposal_id,
+                        report.approval_token.as_deref().unwrap_or_default()
+                    );
+                } else {
+                    anyhow::bail!("proposal failed verification");
+                }
+            }
+        }
+        MaintainAction::Apply { id, approval_token } => {
+            let proposal = maintenance::apply(&cfg, &id, &approval_token)?;
+            if proposal.transition.changes_memory() {
+                println!("applied {} to {}", proposal.id, proposal.target.as_deref().unwrap_or_default());
+                println!("reversible now: cfetch maintain revert {}", proposal.id);
+                println!("after committing the brain tree: cfetch maintain finalize {}", proposal.id);
+            } else {
+                println!("applied decision {}", proposal.id);
+                println!("finalize it: cfetch maintain finalize {}", proposal.id);
+            }
+        }
+        MaintainAction::Revert { id } => {
+            let proposal = maintenance::revert(&cfg, &id)?;
+            println!("reverted {} (source candidates remain pending)", proposal.id);
+        }
+        MaintainAction::Reject { id } => {
+            maintenance::reject(&cfg, &id)?;
+            println!("rejected {id} (source candidates remain pending)");
+        }
+        MaintainAction::Finalize { id } => {
+            let result = maintenance::finalize(&cfg, &id)?;
+            println!(
+                "{} {} and settled {} source candidate(s)",
+                if result.already_finalized { "reconciled" } else { "finalized" },
+                result.proposal_id,
+                result.candidate_ids.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `init` deliberately does not load the config: it must work before there is
 /// anything to configure, which is the only moment it is useful.
 fn init_cmd(path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
@@ -1590,6 +1876,8 @@ fn delivery_status_line(agent: &str, verification: Option<(u64, u64)>) -> String
 }
 
 fn status() -> anyhow::Result<()> {
+    let runtime = runtime_status::refresh_static()?;
+    println!("{}", runtime_status::render_line(&runtime));
     daemon::status()?;
     // Diagnostics must survive a broken config: the paths below fall back to
     // the defaults rather than making `status` the second casualty.
@@ -1914,6 +2202,7 @@ fn join(ticket: &str, json: bool) -> anyhow::Result<()> {
             grant::remember_membership(
                 &paths::state_dir(),
                 grant::Membership {
+                    network_major: embedding_profile::NETWORK_MAJOR,
                     origin: t.origin.clone(),
                     slice: g.slice.clone(),
                     mode: g.mode,
@@ -2034,13 +2323,21 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Install { settings, agents, all, project, remove } => {
+        Command::Install {
+            settings,
+            agents,
+            all,
+            project,
+            remove,
+            replace_status_line,
+        } => {
             if let Err(e) = install::configure(
                 settings.as_deref(),
                 &agents,
                 all,
                 remove,
                 project.as_deref(),
+                replace_status_line,
             ) {
                 eprintln!("cfetch install: {e}");
                 std::process::exit(1);
@@ -2129,6 +2426,26 @@ fn main() {
                 println!("build variant: {}", variant::build_id().unwrap_or("unidentified source build"));
             }
         }
+        Command::EmbeddingProfile { json } => {
+            let profile = embedding_profile::manifest();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&profile).expect("profile serializes"));
+            } else {
+                println!(
+                    "{}: network major {}, {} @ {}, {}, {} dims / {} bytes",
+                    profile.profile_id,
+                    profile.network_major,
+                    profile.model,
+                    profile.model_revision,
+                    profile.model_quantization,
+                    profile.dimensions,
+                    profile.vector_bytes,
+                );
+                println!("query prefix: {:?}", profile.query_prefix);
+                println!("document prefix: {:?}", profile.document_prefix);
+                println!("pooling: {}; normalization: {}", profile.pooling, profile.normalization);
+            }
+        }
         Command::Identity { json } => {
             match net::endpoint_id(&paths::state_dir()) {
                 Ok(id) if json => println!("{}", serde_json::json!({"endpoint_id": id.to_string()})),
@@ -2148,6 +2465,15 @@ fn main() {
         Command::Staging { action } => {
             if let Err(e) = staging_cmd(action) {
                 eprintln!("cfetch staging: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Maintain { action } => {
+            if let Err(e) = maintain_cmd(action).and_then(|()| {
+                let _ = runtime_status::refresh_static()?;
+                Ok(())
+            }) {
+                eprintln!("cfetch maintain: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2178,7 +2504,10 @@ fn main() {
             }
         }
         Command::Scan { background } => {
-            if let Err(e) = scan(background) {
+            if let Err(e) = scan(background).and_then(|()| {
+                let _ = runtime_status::refresh_static()?;
+                Ok(())
+            }) {
                 eprintln!("cfetch scan: {e}");
                 std::process::exit(1);
             }
@@ -2219,7 +2548,13 @@ fn main() {
         }
         Command::EmbedIndex { batch } => {
             let guard = config::Config::load().and_then(|c| none_tier_guard(&c, "embed-index"));
-            if let Err(e) = guard.and_then(|()| embed::embed_index_cmd(batch)) {
+            if let Err(e) = guard
+                .and_then(|()| embed::embed_index_cmd(batch))
+                .and_then(|()| {
+                    let _ = runtime_status::refresh_static()?;
+                    Ok(())
+                })
+            {
                 eprintln!("cfetch embed-index: {e}");
                 std::process::exit(1);
             }
@@ -2236,8 +2571,19 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Status => {
-            if let Err(e) = status() {
+        Command::Status { json, line } => {
+            let result = if line {
+                println!("{}", runtime_status::render_line(&runtime_status::load_cached()));
+                Ok(())
+            } else if json {
+                runtime_status::refresh_static().and_then(|snapshot| {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                    Ok(())
+                })
+            } else {
+                status()
+            };
+            if let Err(e) = result {
                 eprintln!("cfetch status: {e}");
                 std::process::exit(1);
             }

@@ -5,6 +5,39 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Supervised AI maintenance.** `cfetch maintain` turns a staged signal into
+  a bounded evidence packet, typed proposal, immutable independent review, and
+  exact Markdown diff. Deterministic authority, citation, path, secret, expiry,
+  and stale-file gates protect apply; changes are reversible, and the candidate
+  is finalized only after git contains the approved bytes. MCP may inspect and
+  write ring-5 proposal/review records, but apply and finalization remain
+  explicit CLI actions. A read-only dashboard inbox shows candidates, proposal
+  lifecycles, review gates, verification failures, bounded diff previews, and
+  revision-bound next commands without calling a model or applying a proposal.
+- **One embedding/network ABI for v1.** The v1 profile freezes the pinned
+  EmbeddingGemma-300M Q8-QAT source, XINT8 W8A8 execution, official
+  retrieval prompts, full 768 dimensions, pooling/normalization, and an exact
+  768-byte signed-INT8 vector. Model-pipeline changes now require a new network
+  major and coordinated re-embedding; configuration drift is refused.
+- **Byte-stable shared vectors.** INT8 records no longer carry an FP16 scale
+  trailer. Ranking uses integer-defined cosine order, repeated producers must
+  match an existing content hash byte-for-byte, and store/cache headers include
+  the network/profile identity.
+- **Cross-major networking fails closed.** TCP, iroh ALPN, invites, grants, and
+  remote memberships carry network major 1. Missing or different majors are
+  rejected before slice data is served. `cfetch embedding-profile [--json]`
+  prints the executable contract.
+- **Public feature and benchmark guide.** The README now maps the product's
+  agent-memory, retrieval, code-navigation, capture, measurement, serving, and
+  sharing surfaces; includes the real v0.9.9 terminal dashboard; and compares
+  cfetch with OpenWolf and OpenWolf Enhanced. A reproducible v0.9.9 study
+  records 93.4% aggregate model-facing reduction across eight selected
+  oversized command outputs, explicitly without claiming whole-session savings.
+- **Unified contributor stewardship.** Accepted contributions now assign
+  copyright to the project steward while preserving authorship attribution and
+  granting contributors a broad license back to their own work. This keeps the
+  whole project under one coherent FSL-to-Apache release promise.
+
 ## 0.9.9
 
 ## 0.9.8

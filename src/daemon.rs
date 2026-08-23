@@ -44,6 +44,9 @@ use crate::{grant, heartbeat, hooks, index, ipc, net, paths, resident, serve};
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Request {
     op: String,
+    /// Required on every remote transport. Local control calls omit it.
+    #[serde(default)]
+    network_major: Option<u32>,
     #[serde(default)]
     token: Option<String>,
     #[serde(default)]
@@ -411,7 +414,8 @@ pub fn call_iroh(
 ) -> anyhow::Result<Response> {
     // Validate the nested request here so malformed locally constructed JSON
     // never reaches the network.
-    let request: Request = serde_json::from_value(body).context("invalid iroh request")?;
+    let mut request: Request = serde_json::from_value(body).context("invalid iroh request")?;
+    request.network_major = Some(crate::embedding_profile::NETWORK_MAJOR);
     let envelope = serde_json::to_value(Request {
         op: "iroh-forward".to_string(),
         target: Some(target.clone()),
@@ -464,7 +468,7 @@ struct IrohClient {
     runtime: tokio::runtime::Handle,
 }
 
-const IROH_ALPN: &[u8] = b"cfetch/1/line-json";
+const IROH_ALPN: &[u8] = b"cfetch/network/1/line-json";
 const IROH_MAX_REQUEST: usize = 64 * 1024;
 const IROH_MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const IROH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -595,6 +599,13 @@ fn forward_iroh(ctx: &Ctx, target: iroh::EndpointAddr, req: &Request) -> anyhow:
 /// endpoint id. A ticket secret may create a grant; every subsequent data
 /// request must name a slice that this exact peer holds.
 fn handle_iroh(req: &Request, peer: &str, ctx: &Ctx) -> Response {
+    if req.network_major != Some(crate::embedding_profile::NETWORK_MAJOR) {
+        return Response::err(format!(
+            "incompatible cfetch network major: peer sent {:?}, this host requires {}",
+            req.network_major,
+            crate::embedding_profile::NETWORK_MAJOR
+        ));
+    }
     if req.op == "redeem" {
         let Some(slice) = req.slice.as_deref() else {
             return Response::err("redeem request names no slice");
@@ -809,6 +820,12 @@ fn serve_query(
     resp.fresh = Some(outcome.fresh);
     resp.stale_note = outcome.note;
     resp.barrier_ms = Some(outcome.waited_ms);
+    crate::runtime_status::record_memory_answer(
+        crate::runtime_status::MemoryRoute::Serving,
+        resp.generation,
+        resp.fresh,
+        true,
+    );
     resp
 }
 
@@ -1022,7 +1039,18 @@ fn serve_conn<S: Read + Write>(stream: S, ctx: &Ctx, chan: Channel) -> bool {
             Ok(req) => {
                 // Bearer gate wherever the transport is not access-controlled by
                 // the operating system: every op requires the token.
-                if let Some(expected) = chan.expected_token(ctx)
+                if matches!(chan, Channel::Remote)
+                    && req.network_major != Some(crate::embedding_profile::NETWORK_MAJOR)
+                {
+                    (
+                        Response::err(format!(
+                            "incompatible cfetch network major: client sent {:?}, server requires {}",
+                            req.network_major,
+                            crate::embedding_profile::NETWORK_MAJOR
+                        )),
+                        false,
+                    )
+                } else if let Some(expected) = chan.expected_token(ctx)
                     && !authorized(expected, req.token.as_ref())
                 {
                     (Response::err("unauthorized"), false)
@@ -1059,6 +1087,7 @@ pub fn run() -> anyhow::Result<()> {
     // here (hooks then use their daemon-less fallbacks) instead of silently
     // starting a daemon that cannot serve.
     let cfg = Config::load()?;
+    let _ = crate::runtime_status::refresh_static();
     let serve_handle = if cfg.serve.enabled { Some(serve::start(&cfg)?) } else { None };
     let tcp_token = match (&cfg.serve.bind, &cfg.serve.token_file) {
         (Some(_), Some(tf)) => Some(serve::read_token(tf, true)?),
@@ -1118,6 +1147,7 @@ pub fn run() -> anyhow::Result<()> {
     // A stale endpoint from a dead daemon is cleared; a live one is never
     // stolen (see `ipc::listen`).
     let listener = ipc::listen(local_token)?;
+    crate::runtime_status::record_service(crate::runtime_status::ServiceState::Ready, None);
     eprintln!("cfetch daemon listening on {}", listener.describe());
     for conn in listener.incoming() {
         if ctx.shutdown.load(Ordering::SeqCst) {
@@ -1142,6 +1172,10 @@ pub fn run() -> anyhow::Result<()> {
         client.runtime.block_on(client.endpoint.close());
     }
     listener.cleanup();
+    crate::runtime_status::record_service(
+        crate::runtime_status::ServiceState::Degraded,
+        Some("daemon_unavailable"),
+    );
     Ok(())
 }
 
@@ -1203,6 +1237,7 @@ pub fn status() -> anyhow::Result<()> {
     }
     match call("ping", Duration::from_millis(300)) {
         Some(r) => {
+            crate::runtime_status::record_service(crate::runtime_status::ServiceState::Ready, None);
             println!("daemon: running (v{})", r.version.unwrap_or_default());
             if let Some(info) = info.filter(|i| i.enabled) {
                 println!(
@@ -1234,7 +1269,13 @@ pub fn status() -> anyhow::Result<()> {
                 }
             }
         }
-        None => println!("daemon: not running ({})", ipc::describe()),
+        None => {
+            crate::runtime_status::record_service(
+                crate::runtime_status::ServiceState::Degraded,
+                Some("daemon_unavailable"),
+            );
+            println!("daemon: not running ({})", ipc::describe());
+        }
     }
     // "healthy" used to mean "nothing has failed", which is also what a host
     // where no hook has ever run reports. The liveness picture compares the
@@ -1474,14 +1515,20 @@ mod tests {
         }
     }
 
-    fn roundtrip(ctx: &Ctx, chan: Channel, body: serde_json::Value) -> Response {
+    fn roundtrip(ctx: &Ctx, chan: Channel, mut body: serde_json::Value) -> Response {
+        if matches!(chan, Channel::Remote) && body.get("network_major").is_none() {
+            body["network_major"] = serde_json::json!(crate::embedding_profile::NETWORK_MAJOR);
+        }
         let mut stream = Duplex { input: std::io::Cursor::new(format!("{body}\n").into_bytes()), output: Vec::new() };
         serve_conn(&mut stream, ctx, chan);
         serde_json::from_slice(&stream.output).unwrap()
     }
 
     /// Did this connection ask for shutdown, and was it granted?
-    fn roundtrip_shutdown(ctx: &Ctx, chan: Channel, body: serde_json::Value) -> bool {
+    fn roundtrip_shutdown(ctx: &Ctx, chan: Channel, mut body: serde_json::Value) -> bool {
+        if matches!(chan, Channel::Remote) && body.get("network_major").is_none() {
+            body["network_major"] = serde_json::json!(crate::embedding_profile::NETWORK_MAJOR);
+        }
         let mut stream = Duplex { input: std::io::Cursor::new(format!("{body}\n").into_bytes()), output: Vec::new() };
         serve_conn(&mut stream, ctx, chan)
     }
@@ -1503,6 +1550,25 @@ mod tests {
         assert_eq!(r.error.as_deref(), Some("unauthorized"));
         let r = roundtrip(&ctx, Channel::Remote, serde_json::json!({"op": "ping", "token": "right-token"}));
         assert!(r.ok);
+    }
+
+    #[test]
+    fn remote_network_majors_fail_closed_before_serving_data() {
+        let ctx = Ctx {
+            cfg: Arc::new(crate::config::Config::default()),
+            serve: None,
+            tcp_token: Some("right-token".to_string()),
+            local_token: None,
+            iroh: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+        };
+        let r = roundtrip(
+            &ctx,
+            Channel::Remote,
+            serde_json::json!({"op": "ping", "token": "right-token", "network_major": 2}),
+        );
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("incompatible cfetch network major"));
     }
 
     #[test]
@@ -1562,6 +1628,7 @@ mod tests {
         let response = handle_iroh(
             &Request {
                 op: "redeem".into(),
+                network_major: Some(crate::embedding_profile::NETWORK_MAJOR),
                 slice: Some(ticket.slice),
                 secret: Some(ticket.secret),
                 mode: Some(ticket.mode),
