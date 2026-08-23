@@ -7,7 +7,7 @@
 //! closes the connection. Ops: ping, resident, health, scan-code,
 //! scan-status, serve-status, shutdown — plus, when serving mode is enabled
 //! (config `serve.enabled`), the barrier-gated query ops recall, expand,
-//! find, map, slices, generation and checksum.
+//! find, map, graph, slices, generation and checksum.
 //!
 //! A serving daemon also keeps its OWN code index current: once the tree
 //! watches are registered it kicks the single-flight background code scan and
@@ -40,7 +40,9 @@ use iroh::protocol::ProtocolHandler as _;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, VectorSpec};
-use crate::{grant, heartbeat, hooks, index, ipc, net, paths, resident, serve, vectors};
+use crate::{
+    grant, heartbeat, hooks, index, ipc, maintenance_worker, net, paths, resident, serve, vectors,
+};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Request {
@@ -151,6 +153,8 @@ pub struct Response {
     pub code_hits: Option<Vec<serve::WireFindHit>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub map: Option<serve::WireMap>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knowledge_graph: Option<crate::knowledge_graph::KnowledgeGraph>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slices: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -700,6 +704,7 @@ impl Channel {
                     | "expand"
                     | "find"
                     | "map"
+                    | "graph"
                     | "slices"
                     | "generation"
                     | "checksum"
@@ -1081,6 +1086,29 @@ fn handle_iroh(req: &Request, peer: &str, ctx: &Ctx) -> Response {
                 Ok(Response { blocks: Some(blocks), ..Response::default() })
             })
         }
+        "graph" => {
+            if ctx.serve.is_none() {
+                return Response::err("serving is not enabled on this daemon (config serve.enabled)");
+            }
+            let model = match ctx.cfg.slice_model() {
+                Ok(model) => model,
+                Err(e) => return Response::err(e.to_string()),
+            };
+            let focus = req.focus.as_deref();
+            let limit = req.limit.unwrap_or(40);
+            serve_query(ctx, |conn| {
+                let graph = crate::knowledge_graph::build_matching(
+                    conn,
+                    focus,
+                    limit,
+                    |path| model.contains(slice, path),
+                )?;
+                Ok(Response {
+                    knowledge_graph: Some(graph),
+                    ..Response::default()
+                })
+            })
+        }
         // These operations either mutate the host or are not slice-scoped.
         // Returning them through a slice grant would widen that grant to code
         // roots, daemon control, or resident private context.
@@ -1435,6 +1463,20 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
                 false,
             )
         }
+        "graph" => {
+            let focus = req.focus.as_deref();
+            let limit = req.limit.unwrap_or(40);
+            (
+                serve_query(ctx, |conn| {
+                    let graph = crate::knowledge_graph::build(conn, focus, limit)?;
+                    Ok(Response {
+                        knowledge_graph: Some(graph),
+                        ..Response::default()
+                    })
+                }),
+                false,
+            )
+        }
         "slices" => {
             // Hook advisory path: read-only, deliberately WITHOUT the
             // barrier — a hint must never cost seconds on the interactive
@@ -1552,6 +1594,19 @@ pub fn run() -> anyhow::Result<()> {
         shutdown: AtomicBool::new(false),
     });
     start_iroh(ctx.clone())?;
+
+    if cfg.maintenance.enabled && cfg.maintenance.configured() {
+        let maintenance_cfg = cfg.clone();
+        let maintenance_ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("cfetch-maintenance".into())
+            .spawn(move || {
+                maintenance_worker::run(maintenance_cfg, || {
+                    maintenance_ctx.shutdown.load(Ordering::SeqCst)
+                });
+            })
+            .context("start maintenance worker")?;
+    }
 
     if let (Some(bind), Some(_)) = (&cfg.serve.bind, &tcp_token) {
         let listener = std::net::TcpListener::bind(bind)?;
@@ -1943,7 +1998,16 @@ mod tests {
     #[test]
     fn query_ops_refuse_when_serving_disabled() {
         let ctx = no_serve_ctx();
-        for op in ["recall", "expand", "find", "map", "slices", "generation", "checksum"] {
+        for op in [
+            "recall",
+            "expand",
+            "find",
+            "map",
+            "graph",
+            "slices",
+            "generation",
+            "checksum",
+        ] {
             let (resp, shutdown) =
                 handle(&Request { op: op.to_string(), ..Request::default() }, &ctx);
             assert!(!resp.ok, "{op} must refuse without serve.enabled");

@@ -52,11 +52,14 @@ mod init;
 mod install;
 mod ipc;
 mod jsonl;
+mod knowledge_graph;
 mod ledger;
 mod lockfile;
 mod markers;
 mod maintenance;
 mod maintenance_inbox;
+mod maintenance_model;
+mod maintenance_worker;
 mod mcp;
 mod migrate;
 mod net;
@@ -149,6 +152,17 @@ enum Command {
         #[arg(long, default_value_t = graph::DEFAULT_MAP_BUDGET_TOKENS)]
         budget_tokens: u64,
     },
+    /// Inspect the Obsidian knowledge graph derived from curated Markdown links
+    Graph {
+        /// Center the view on a Markdown path or note name
+        #[arg(long)]
+        focus: Option<String>,
+        /// Maximum documents to return (1-200)
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Search the brain (rings 0-4), BM25-ranked, with ring-prefixed citations
     Recall {
         /// Search terms (word-prefix matched, OR-combined)
@@ -233,8 +247,7 @@ enum Command {
         #[command(subcommand)]
         action: StagingAction,
     },
-    /// Supervised AI maintenance: evidence packets, quarantined proposals,
-    /// deterministic verification, and explicit promotion into rings 2-3
+    /// Continuous second-brain maintenance, history, exceptions, and debugging
     Maintain {
         #[command(subcommand)]
         action: MaintainAction,
@@ -320,6 +333,24 @@ enum StagingAction {
 
 #[derive(Subcommand)]
 enum MaintainAction {
+    /// Run one bounded autonomous propose → review → verify → apply cycle
+    Run {
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause background and manual autonomous cycles with a visible reason
+    Pause { reason: Vec<String> },
+    /// Resume autonomous maintenance after debugging or an intervention
+    Resume,
+    /// Show immutable automatic activity and exception history
+    History {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Build a bounded evidence packet for an agent to analyze
     Packet {
         candidate_id: String,
@@ -364,6 +395,8 @@ enum MaintainAction {
         #[arg(long, value_name = "TOKEN")]
         approval_token: String,
     },
+    /// Apply a passing independent review through the autonomous policy gates
+    AutoApply { id: String },
     /// Restore the captured bytes of an applied, unfinalized proposal
     Revert { id: String },
     /// Reject a proposal without dismissing its source candidate
@@ -1035,6 +1068,91 @@ fn map_cmd(focus: Option<&str>, budget_tokens: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_knowledge_graph(graph: &knowledge_graph::KnowledgeGraph) {
+    println!(
+        "knowledge graph: {} of {} document(s), {} curated link(s), {} unresolved reference(s), generation {}",
+        graph.nodes.len(),
+        graph.total_nodes,
+        graph.total_edges,
+        graph.unresolved_references,
+        graph.generation,
+    );
+    if let Some(requested) = &graph.requested_focus {
+        match &graph.resolved_focus {
+            Some(path) => println!("focus: {requested:?} → {path}"),
+            None => println!(
+                "focus: {requested:?} matched no document — showing the connected overview"
+            ),
+        }
+    }
+    if graph.nodes.is_empty() {
+        println!("no indexed Markdown documents — run `cfetch scan`");
+        return;
+    }
+    println!("\ndocuments:");
+    for node in &graph.nodes {
+        println!(
+            "{} r{}  ←{:<3} →{:<3} {:<12} {}",
+            if node.focused { "●" } else { " " },
+            node.ring,
+            node.inbound,
+            node.outbound,
+            node.kind,
+            node.path,
+        );
+    }
+    if !graph.edges.is_empty() {
+        println!("\ncurated links:");
+        for edge in &graph.edges {
+            println!("{} → {}", edge.from, edge.to);
+        }
+        if graph.omitted_edges > 0 {
+            println!("… {} more link(s) omitted from this bounded view", graph.omitted_edges);
+        }
+    }
+}
+
+fn graph_cmd(focus: Option<&str>, limit: usize, json: bool) -> anyhow::Result<()> {
+    anyhow::ensure!((1..=200).contains(&limit), "--limit must be between 1 and 200");
+    let cfg = config::Config::load()?;
+    if let Some(cs) = &cfg.client.serving {
+        let body = serde_json::json!({"op": "graph", "focus": focus, "limit": limit});
+        let response = serve::client_call(cs, body, serve::QUERY_TIMEOUT)?;
+        let graph = response.knowledge_graph.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("serving host {} returned no knowledge graph", cs.addr)
+        })?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "graph": graph,
+                    "origin": response.origin,
+                    "generation": response.generation,
+                    "fresh": response.fresh,
+                    "stale_note": response.stale_note,
+                }))?
+            );
+        } else {
+            print_knowledge_graph(graph);
+            print_served_by(&response);
+        }
+        return Ok(());
+    }
+    let conn = index::ensure_fresh(
+        &paths::state_dir(),
+        &cfg.brain_root,
+        Some(&paths::native_projects_root()),
+        &cfg.rings(),
+    )?;
+    let graph = knowledge_graph::build(&conn, focus, limit)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&graph)?);
+    } else {
+        print_knowledge_graph(&graph);
+    }
+    Ok(())
+}
+
 /// Coherence footer for answers that went through a serving daemon.
 fn print_served_by(resp: &daemon::Response) {
     let origin = resp.origin.clone().unwrap_or_default();
@@ -1461,6 +1579,58 @@ fn staging_cmd(action: StagingAction) -> anyhow::Result<()> {
 fn maintain_cmd(action: MaintainAction) -> anyhow::Result<()> {
     let cfg = config::Config::load()?;
     match action {
+        MaintainAction::Run { limit, json } => {
+            let mut model = maintenance_model::MaintenanceClient::new(&cfg.maintenance)?;
+            let report = maintenance::run_once_with(
+                &cfg,
+                &mut model,
+                limit.unwrap_or(cfg.maintenance.max_candidates),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else if report.paused {
+                println!(
+                    "maintenance paused: {}",
+                    maintenance::pause_reason(&cfg).unwrap_or_else(|| "pause marker present".into())
+                );
+            } else {
+                println!(
+                    "maintenance cycle: {} examined, {} applied, {} dismissed, {} noop, {} exception(s)",
+                    report.examined,
+                    report.applied,
+                    report.dismissed,
+                    report.noops,
+                    report.exceptions
+                );
+            }
+        }
+        MaintainAction::Pause { reason } => {
+            let reason = reason.join(" ");
+            maintenance::pause(&cfg, &reason)?;
+            println!("maintenance paused: {reason}");
+        }
+        MaintainAction::Resume => {
+            maintenance::resume(&cfg)?;
+            println!("maintenance resumed");
+        }
+        MaintainAction::History { limit, json } => {
+            let events: Vec<_> = maintenance::history(&cfg).into_iter().take(limit).collect();
+            if json {
+                println!("{}", serde_json::to_string(&events)?);
+            } else if events.is_empty() {
+                println!("no automatic maintenance activity recorded");
+            } else {
+                for event in events {
+                    println!(
+                        "{}  {:<10}  {}  {}",
+                        event.id,
+                        format!("{:?}", event.outcome).to_ascii_lowercase(),
+                        event.target.as_deref().unwrap_or("no memory write"),
+                        event.detail
+                    );
+                }
+            }
+        }
         MaintainAction::Packet { candidate_id, json } => {
             let packet = maintenance::packet(&cfg, &candidate_id)?;
             if json {
@@ -1643,6 +1813,15 @@ fn maintain_cmd(action: MaintainAction) -> anyhow::Result<()> {
                 println!("applied decision {}", proposal.id);
                 println!("finalize it: cfetch maintain finalize {}", proposal.id);
             }
+        }
+        MaintainAction::AutoApply { id } => {
+            let proposal = maintenance::automatic_apply(&cfg, &id)?;
+            println!(
+                "automatically finalized {} ({})",
+                proposal.id,
+                proposal.target.as_deref().unwrap_or("no memory write")
+            );
+            println!("reversible while exact bytes remain: cfetch maintain revert {}", proposal.id);
         }
         MaintainAction::Revert { id } => {
             let proposal = maintenance::revert(&cfg, &id)?;
@@ -2566,6 +2745,12 @@ fn main() {
         Command::Map { focus, budget_tokens } => {
             if let Err(e) = map_cmd(focus.as_deref(), budget_tokens) {
                 eprintln!("cfetch map: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Graph { focus, limit, json } => {
+            if let Err(e) = graph_cmd(focus.as_deref(), limit, json) {
+                eprintln!("cfetch graph: {e}");
                 std::process::exit(1);
             }
         }
