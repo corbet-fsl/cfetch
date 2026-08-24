@@ -46,6 +46,8 @@ is part of the build.
 The model bundle is deterministic and separately licensed under the included
 Gemma terms. Its current archive SHA-256 is
 `12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1`.
+The immutable archive is published in the public
+[`model-v1` release](https://github.com/corbet-labs/cfetch/releases/tag/model-v1).
 The archive includes the graph, tokenizer, source card, build report,
 retrieval audit, artifact lock, terms, modification notice, and per-file
 checksums. The graph digest above, rather than the archive filename or URL, is
@@ -91,6 +93,43 @@ Microsoft's official shared build both reported ONNX Runtime 1.28.0, but the
 static build failed all 11 v1 vector answers while Microsoft's release passed
 all 11. The Nix local-CPU package therefore pins Microsoft's exact archive
 bytes and records their digest. “Same ORT version” is not sufficient.
+The Rust/FastEmbed binding uses the older ORT C API 18 surface so compatible
+vendor runtimes are not excluded merely by a newer compile-time ABI request;
+the loaded runtime's exact distribution and bytes still have to be certified.
+
+The same official ORT 1.28 build commit was then exercised on public Linux
+arm64 and macOS arm64 runners. Both loaded and ran successfully but matched
+none of the 11 x86 reference records. Hundreds of components changed in every
+answer, and the two arm64 OS runtimes themselves diverged on five answers.
+They are rejected producers, not “probably compatible” CPU packages. This is
+why shared vectors are derived once and distributed, and why an architecture
+name or matching runtime version cannot bypass the KAT.
+
+A physical AMD Radeon RX 6800 produced the complementary accelerator result.
+ORT's MIGraphX provider could not own the whole graph with CPU fallback
+disabled. Standalone MIGraphX did compile and run the complete frozen W8A8
+graph on RDNA2 INT8-capable kernels, but its first encoded result changed 729
+of 768 components. This proves that “same ONNX Q/DQ graph” and “real INT8
+acceleration” still do not imply identical output arithmetic across kernels.
+It also rules out bypassing ORT with direct MIGraphX as a v1 producer.
+
+AMD's current NPU material illustrates why v1 cannot accept a vendor-specific
+"optimized EmbeddingGemma" by name alone. Ryzen AI 1.8's classic compiler has
+A8W8 operators, but its compatibility table promises INT8 only for CNNs; its
+Windows ML path requires A16W8 for quantized Transformers. AMD's published
+EmbeddingGemma NPU artifact instead uses UINT4 weights and BFP16 activations.
+Those are useful vendor formats, but they are a different numerical pipeline
+and therefore cannot produce network-major-1 records. The physical VitisAI
+harness tests only the unchanged cfetch W8A8 graph and fails closed.
+
+These results settle the apparent common-denominator problem at the correct
+boundary. V1 has one logical W8A8 model and one canonical signed `INT8x768`
+record, but it cannot honestly promise that every vendor kernel derives those
+bytes independently. A device is a producer only if its exact host/runtime
+passes the byte KAT; every other device consumes the same already-derived
+record or uses a certified remote producer. That consumer path is fully
+interoperable across CPU, GPU and NPU because inference precision is never
+part of the shared record. There is no approximate compatibility mode.
 
 Run the real packaged path with:
 
@@ -104,6 +143,14 @@ the canonical codec, and compares all 11 records byte for byte. Accelerator
 packages additionally disable ORT CPU fallback. A passing accelerator vector
 test still needs reviewed placement/profiler evidence that learned W8A8
 regions actually used the claimed INT8 device kernels.
+
+The ordinary local embedding path enforces the same gate before it can answer
+or write a vector. A bundle or session that merely loads is not admitted. On a
+host whose runtime produces different bytes, local initialization fails with a
+consumer-only message. Existing shared records and a separately configured
+certified remote producer remain the compatible routes. `inference-certify`
+deliberately remains available on such a host so it can emit the failure report
+needed to add or reject that runtime.
 
 ## Canonical vector codec
 
@@ -130,7 +177,9 @@ closed on a mismatch.
 Uncertified hardware remains fully useful as a consumer: it can search shared
 vectors or request inference from a certified producer. It must not advertise
 local producer capability. The release catalog remains remote-only until a
-complete local package, model distribution and reviewed certificate exist.
+standalone local release variant assembles the published model, provider
+runtime, and reviewed certificate. The source flake's `cfetch-local-cpu`
+package and public model bundle can already be used directly for evaluation.
 
 Reranking is deliberately outside this boundary. It is transient per query,
 never stored or exchanged as vector truth, and may use a different model or be

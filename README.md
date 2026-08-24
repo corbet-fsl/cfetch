@@ -72,9 +72,10 @@ for this screen or for routine approval.
 
 The latest tagged release is v0.9.9. Features added since that tag are clearly
 marked **Main — next release**; install from source to try them before the next
-release. Optional semantic search and reranking require an OpenAI-compatible
-inference endpoint; lexical recall, code navigation, hooks, capture, and
-measurement do not.
+release. Optional semantic search can use the frozen v1 local model package or
+a certified OpenAI-compatible producer; optional reranking still uses an
+OpenAI-compatible endpoint and is outside the shared-vector ABI. Lexical
+recall, code navigation, hooks, capture, and measurement need neither.
 
 | Area | Availability | What you experience | Main surfaces |
 |---|---|---|---|
@@ -456,6 +457,52 @@ Every archive includes the binary, cfetch license, generated third-party
 notices, and embedded variant metadata. `cfetch variants` prints the exact
 catalog used to build the release.
 
+### Evaluate the frozen v1 local CPU path
+
+The source flake exposes the certified local CPU package on x86-64 Linux,
+arm64 Linux, and Apple silicon. The separately licensed, immutable model bundle
+is published in the public
+[`model-v1` release](https://github.com/corbet-labs/cfetch/releases/tag/model-v1):
+
+```console
+$ nix build github:corbet-labs/cfetch#cfetch-local-cpu
+$ curl --proto '=https' --tlsv1.2 --location --fail --output model-v1.tar.gz \
+    https://github.com/corbet-labs/cfetch/releases/download/model-v1/cfetch-embeddinggemma-300m-a8w8-v1.tar.gz
+$ test "$(nix hash file --type sha256 --base16 model-v1.tar.gz)" = \
+    12892e4fb2dea4e60adc03669f32dcee2813d2764c8bf6c25ecf6b95aa5756b1
+$ tar -xzf model-v1.tar.gz
+$ ./result/bin/cfetch inference-certify \
+    --model-dir ./cfetch-embeddinggemma-300m-a8w8-v1 --provider auto --json
+```
+
+Apple Silicon testers can build the non-catalogue CoreML evidence package with
+`nix build github:corbet-labs/cfetch#cfetch-test-coreml`, then certify
+`coreml-gpu` and `coreml-npu` separately. It enables Core ML compute-plan
+logging. The first hosted GPU and NPU probes were rejected: all logged Core ML
+operations ran on its CPU and ORT still required CPU fallback. A new route must
+pass exact bytes and placement review before it may produce vectors.
+
+Linux x86-64 Intel testers use
+`nix build github:corbet-labs/cfetch#cfetch-test-openvino` and certify
+`openvino-cpu`, `openvino-gpu`, or `openvino-npu`. The package pins Intel's
+complete official ORT/OpenVINO wheel; exact bytes and per-device placement are
+still mandatory. The available local CPU probe was rejected because OpenVINO
+did not own the complete frozen graph, so this is an evidence package only.
+Windows x64 testers can create the equivalent hash-pinned NuGet evidence
+package with `scripts/build-windows-inference-package.ps1 -Provider
+openvino-npu -Output ./cfetch-openvino-npu`; CPU and GPU are selectable by
+replacing the provider suffix. The public hosted runner exercises CPU only and
+does not stand in for physical Intel GPU or NPU hardware.
+
+One tested x86-64 host is the current certified CPU reference; a later public
+x86-64 host using the exact same package/runtime failed all 11 vectors. Public
+Linux arm64 and macOS arm64 runs failed all 11 too. These are host/runtime
+certificates, never architecture-wide promises. The release catalog therefore
+remains remote-only. Ordinary local loading runs the same admission gate on
+the actual host and fails closed before writing incompatible vectors. See the
+[frozen profile](docs/embedding-profile-v1.md) and
+[certification matrix](docs/accelerator-certification.md).
+
 ### Build the development branch
 
 ```console
@@ -518,7 +565,8 @@ Ring rules are ordered; the first matching path prefix wins:
 ```
 
 Semantic recall is off by default. Point it at an OpenAI-compatible embeddings
-endpoint; keep the credential in an environment variable, never in JSON.
+endpoint, or use the local package and extracted v1 model bundle. Keep remote
+credentials in an environment variable, never in JSON.
 
 On `main` for the next release, the model pipeline is no longer configurable:
 network major 1 fixes EmbeddingGemma-300M,
@@ -532,11 +580,15 @@ plain OpenAI wire shape alone is not permission to publish shared vectors:
 {
   "embeddings": {
     "enabled": true,
-    "endpoint": "http://127.0.0.1:8080/v1",
-    "api_key_env": "EMBEDDINGS_API_KEY"
+    "model_dir": "/absolute/path/to/cfetch-embeddinggemma-300m-a8w8-v1",
+    "execution_provider": "auto"
   }
 }
 ```
+
+For a remote certified producer, replace `model_dir` and `execution_provider`
+with `endpoint` and `api_key_env`. A configured local model never silently
+falls back to that endpoint.
 
 Run `cfetch embed-index` for an explicit backfill or debugging pass. With the
 daemon running, catalog generation changes trigger the same shared-first

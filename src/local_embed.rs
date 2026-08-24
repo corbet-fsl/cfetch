@@ -14,6 +14,8 @@ use anyhow::Context as _;
 use fastembed::{
     InitOptionsUserDefined, OutputKey, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
 };
+#[cfg(feature = "inference-vitis")]
+use ort::ep::ArbitrarilyConfigurableExecutionProvider as _;
 use ort::ep::ExecutionProviderDispatch;
 use sha2::Digest as _;
 use tokenizers::{PaddingStrategy, TruncationParams};
@@ -200,9 +202,9 @@ impl std::fmt::Debug for LocalEmbedder {
 }
 
 impl LocalEmbedder {
-    pub fn load(model_dir: &Path, requested_provider: &str) -> anyhow::Result<Self> {
+    fn load_unadmitted(model_dir: &Path, requested_provider: &str) -> anyhow::Result<Self> {
         let bundle = VerifiedBundle::load(model_dir)?;
-        let (provider, device_class, dispatch) = execution_provider(requested_provider)?;
+        let (provider, device_class, dispatch) = execution_provider(requested_provider, None)?;
         let mut length_tokenizer = tokenizers::Tokenizer::from_bytes(bundle.tokenizer.clone())
             .map_err(|error| anyhow::anyhow!("load verified tokenizer: {error}"))?;
         length_tokenizer.with_padding(None);
@@ -230,6 +232,20 @@ impl LocalEmbedder {
         })
     }
 
+    /// Load a local producer only after this package/runtime passes the
+    /// released byte KAT. Certification itself deliberately bypasses this
+    /// admission so new and incompatible hardware can still emit evidence.
+    pub fn load_for_production(model_dir: &Path, requested_provider: &str) -> anyhow::Result<Self> {
+        let embedder = Self::load_unadmitted(model_dir, requested_provider)?;
+        let report = certify_loaded(&embedder, Instant::now())?;
+        ensure_production_admission(
+            report.provider,
+            report.exact_vector_conformance,
+            report.producer_eligible_without_external_review,
+        )?;
+        Ok(embedder)
+    }
+
     pub fn provider(&self) -> &'static str {
         self.provider
     }
@@ -255,7 +271,7 @@ impl LocalEmbedder {
                 ModelState::Dynamic(model) => model,
                 ModelState::StaticAccelerator { bundle, current } => {
                     if current.as_ref().map(|(shape, _)| *shape) != Some(bucket) {
-                        let (_, _, dispatch) = execution_provider(self.provider)?;
+                        let (_, _, dispatch) = execution_provider(self.provider, Some(bucket))?;
                         *current = Some((
                             bucket,
                             build_model(bundle.clone(), self.provider, dispatch, Some(bucket))?,
@@ -354,6 +370,19 @@ impl LocalEmbedder {
     }
 }
 
+fn ensure_production_admission(provider: &str, exact: bool, eligible: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        exact,
+        "{provider} provider output is incompatible with {} on this host; local production is disabled, but shared/remote vectors remain usable",
+        crate::embedding_profile::PROFILE_ID
+    );
+    anyhow::ensure!(
+        eligible,
+        "{provider} provider has no production admission for this runtime/device; run `cfetch inference-certify` and submit the report plus required placement evidence"
+    );
+    Ok(())
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -396,7 +425,14 @@ fn runtime_library_sha256() -> anyhow::Result<String> {
 /// regions internally.
 pub fn certify(model_dir: &Path, requested_provider: &str) -> anyhow::Result<CertificationReport> {
     let started = Instant::now();
-    let embedder = LocalEmbedder::load(model_dir, requested_provider)?;
+    let embedder = LocalEmbedder::load_unadmitted(model_dir, requested_provider)?;
+    certify_loaded(&embedder, started)
+}
+
+fn certify_loaded(
+    embedder: &LocalEmbedder,
+    started: Instant,
+) -> anyhow::Result<CertificationReport> {
     let mut results = Vec::with_capacity(KNOWN_ANSWERS.len());
     for known in KNOWN_ANSWERS {
         let body = std::iter::repeat_n(known.seed, known.repeats)
@@ -503,12 +539,12 @@ pub fn certify(model_dir: &Path, requested_provider: &str) -> anyhow::Result<Cer
         device_class: embedder.device_class(),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
-        ort_crate: "2.0.0-rc.13 (API 24)",
+        ort_crate: "2.0.0-rc.13 (API 18)",
         onnxruntime_build_info: ort::info(),
         onnxruntime_distribution: runtime_distribution,
         onnxruntime_archive_sha256: runtime_archive_sha256,
         onnxruntime_library_sha256: runtime_library_sha256,
-        fastembed: "6.0.0 + cfetch session-controls f8bb355369340dc81e43979b23d23eddab0a40c4",
+        fastembed: "6.0.0 + cfetch session-controls 234fc39af5b010de0cb0c5688d138492e690fa68",
         graph_optimization: crate::embedding_profile::GRAPH_OPTIMIZATION,
         inference_batch_size: crate::embedding_profile::INFERENCE_BATCH_SIZE,
         ort_intra_threads: crate::embedding_profile::ORT_INTRA_THREADS,
@@ -578,6 +614,7 @@ fn set_fixed_padding(model: &mut TextEmbedding, bucket: usize) -> anyhow::Result
 
 fn execution_provider(
     requested: &str,
+    _fixed_bucket: Option<usize>,
 ) -> anyhow::Result<(&'static str, &'static str, ExecutionProviderDispatch)> {
     let requested = requested.trim().to_ascii_lowercase();
     let requested = requested.as_str();
@@ -589,7 +626,7 @@ fn execution_provider(
         #[cfg(feature = "inference-qnn")]
         return qnn_provider();
         #[cfg(all(not(feature = "inference-qnn"), feature = "inference-vitis"))]
-        return Ok(vitis_provider());
+        return vitis_provider(_fixed_bucket);
         #[cfg(all(
             not(feature = "inference-qnn"),
             not(feature = "inference-vitis"),
@@ -690,7 +727,7 @@ fn execution_provider(
         #[cfg(feature = "inference-qnn")]
         "qnn" => qnn_provider(),
         #[cfg(feature = "inference-vitis")]
-        "vitis" => Ok(vitis_provider()),
+        "vitis" => vitis_provider(_fixed_bucket),
         #[cfg(feature = "inference-cuda")]
         "cuda" => Ok(cuda_provider()),
         #[cfg(feature = "inference-tensorrt")]
@@ -719,7 +756,7 @@ fn cpu_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
 
 #[cfg(feature = "inference-coreml")]
 fn coreml_provider(name: &str) -> (&'static str, &'static str, ExecutionProviderDispatch) {
-    use ort::ep::coreml::ComputeUnits;
+    use ort::ep::coreml::{ComputeUnits, ModelFormat};
 
     let (name, units, class) = match name {
         "coreml-gpu" => ("coreml-gpu", ComputeUnits::CPUAndGPU, "gpu"),
@@ -732,6 +769,12 @@ fn coreml_provider(name: &str) -> (&'static str, &'static str, ExecutionProvider
         class,
         ort::ep::CoreML::default()
             .with_compute_units(units)
+            .with_model_format(ModelFormat::MLProgram)
+            .with_static_input_shapes(true)
+            // The log is part of the external placement-review evidence. It
+            // does not by itself grant producer admission.
+            .with_profile_compute_plan(true)
+            .with_low_precision_accumulation_on_gpu(false)
             .build()
             .error_on_failure(),
     )
@@ -749,6 +792,9 @@ fn openvino_provider(name: &str) -> (&'static str, &'static str, ExecutionProvid
         class,
         ort::ep::OpenVINO::default()
             .with_device_type(device)
+            .with_num_threads(crate::embedding_profile::ORT_INTRA_THREADS)
+            .with_num_streams(1)
+            .with_dynamic_shapes(false)
             .build()
             .error_on_failure(),
     )
@@ -774,12 +820,49 @@ fn qnn_provider() -> anyhow::Result<(&'static str, &'static str, ExecutionProvid
 }
 
 #[cfg(feature = "inference-vitis")]
-fn vitis_provider() -> (&'static str, &'static str, ExecutionProviderDispatch) {
-    (
-        "vitis",
-        "npu",
-        ort::ep::Vitis::default().build().error_on_failure(),
-    )
+fn vitis_provider(
+    fixed_bucket: Option<usize>,
+) -> anyhow::Result<(&'static str, &'static str, ExecutionProviderDispatch)> {
+    let target = std::env::var("CFETCH_VITIS_TARGET").unwrap_or_else(|_| "X2".to_string());
+    anyhow::ensure!(
+        matches!(target.as_str(), "X1" | "X2"),
+        "CFETCH_VITIS_TARGET must be X1 or X2"
+    );
+    let xclbin = std::env::var("CFETCH_VITIS_XCLBIN")
+        .ok()
+        .filter(|path| !path.trim().is_empty());
+    anyhow::ensure!(
+        target != "X1" || xclbin.is_some(),
+        "Ryzen AI X1 targets require CFETCH_VITIS_XCLBIN"
+    );
+    anyhow::ensure!(
+        target != "X2" || xclbin.is_none(),
+        "Ryzen AI X2 targets must not set CFETCH_VITIS_XCLBIN"
+    );
+
+    let mut provider = ort::ep::Vitis::default()
+        .with_arbitrary_config("target", target)
+        .with_arbitrary_config("opt_level", "0");
+    if let Some(xclbin) = xclbin {
+        provider = provider.with_arbitrary_config("xclbin", xclbin);
+    }
+    if let Some(report_dir) = std::env::var("CFETCH_VITIS_REPORT_DIR")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+    {
+        let bucket = fixed_bucket
+            .context("CFETCH_VITIS_REPORT_DIR requires a fixed accelerator sequence bucket")?;
+        provider = provider
+            .with_cache_dir(report_dir)
+            .with_cache_key(format!("cfetch-v1-seq-{bucket}"))
+            // AMD requires disk-backed compilation for its operator-assignment
+            // report. Bucket-specific cache keys prevent one compiled static
+            // shape from being reused for another.
+            .with_arbitrary_config("enable_cache_file_io_in_mem", "0")
+            .with_arbitrary_config("ai_analyzer_profiling", "true");
+    }
+
+    Ok(("vitis", "npu", provider.build().error_on_failure()))
 }
 
 #[cfg(feature = "inference-cuda")]
@@ -857,16 +940,31 @@ mod tests {
             feature = "inference-webgpu"
         )))]
         {
-            let (name, class, _) = execution_provider("auto").unwrap();
+            let (name, class, _) = execution_provider("auto", None).unwrap();
             assert_eq!((name, class), ("cpu", "cpu"));
         }
     }
 
     #[test]
     fn unavailable_provider_is_never_silently_cpu() {
-        let error = execution_provider("definitely-not-compiled")
+        let error = execution_provider("definitely-not-compiled", None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("not compiled"), "{error}");
+    }
+
+    #[test]
+    fn production_requires_exact_bytes_and_a_runtime_admission() {
+        ensure_production_admission("cpu", true, true).unwrap();
+
+        let drift = ensure_production_admission("cpu", false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(drift.contains("incompatible") && drift.contains("local production is disabled"));
+
+        let unreviewed = ensure_production_admission("qnn", true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(unreviewed.contains("no production admission"));
     }
 }
