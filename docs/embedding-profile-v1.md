@@ -118,9 +118,29 @@ v1-capable software release or producer catalog ships, an equivalent change is
 forbidden in place and requires network major 2.
 
 All earlier CPU reports are retained as superseded diagnostic evidence, not
-current certificates. In particular, the former Linux/macOS arm64 and hosted
-x86 results must be rerun against report schema 2 and the precise profile.
+current certificates. Current report-schema-2 testing is now complete on the
+available hosted CPU matrix: an AMD EPYC 7763 matched 11/11, while Linux Arm
+Neoverse N2 and virtual macOS Apple M1 were stable but failed 0/11.
 Architecture names and matching runtime versions still cannot bypass the KAT.
+
+Source-level inspection and controlled runs ruled out two plausible Arm
+explanations. Disabling ORT's KleidiAI path changed none of the 11 raw outputs
+or final vectors on either Arm host. ORT also defaults to signed Q/DQ fusion on
+Arm while rewriting eligible x86 signed-activation Q/DQ pairs to unsigned.
+Forcing that unsigned policy everywhere changed the Arm results, but each host
+still passed only 1/11. The same control was inert on the physical Ryzen
+reference yet exposed a new result on a hosted Xeon Platinum 8573C with
+AVX-VNNI, AVX-512 VNNI and AMX-INT8: 6/11 passed, with buckets 128 through
+2,048 producing stable incompatible bytes.
+
+The controls are rejected and are not part of v1. They prove that signedness
+lowering is one source of variation, not the whole source. ORT still selects
+shape- and ISA-specific quantized kernels, and the graph's residual,
+nonlinear, normalization and output arithmetic remains floating point.
+`deterministic_compute` makes the selected route repeatable; it does not make
+different kernels or hardware bit-identical. Producer admission is therefore
+host/runtime scoped even within x86-64, and the exact startup KAT remains the
+only authority.
 
 A physical AMD Radeon RX 6800 produced the complementary accelerator result.
 ORT's MIGraphX provider could not own the whole graph with CPU fallback
@@ -133,14 +153,16 @@ across kernels. It also rules out bypassing ORT with direct MIGraphX as a v1
 producer.
 
 A physical Intel Lunar Lake probe reached the same boundary from the NPU side.
-OpenVINO 2026.3 compiled the unchanged graph for both its Arc 140V GPU and NPU,
-but strict ORT/OpenVINO sessions could not own the complete graph. A temporary,
-explicit hybrid diagnostic allowed the CPU remainder only to test that
-hypothesis; both devices produced incompatible vectors under the superseded
-candidate KAT. The strict full-graph rejection remains current because the
-model graph did not change. This shows that current INT8 hardware and
-successful graph compilation are still insufficient: exact final bytes remain
-the admission boundary.
+Strict ORT/OpenVINO sessions could not own the complete graph. A native
+OpenVINO 2026.3 adapter then removed that ambiguity: it compiled every static
+bucket and executed the unchanged corrected-v1 graph wholly on the Core Ultra
+CPU, Arc 140V GPU, and Intel AI Boost NPU. All three paths failed 0/11 final
+records. The Arc runtime graph did contain hundreds of `i8`/`u8` nodes, and an
+`ACCURACY` plus FP32-hint control was still 0/11, so neither real integer work
+nor avoiding its default FP16 hint made the outputs interchangeable. This
+shows that current INT8 hardware, complete graph ownership, and successful
+compilation are still insufficient: exact final bytes remain the admission
+boundary.
 
 The physical RX 6800 WebGPU probe further isolated the issue from temperature.
 Three executions produced identical raw-output and vector hashes while the GPU

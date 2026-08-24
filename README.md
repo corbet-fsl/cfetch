@@ -80,6 +80,7 @@ recall, code navigation, hooks, capture, and measurement need neither.
 | Area | Availability | What you experience | Main surfaces |
 |---|---|---|---|
 | Persistent agent memory | v0.9.9 | Decisions, rules, notes, and working state stay in plain Markdown and git | `cfetch init`, configurable knowledge tree |
+| Selective learning cards | **Main — next release** | A huge nixcards catalogue can contribute only the locally selected Markdown sets; the nixcards TUI and cfetch share Git's native sparse selection without a shadow config | `cards init`, `cards list`, `cards select`, `cards sync`, `cards tui` |
 | Cited retrieval | v0.9.9 | BM25, semantic, and hybrid search return statement-level citations that survive file reordering | `recall`, `recall --semantic`, `recall --hybrid`, `recall --id` |
 | Retrieval quality | v0.9.9 | Trust-aware ranking, optional cross-encoder reranking, lexical precision gates, duplicate suppression, and wikilink expansion | `recall --expand`, `rerank.*`, `recall.gate` |
 | Code intelligence | v0.9.9 | Tree-sitter symbols, exact line ranges, import-graph importance, and token-budgeted repository maps | `find`, `map`, `.cfetchignore` |
@@ -173,6 +174,36 @@ The knowledge tree is the only fact store. The local SQLite catalog, symbol
 index, fingerprints, and vector cache can be deleted and rebuilt without
 losing knowledge. This also means ordinary editors, git history, Obsidian,
 shell tools, and code review continue to work.
+
+### Selective nixcards knowledge
+
+`cfetch cards init` creates a `blob:none` partial clone of the canonical nixcards `cards` branch at
+`<brain_root>/knowledge/cards`. The checkout's Git sparse-checkout list is the only local selection
+record: cfetch and the nixcards Ratatui interface read and update the same state, so neither tool can
+overwrite a shadow configuration owned by the other.
+
+```console
+$ cfetch cards init
+$ cfetch cards list
+$ cfetch cards select cloud.bearingpoint.interview
+$ cfetch cards status
+$ cfetch cards tui
+```
+
+Dotted selectors may name one set or a whole hierarchy branch. The root `catalog.json` remains
+local so either interface can show the complete taxonomy; only the selected set directories and
+their Markdown blobs materialize. `cards sync` fast-forwards the catalogue without changing that
+selection. Store mutations share one bounded cross-platform lock, and the daemon watches selected
+files even when the outer brain repository ignores the nested checkout.
+
+This managed checkout is also the contribution source. A correction made while reading under
+`knowledge/cards` is an ordinary Git change that can be committed on a topic branch and proposed
+directly against nixcards' `cards` branch. `cards sync` refuses to overwrite local changes.
+
+The cards carry no cfetch trust setting. Their physical `knowledge/cards/...` paths pass through
+the brain's normal ordered `ring_rules`, exactly like manually written knowledge. The nixcards
+application remains independent: cfetch is not required for its TUI, web application, catalogue,
+or progress store.
 
 ### Trust is visible in every citation
 
@@ -491,12 +522,12 @@ did not own the complete frozen graph, so this is an evidence package only.
 For current Intel drivers, `cfetch-test-openvino-current` instead pins ORT
 1.27.1 and OpenVINO 2026.3 from the locked Nix input. A physical Core Ultra 7
 258V probe compiled the frozen graph on both Arc 140V and its NPU, but strict
-sessions still required forbidden CPU remainder. An explicit diagnostic that
-allowed the remainder produced vectors incompatible with the then-current
-candidate KAT on both devices. The graph is unchanged, so the strict ownership
-rejection remains current; the hybrid comparison must be rerun against the
-corrected KAT before being quoted numerically. These are rejected routes, not
-producer support; production remains fail-closed.
+sessions still required forbidden CPU remainder. A native OpenVINO diagnostic
+subsequently owned the unchanged corrected-v1 graph completely on the Core
+Ultra CPU, Arc GPU, and Intel NPU across all seven buckets. Each passed 0/11
+exact vectors, including conservative `ACCURACY` controls and an FP32-hint GPU
+control. These are rejected routes, not producer support; production remains
+fail-closed.
 Windows x64 testers can create the equivalent hash-pinned NuGet evidence
 package with `scripts/build-windows-inference-package.ps1 -Provider
 openvino-npu -Output ./cfetch-openvino-npu`; CPU and GPU are selectable by
@@ -522,11 +553,12 @@ the GPU warmed by several degrees, ruling out temperature instability.
 
 The corrected CPU reference freezes ORT deterministic compute and precise QMM.
 It produced identical raw outputs and final vectors on a physical Ryzen 9
-5950X AVX2 host and a physical Core Ultra 7 258V VNNI host: 11/11 on both. The
-former AVX2 KAT had accidentally canonized ORT's saturating U8S8 fast path and
-all earlier CPU reports are superseded until rerun against report schema 2.
-Ordinary local loading runs the same admission gate on the actual host and
-fails closed before writing incompatible vectors. See the
+5950X AVX2 host, a physical Core Ultra 7 258V VNNI host, and one hosted EPYC
+7763: 11/11 on each. Current hosted Arm routes failed 0/11, and a controlled
+Q/DQ-policy run on a Xeon 8573C passed only 6/11. Deterministic execution is
+repeatable on a selected kernel route; it is not a cross-hardware byte promise.
+Ordinary local loading therefore runs the same admission gate on every actual
+host and fails closed before writing incompatible vectors. See the
 [frozen profile](docs/embedding-profile-v1.md) and
 [certification matrix](docs/accelerator-certification.md).
 
