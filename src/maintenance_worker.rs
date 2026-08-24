@@ -19,24 +19,48 @@ pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
     let debounce = Duration::from_secs(cfg.maintenance.debounce_secs.max(1));
     let mut observed_revision: Option<String> = None;
     let mut due: Option<Instant> = None;
+    let mut journaled_preflight_failure: Option<String> = None;
 
     while !stopping() {
         let revision = maintenance::candidate_revision(&cfg);
         let candidates = crate::staging::pending_count(&crate::paths::staging_dir(&cfg.brain_root));
-        if maintenance::is_paused(&cfg) || candidates == 0 {
+        if maintenance::is_paused(&cfg) {
+            // Forget the pre-pause revision. Resuming must schedule the
+            // evidence that was already observed instead of waiting for a
+            // second edit to wake the worker.
+            observed_revision = None;
+            due = None;
+        } else if candidates == 0 {
             due = None;
         } else if observed_revision.as_deref() != Some(revision.as_str()) {
             // Every new edit resets the quiet period, so the packet sees a
             // settled batch rather than racing a burst of hook writes.
-            observed_revision = Some(revision);
+            observed_revision = Some(revision.clone());
             due = Some(Instant::now() + debounce);
+            journaled_preflight_failure = None;
         }
 
         if due.is_some_and(|deadline| Instant::now() >= deadline) {
-            match maintenance_model::MaintenanceClient::new(&cfg.maintenance).and_then(|mut model| {
-                maintenance::run_once_with(&cfg, &mut model, cfg.maintenance.max_candidates)
-            }) {
+            let cycle = match maintenance_model::MaintenanceClient::new(&cfg.maintenance) {
+                Ok(mut model) => {
+                    maintenance::run_once_with(&cfg, &mut model, cfg.maintenance.max_candidates)
+                }
+                Err(error) => {
+                    crate::runtime_status::record_maintenance_attempt(
+                        crate::runtime_status::endpoint_route(&cfg.maintenance.endpoint),
+                        "proposal",
+                        false,
+                    );
+                    if journaled_preflight_failure.as_deref() != Some(revision.as_str()) {
+                        let _ = maintenance::record_background_exception(&cfg, error.to_string());
+                        journaled_preflight_failure = Some(revision.clone());
+                    }
+                    Err(error)
+                }
+            };
+            match cycle {
                 Ok(report) => {
+                    journaled_preflight_failure = None;
                     eprintln!(
                         "cfetch maintenance: {} examined, {} applied, {} dismissed, {} noop, {} exception(s)",
                         report.examined,
@@ -47,11 +71,20 @@ pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
                     );
                     let remaining = crate::staging::pending_count(&crate::paths::staging_dir(&cfg.brain_root));
                     observed_revision = Some(maintenance::candidate_revision(&cfg));
-                    due = (remaining > 0).then(|| Instant::now() + FAILURE_RETRY);
+                    due = (remaining > 0).then(|| {
+                        Instant::now()
+                            + if report.exceptions > 0 {
+                                FAILURE_RETRY
+                            } else {
+                                debounce
+                            }
+                    });
+                    let _ = crate::runtime_status::refresh_static();
                 }
                 Err(error) => {
                     eprintln!("cfetch maintenance degraded: {error:#}");
                     due = Some(Instant::now() + FAILURE_RETRY);
+                    let _ = crate::runtime_status::refresh_static();
                 }
             }
         }

@@ -25,6 +25,7 @@ const MAX_RELEVANT: usize = 12;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_JOURNAL_TEXT_BYTES: usize = 16 * 1024;
 const LOCK_WAIT_MS: u64 = 2_000;
 
 const PENDING: &str = "pending";
@@ -643,7 +644,7 @@ fn snapshot_target(candidate: &staging::Candidate, cfg: &Config) -> Option<Targe
 
 pub fn proposal_contract() -> serde_json::Value {
     serde_json::json!({
-        "candidate_ids": ["candidate id(s) from this packet"],
+        "candidate_ids": ["the exact candidate id from this packet"],
         "transition": "add | fold | supersede | revalidate | dismiss | noop",
         "target": "brain-relative .md path; required for content transitions, otherwise null",
         "after": "complete proposed Markdown bytes; required for content transitions, otherwise null",
@@ -729,8 +730,9 @@ fn render(proposal: &Proposal) -> String {
     let json = serde_json::to_string_pretty(proposal).unwrap_or_else(|_| "{}".to_string());
     format!(
         "---\nring: 5\ntype: cfetch-maintenance-proposal\nid: {:?}\ntransition: {:?}\n---\n\n\
-         Quarantined maintenance proposal. It is not recalled or injected. Review the exact\n\
-         evidence and diff with `cfetch maintain verify {}` before approving it.\n\n\
+         Quarantined maintenance proposal. It is not recalled or injected. The automatic and\n\
+         manual paths re-run exact evidence, authority, and target checks before applying it.\n\
+         Inspect those checks with `cfetch maintain verify {}`.\n\n\
          ```json\n{}\n```\n",
         proposal.id,
         format!("{:?}", proposal.transition).to_ascii_lowercase(),
@@ -744,7 +746,7 @@ fn render_review(review: &Review) -> String {
     format!(
         "---\nring: 5\ntype: cfetch-maintenance-review\nid: {:?}\nproposal: {:?}\nverdict: {:?}\n---\n\n\
          Immutable semantic review of a quarantined maintenance proposal. Deterministic\n\
-         gates are re-run separately before any approval token is issued.\n\n\
+         gates are re-run separately before either automatic or manual application.\n\n\
          ```json\n{}\n```\n",
         review.id,
         review.proposal_id,
@@ -768,13 +770,32 @@ fn render_event(event: &MaintenanceEvent) -> String {
 
 fn load_event_at(path: &Path) -> anyhow::Result<MaintenanceEvent> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_value(fenced_json(&text)?).context("decode maintenance event")
+    let event: MaintenanceEvent =
+        serde_json::from_value(fenced_json(&text)?).context("decode maintenance event")?;
+    let expected = event_identity(&event)?;
+    anyhow::ensure!(
+        event.id == expected,
+        "maintenance event content address mismatch: expected {expected}"
+    );
+    anyhow::ensure!(
+        path.file_stem().and_then(|name| name.to_str()) == Some(event.id.as_str()),
+        "maintenance event filename does not match its content address"
+    );
+    Ok(event)
+}
+
+fn event_identity(event: &MaintenanceEvent) -> anyhow::Result<String> {
+    let mut identity = event.clone();
+    identity.id.clear();
+    Ok(format!("event-{}", &hash_bytes(serde_json::to_vec(&identity)?)[..16]))
 }
 
 fn write_event(cfg: &Config, mut event: MaintenanceEvent) -> anyhow::Result<MaintenanceEvent> {
-    let mut identity = event.clone();
-    identity.id.clear();
-    event.id = format!("event-{}", &hash_bytes(serde_json::to_vec(&identity)?)[..16]);
+    event.detail = journal_text(&event.detail);
+    for check in &mut event.checks {
+        check.detail = journal_text(&check.detail);
+    }
+    event.id = event_identity(&event)?;
     let path = history_path(&cfg.brain_root, &event.id);
     if path.exists() {
         let existing = load_event_at(&path)?;
@@ -783,6 +804,20 @@ fn write_event(cfg: &Config, mut event: MaintenanceEvent) -> anyhow::Result<Main
     }
     fsutil::atomic_write(&path, render_event(&event))?;
     Ok(event)
+}
+
+fn journal_text(value: &str) -> String {
+    if let Some(shape) = secret_shape(value) {
+        return format!("detail redacted by the maintenance journal ({shape})");
+    }
+    if value.len() <= MAX_JOURNAL_TEXT_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_JOURNAL_TEXT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [journal detail truncated]", &value[..end])
 }
 
 pub fn history(cfg: &Config) -> Vec<MaintenanceEvent> {
@@ -797,6 +832,33 @@ pub fn history(cfg: &Config) -> Vec<MaintenanceEvent> {
         .collect();
     events.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
     events
+}
+
+/// Corrupt or edited history is never accepted as an automatic outcome. The
+/// doctor uses these bounded, brain-relative diagnostics to make tampering or
+/// storage damage visible instead of silently lowering the event count.
+pub fn history_issues(cfg: &Config) -> Vec<String> {
+    let dir = state_dir(&cfg.brain_root, HISTORY);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => return vec![format!("history directory unreadable: {error}")],
+    };
+    let mut issues = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .filter_map(|path| {
+            load_event_at(&path).err().map(|error| {
+                format!(
+                    "{}: {error}",
+                    path.file_name().and_then(|name| name.to_str()).unwrap_or("history record")
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    issues.sort();
+    issues
 }
 
 fn event_for(
@@ -1622,6 +1684,21 @@ fn record_exception(
     )
 }
 
+/// Records a worker failure that happened before a proposal existed (for
+/// example, endpoint policy or credential resolution). Candidate ids are
+/// bounded and the ordinary journal redaction/content-addressing still apply.
+pub(crate) fn record_background_exception(
+    cfg: &Config,
+    detail: impl Into<String>,
+) -> anyhow::Result<MaintenanceEvent> {
+    let candidate_ids = staging::list(&paths::staging_dir(&cfg.brain_root))
+        .into_iter()
+        .take(cfg.maintenance.max_candidates)
+        .map(|candidate| candidate.id)
+        .collect();
+    record_exception(cfg, None, candidate_ids, detail, Vec::new())
+}
+
 /// Process a bounded batch and continue past per-candidate exceptions. A
 /// healthy cycle needs no human input; failures remain visible in history and
 /// their source candidates remain available for a later, freshly grounded
@@ -1641,7 +1718,14 @@ pub fn run_once_with<M: MaintenanceModel>(
         let mut submitted: Option<Proposal> = None;
         let result = (|| -> anyhow::Result<Proposal> {
             let packet = packet(cfg, &candidate.id)?;
-            let proposal = submit(cfg, model.propose(&packet)?)?.proposal;
+            let input = model.propose(&packet)?;
+            anyhow::ensure!(
+                input.candidate_ids.len() == 1 && input.candidate_ids[0] == candidate.id,
+                "autonomous proposal must name only packet candidate {}; got {:?}",
+                candidate.id,
+                input.candidate_ids
+            );
+            let proposal = submit(cfg, input)?.proposal;
             submitted = Some(proposal.clone());
             let review = model.review(&packet, &proposal)?;
             let (recorded, _) = submit_review(cfg, &proposal.id, review)?;
@@ -1713,7 +1797,7 @@ pub fn revert(cfg: &Config, id: &str) -> anyhow::Result<Proposal> {
     } else {
         move_proposal(&cfg.brain_root, id, &state, REVERTED)?;
     }
-    write_event(
+    if let Err(error) = write_event(
         cfg,
         event_for(
             Some(&proposal),
@@ -1723,7 +1807,21 @@ pub fn revert(cfg: &Config, id: &str) -> anyhow::Result<Proposal> {
             "exact automatic or manual result was still present and its captured before bytes were restored",
             Vec::new(),
         ),
-    )?;
+    ) {
+        if proposal.transition.changes_memory() {
+            let path = reject_symlink_path(
+                &cfg.brain_root,
+                proposal.target.as_deref().unwrap_or_default(),
+            )?;
+            fsutil::atomic_write(&path, proposal.after.as_deref().unwrap_or_default())?;
+        }
+        if let Err(move_error) = move_proposal(&cfg.brain_root, id, REVERTED, &state) {
+            return Err(error.context(format!(
+                "write revert history; restoring proposal state also failed: {move_error}"
+            )));
+        }
+        return Err(error.context("write revert history; reverted bytes and state were rolled back"));
+    }
     Ok(proposal)
 }
 
@@ -2229,6 +2327,29 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_review_cannot_cover_a_candidate_absent_from_its_packet() {
+        let fixture = Fixture::new();
+        let mut proposal = fixture.proposal("knowledge/wrong-packet.md", "# Wrong packet\n");
+        proposal.candidate_ids = vec!["another-pending-candidate".into()];
+        let mut model = FakeModel {
+            proposal,
+            review: passing_review(),
+            edit_before_review: None,
+        };
+
+        let report = run_once_with(&fixture.cfg, &mut model, 8).unwrap();
+
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.exceptions, 1);
+        assert!(!fixture.brain.path().join("knowledge/wrong-packet.md").exists());
+        assert!(
+            staging::path_of(&paths::staging_dir(fixture.brain.path()), &fixture.candidate.id)
+                .is_file()
+        );
+        assert!(history(&fixture.cfg)[0].detail.contains("must name only packet candidate"));
+    }
+
+    #[test]
     fn external_obsidian_edit_wins_and_becomes_a_visible_exception() {
         let fixture = Fixture::new();
         let target = fixture.brain.path().join("knowledge/existing.md");
@@ -2349,5 +2470,61 @@ mod tests {
             std::fs::read_to_string(fixture.brain.path().join("knowledge/reversible.md")).unwrap(),
             "# Human edit\n"
         );
+    }
+
+    #[test]
+    fn journal_details_are_secret_safe_and_bounded() {
+        let redacted = journal_text("endpoint returned sk-123456789012345678901234567890");
+        assert!(redacted.contains("redacted"), "{redacted}");
+        assert!(!redacted.contains("sk-"), "{redacted}");
+
+        let large = "é".repeat(MAX_JOURNAL_TEXT_BYTES);
+        let bounded = journal_text(&large);
+        assert!(bounded.len() <= MAX_JOURNAL_TEXT_BYTES + 64);
+        assert!(bounded.ends_with("[journal detail truncated]"));
+    }
+
+    #[test]
+    fn edited_history_is_rejected_and_reported_for_doctor() {
+        let fixture = Fixture::new();
+        let event = write_event(
+            &fixture.cfg,
+            event_for(
+                None,
+                EventOutcome::Exception,
+                None,
+                Vec::new(),
+                "original exception",
+                vec![fixture.candidate.id.clone()],
+            ),
+        )
+        .unwrap();
+        let path = history_path(fixture.brain.path(), &event.id);
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("original exception", "edited exception");
+        std::fs::write(path, edited).unwrap();
+
+        assert!(history(&fixture.cfg).is_empty());
+        let issues = history_issues(&fixture.cfg);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("content address mismatch"), "{issues:?}");
+    }
+
+    #[test]
+    fn preflight_failure_is_visible_without_a_proposal() {
+        let fixture = Fixture::new();
+
+        let event = record_background_exception(
+            &fixture.cfg,
+            "maintenance.api_key=sk-123456789012345678901234567890",
+        )
+        .unwrap();
+
+        assert_eq!(event.outcome, EventOutcome::Exception);
+        assert!(event.proposal_id.is_none());
+        assert_eq!(event.candidate_ids, vec![fixture.candidate.id.clone()]);
+        assert!(event.detail.contains("redacted"));
+        assert!(!event.detail.contains("sk-"));
     }
 }
