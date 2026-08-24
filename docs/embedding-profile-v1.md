@@ -93,9 +93,12 @@ Microsoft's official shared build both reported ONNX Runtime 1.28.0, but the
 static build failed all 11 v1 vector answers while Microsoft's release passed
 all 11. The Nix local-CPU package therefore pins Microsoft's exact archive
 bytes and records their digest. “Same ORT version” is not sufficient.
-The Rust/FastEmbed binding uses the older ORT C API 18 surface so compatible
-vendor runtimes are not excluded merely by a newer compile-time ABI request;
-the loaded runtime's exact distribution and bytes still have to be certified.
+The Rust/FastEmbed binding normally uses the older ORT C API 18 surface so
+compatible vendor runtimes are not excluded merely by a newer compile-time ABI
+request. The native WebGPU plugin evidence package alone uses API 22 because
+plugin device discovery requires it. The loaded runtime's exact distribution
+and bytes still have to be certified; neither API surface changes the frozen
+graph or vector contract.
 
 The same official ORT 1.28 build commit was then exercised on public Linux
 arm64 and macOS arm64 runners. Both loaded and ran successfully but matched
@@ -104,6 +107,12 @@ answer, and the two arm64 OS runtimes themselves diverged on five answers.
 They are rejected producers, not “probably compatible” CPU packages. This is
 why shared vectors are derived once and distributed, and why an architecture
 name or matching runtime version cannot bypass the KAT.
+
+The same conclusion holds inside x86-64. A recorded AMD EPYC 7763 passed all
+11 answers, while a recorded Intel Xeon Platinum 8573C with AVX-512, VNNI and
+AMX-INT8 failed all 11 with identical model/runtime bytes. The v1 contract
+therefore names passing hosts, never an ISA marketing feature as a producer
+guarantee.
 
 A physical AMD Radeon RX 6800 produced the complementary accelerator result.
 ORT's MIGraphX provider could not own the whole graph with CPU fallback

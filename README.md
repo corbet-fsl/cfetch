@@ -494,12 +494,24 @@ openvino-npu -Output ./cfetch-openvino-npu`; CPU and GPU are selectable by
 replacing the provider suffix. The public hosted runner exercises CPU only and
 does not stand in for physical Intel GPU or NPU hardware.
 
-One tested x86-64 host is the current certified CPU reference; a later public
-x86-64 host using the exact same package/runtime failed all 11 vectors. Public
-Linux arm64 and macOS arm64 runs failed all 11 too. These are host/runtime
-certificates, never architecture-wide promises. The release catalog therefore
-remains remote-only. Ordinary local loading runs the same admission gate on
-the actual host and fails closed before writing incompatible vectors. See the
+Mixed-vendor GPU testers use `nix build
+github:corbet-labs/cfetch#cfetch-test-webgpu` on Linux x86-64 or Apple Silicon,
+or the Windows package builder with `-Provider webgpu`. This pins Microsoft's
+native WebGPU plugin across Vulkan, D3D12, and Metal. It remains an evidence
+route: the actual adapter must pass exact bytes and placement review, and no
+Linux ARM64 plugin binary is currently published upstream. Public hosted
+probes failed closed: Linux exposed no Vulkan adapter and Windows exposed only
+Hyper-V Video, where WebGPU could not own the complete graph. The isolated
+macOS retry reached the pinned plugin on a virtual Apple M1 but likewise left
+nodes on forbidden CPU fallback. None is a physical GPU certificate.
+
+Recorded EPYC 7763 hosts pass the current CPU reference; a recorded Xeon 8573C
+with AVX-512, VNNI and AMX-INT8 using the exact same package/runtime failed all
+11 vectors. Public Linux arm64 and macOS arm64 runs failed all 11 too. These
+are host/runtime certificates, never architecture-wide promises. The release
+catalog therefore remains remote-only. Ordinary local loading runs the same
+admission gate on the actual host and fails closed before writing incompatible
+vectors. See the
 [frozen profile](docs/embedding-profile-v1.md) and
 [certification matrix](docs/accelerator-certification.md).
 
