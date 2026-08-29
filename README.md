@@ -85,7 +85,7 @@ recall, code navigation, hooks, capture, and measurement need neither.
 | Selective learning cards | **Main — next release** | A huge nixcards catalogue can contribute only the locally selected Markdown sets; the nixcards TUI and cfetch share Git's native sparse selection without a shadow config | `cards init`, `cards list`, `cards select`, `cards sync`, `cards tui` |
 | Cited retrieval | v0.9.9 | BM25, semantic, and hybrid search return statement-level citations that survive file reordering | `recall`, `recall --semantic`, `recall --hybrid`, `recall --id` |
 | Retrieval quality | v0.9.9 | Trust-aware ranking, optional cross-encoder reranking, lexical precision gates, duplicate suppression, and wikilink expansion | `recall --expand`, `rerank.*`, `recall.gate` |
-| Code intelligence | v0.9.9 | Tree-sitter symbols, exact line ranges, import-graph importance, and token-budgeted repository maps | `find`, `map`, `.cfetchignore` |
+| Code intelligence | **Main — next release** | Tree-sitter symbols, exact line ranges, import-graph importance, token-budgeted repository maps, explainable dependency paths, bounded bidirectional context, conservative symbol relationships, and reverse-impact analysis | `find`, `map`, `code-graph path`, `code-graph context`, `code-graph impact`, `code-graph symbol`, `.cfetchignore` |
 | Session continuity | v0.9.9 | Scoped startup memory, periodic rule refresh, modified-file recovery after compaction, and known-failure lookup | hooks, `failures` |
 | Context control | v0.9.9 | Repeat-read guidance, large-file slice hints, token-capped answers, and structural command-output condensation | native tool hooks, `--budget-tokens` |
 | Learning capture | v0.9.9 | Redacted session activity is captured and deterministic signals flag evidence worth maintaining | hooks, ring-6 exhaust, ring-5 staging |
@@ -290,6 +290,29 @@ $ cfetch recall --expand "database migration"
 
 ### Graphs and vectors remain derived from readable files
 
+Source imports form a separate, disposable code graph. `code-graph path`
+explains one deterministic shortest chain of project-internal imports;
+`code-graph impact` walks the same edges backwards to expose a bounded blast
+radius. `code-graph context` traverses both incoming and outgoing edges around
+one file, retaining one deterministic shortest explanation edge per related
+file instead of returning an unbounded induced subgraph. `code-graph symbol`
+adds `contains`, direct `calls`, and type `references` relationships around an
+exact symbol. A call or reference resolves only through an explicit import to
+exactly one file-level definition; dynamic, local-only, or ambiguous names stay
+unresolved instead of becoming guessed edges. Every relationship carries its
+exact source range, result limits count what they omit, ambiguous file suffixes
+fail instead of guessing, and paths stay relative when served by another
+machine. Direct calls cover Rust, TypeScript/JavaScript, Python, and Go; safe
+grammar-distinguished type references currently cover Rust, TypeScript, and Go.
+
+```console
+$ cfetch code-graph path src/main.rs src/runtime/worker.rs
+$ cfetch code-graph context src/runtime/worker.rs --depth 2 --limit 50
+$ cfetch code-graph impact src/config.rs --depth 4 --limit 50
+$ cfetch code-graph context src/config.rs --json
+$ cfetch code-graph symbol resolve_request --limit 50 --json
+```
+
 `[[Obsidian wikilinks]]` are the knowledge graph. cfetch resolves them only
 when a target is unambiguous, exposes incoming and outgoing relationships, and
 can center a bounded neighborhood on one note. It does not require a separate
@@ -312,8 +335,9 @@ export step.
 ### Freshness is part of the answer
 
 A machine holding the Markdown can serve recall, citation expansion, knowledge
-graphs, code search, and repository maps to other machines. Every response
-carries an origin, catalog generation, and `fresh` flag. Queries pass a bounded drain
+graphs, code search, repository maps, and dependency explanations to other
+machines. Every response carries an origin, catalog generation, and `fresh`
+flag. Queries pass a bounded drain
 barrier: cfetch either proves that visible writes have reached the catalog or
 labels the answer stale and explains why.
 
@@ -415,6 +439,8 @@ For any MCP client, the manual registration is the standard stdio shape:
 
 The v0.9.9 server exposes read-only `cfetch_recall`, `cfetch_expand`, and
 `cfetch_find`. On `main` for the next release, it also exposes read-only
+`cfetch_code_path`, `cfetch_code_impact`, `cfetch_code_context`,
+`cfetch_code_symbol`,
 `cfetch_runtime_status`, `cfetch_maintenance_packet`, and
 `cfetch_maintenance_show` tools.
 `cfetch_maintenance_propose` and `cfetch_maintenance_review` can write only
@@ -658,10 +684,12 @@ duplicating resident injection.
 ### Does cfetch require a vector database or cloud service?
 
 No. Lexical recall and code search are local and work without embeddings.
-Semantic search can use a local or hosted cfetch-attested adapter with the
-OpenAI embeddings request shape; a generic OpenAI-compatible endpoint lacks
-the admitted scope metadata and package signature. The per-host catalog is
-disposable SQLite; Markdown remains the record.
+Semantic search can use a supervised local package or an explicitly configured
+remote-attested service with the OpenAI embeddings request shape. A generic
+OpenAI-compatible endpoint lacks the admitted transport and scope metadata.
+Local identity comes from cfetch's hash-pinned package and supervised-child
+boundary; remote identity additionally uses an operator-held response key.
+The per-host catalog is disposable SQLite; Markdown remains the record.
 
 ### Is cfetch only for Claude Code?
 

@@ -17,12 +17,12 @@ pub const NETWORK_MAJOR: u32 = 1;
 pub const PROFILE_ID: &str = "cfetch-embedding-v1";
 pub const PROFILE_STATUS: &str = "candidate";
 pub const PROFILE_MANIFEST_SHA256: &str =
-    "0b97104cf35021dc5fde1abe9e17d26818edde6e7330ab014f4deadebaff64d7";
+    "59210a333494f788eb8e607fe38cabb6af1a7aa7cdf604ddf52e3fa6004b5afb";
 pub const ADMISSION_POLICY_VERSION: u32 = 1;
 pub const ADMISSION_POLICY_SHA256: &str =
-    "1572cd91a489633bfe9168cf3fb6fd52b5318992bd415f1207042533eb0fb90d";
+    "4f731158e5c9edb7bd111dbfa1ae91eeabd181b4bf15ec473818f64f074567ce";
 pub const ADMISSION_IMPLEMENTATION_BUNDLE_SHA256: &str =
-    "6716429c08922dc65b90d8835ad0f7ee646e03fc81b4cc4d3fc94df98d0b4783";
+    "51fa13e6d3685c49f2d80da39c18d9b43e6e62582d7d5f1c09730dd7088440f2";
 
 /// Immutable semantic source for the candidate profile. Every native package
 /// records its actual lineage and artifact digest; direct derivation is never
@@ -54,14 +54,15 @@ pub const ADMISSION_TIE_BREAK: &str =
 pub const ADVERSARIAL_MIXED_DOCUMENT_SELECTION: &str =
     "per-query-relevant-minimum-irrelevant-maximum-exact-cosine-across-document-scopes";
 pub const BACKEND_REPEATABILITY: &str = "required-per-runtime-artifact-device";
-pub const SCOPE_AUTHENTICATION: &str = "ed25519-response-challenge-bound-to-admitted-package-key";
+pub const SCOPE_AUTHENTICATION: &str =
+    "ed25519-response-challenge-bound-to-scope-key-with-transport-defined-trust";
 pub const CROSS_BACKEND_EXACT_BYTES: bool = false;
 pub const DECISION_PRIORITY: &[&str] = &["compatibility", "quality", "efficiency"];
 pub const ADMISSION_DATASET: &str = "mteb/scifact";
 pub const ADMISSION_DATASET_REVISION: &str = "cf10ab6856b15b0e670ef8ae5dae4e266c12d035";
 pub const SEQUENCE_SEMANTIC_FIXTURE_ID: &str = "cfetch-sequence-semantic-v1-cat-vs-music";
 pub const SEQUENCE_SEMANTIC_FIXTURE_SHA256: &str =
-    "fccd9309f8e97f4f4750ea0d733670ded08e7cc6824da4f6aa66616cd402c417";
+    "567fac02f2d55ad2b98b54d89e4b8f0ae81aa2b65a2361603adca9f167543203";
 pub const SEQUENCE_SEMANTIC_GATE: &str = "every-profile-sequence-bucket-global-ordered-query-document-scope-plus-adversarial-relevant-minimum-irrelevant-maximum-exact-int8-strict-ranking";
 pub const ADMISSION_REQUIRED_DEVICE_CLASSES: &[&str] = &["npu", "gpu", "cpu"];
 pub const ADMISSION_NDCG_AT_10_MINIMUM: &str = "0.767907905520953";
@@ -86,7 +87,7 @@ pub const SPECIAL_TOKENS_MAP_SHA256: &str =
     "2f7b0adf4fb469770bb1490e3e35df87b1dc578246c5e7e6fc76ecf33213a397";
 pub const DIMENSIONS: usize = 768;
 pub const MAX_TOKENS: usize = 2048;
-pub const SEQUENCE_BUCKETS: &[usize] = &[32, 64, 128, 256, 512, 1024, 2048];
+pub const SEQUENCE_BUCKETS: &[usize] = &[32, 64, 128, 257, 512, 1024, 2048];
 pub const TOKEN_COUNTING: &str = "prefixed-input-including-all-special-tokens";
 pub const SEQUENCE_BUCKET_SELECTION: &str =
     "smallest-supported-bucket-greater-than-or-equal-to-token-count";
@@ -97,6 +98,25 @@ pub const DOCUMENT_PREFIX: &str = "title: none | text: ";
 pub const POOLING: &str = "attention-mask-weighted-mean-include-prompt";
 pub const NORMALIZATION: &str = "l2-source-output-then-i8-maxabs-rne-storage";
 pub const VECTOR_ENCODING: &str = "signed-int8x768";
+
+/// How an admitted execution scope is reached.  Transport is part of scope
+/// identity: a package-private response key admitted behind the local
+/// supervisor must not also self-admit an operator-configured endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionTransport {
+    SupervisedLocal,
+    RemoteAttested,
+}
+
+impl ExecutionTransport {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SupervisedLocal => "supervised-local",
+            Self::RemoteAttested => "remote-attested",
+        }
+    }
+}
 
 /// Serializable form of the vector-space contract. Only changes that alter
 /// which vector an input means belong here. Admission governance is hashed
@@ -342,6 +362,7 @@ pub fn production_availability() -> anyhow::Result<()> {
 /// admit a runtime or artifact by themselves.
 pub struct BackendScopeAttestation<'a> {
     pub scope_id: &'a str,
+    pub transport: ExecutionTransport,
     pub backend: &'a str,
     pub runtime: &'a str,
     pub compiler: &'a str,
@@ -388,6 +409,7 @@ pub fn admitted_backend_attestation_public_key(
                 let matches = entry["profile_manifest_sha256"] == PROFILE_MANIFEST_SHA256
                     && entry["admission_policy_sha256"] == ADMISSION_POLICY_SHA256
                     && entry["scope_id"] == scope.scope_id
+                    && entry["transport"] == scope.transport.as_str()
                     && entry["backend"] == scope.backend
                     && entry["runtime"] == scope.runtime
                     && entry["compiler"] == scope.compiler
@@ -481,7 +503,7 @@ mod tests {
         assert_eq!(policy.backend_internal_precision, "target-native");
         assert_eq!(
             policy.scope_authentication,
-            "ed25519-response-challenge-bound-to-admitted-package-key"
+            "ed25519-response-challenge-bound-to-scope-key-with-transport-defined-trust"
         );
         assert_eq!(policy.max_wire_batch_size, 64);
         assert_eq!(
@@ -551,7 +573,7 @@ mod tests {
         );
         assert_eq!(
             policy.sequence_semantic_fixture_sha256,
-            "fccd9309f8e97f4f4750ea0d733670ded08e7cc6824da4f6aa66616cd402c417"
+            "567fac02f2d55ad2b98b54d89e4b8f0ae81aa2b65a2361603adca9f167543203"
         );
         assert_eq!(
             policy.sequence_semantic_gate,
@@ -592,10 +614,14 @@ mod tests {
     fn admission_implementation_bundle_is_exact_and_registry_bound() {
         use sha2::Digest as _;
 
-        let files: [(&str, &[u8]); 5] = [
+        let files: [(&str, &[u8]); 12] = [
             (
                 "experiments/embedding-profile/admission_evidence.py",
                 &include_bytes!("../experiments/embedding-profile/admission_evidence.py")[..],
+            ),
+            (
+                "experiments/embedding-profile/admission_transaction.py",
+                &include_bytes!("../experiments/embedding-profile/admission_transaction.py")[..],
             ),
             (
                 "experiments/embedding-profile/cross_backend_eval.py",
@@ -606,12 +632,36 @@ mod tests {
                 &include_bytes!("../experiments/embedding-profile/export_adapter_cache.py")[..],
             ),
             (
+                "experiments/embedding-profile/final_package_conformance.py",
+                &include_bytes!("../experiments/embedding-profile/final_package_conformance.py")[..],
+            ),
+            (
+                "experiments/embedding-profile/measurement_bundle.py",
+                &include_bytes!("../experiments/embedding-profile/measurement_bundle.py")[..],
+            ),
+            (
+                "experiments/embedding-profile/physical_evidence.py",
+                &include_bytes!("../experiments/embedding-profile/physical_evidence.py")[..],
+            ),
+            (
+                "experiments/embedding-profile/requirements-lock.txt",
+                &include_bytes!("../experiments/embedding-profile/requirements-lock.txt")[..],
+            ),
+            (
                 "experiments/embedding-profile/requirements-test.txt",
                 &include_bytes!("../experiments/embedding-profile/requirements-test.txt")[..],
             ),
             (
                 "experiments/embedding-profile/scifact_contract.py",
                 &include_bytes!("../experiments/embedding-profile/scifact_contract.py")[..],
+            ),
+            (
+                "packages/openvino/package_inventory.py",
+                &include_bytes!("../packages/openvino/package_inventory.py")[..],
+            ),
+            (
+                "scripts/apply_admission_activation.py",
+                &include_bytes!("../scripts/apply_admission_activation.py")[..],
             ),
         ];
         let mut digest = sha2::Sha256::new();
@@ -761,6 +811,7 @@ mod tests {
         assert_eq!(registry["admitted_backends"], serde_json::json!([]));
         assert!(!backend_scope_is_admitted(&BackendScopeAttestation {
             scope_id: "candidate",
+            transport: ExecutionTransport::RemoteAttested,
             backend: "candidate-runtime",
             runtime: "candidate-version",
             compiler: "candidate-compiler",

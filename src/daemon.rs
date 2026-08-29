@@ -7,7 +7,8 @@
 //! closes the connection. Ops: ping, resident, health, scan-code,
 //! scan-status, serve-status, shutdown — plus, when serving mode is enabled
 //! (config `serve.enabled`), the barrier-gated query ops recall, expand,
-//! find, map, graph, slices, generation and checksum.
+//! find, map, code-path, code-impact, code-context, code-symbol, graph, slices, generation
+//! and checksum.
 //!
 //! A serving daemon also keeps its OWN code index current: once the tree
 //! watches are registered it kicks the single-flight background code scan and
@@ -59,6 +60,15 @@ struct Request {
     cite: Option<String>,
     #[serde(default)]
     path: Option<String>,
+    /// code-path op endpoints. Kept separate from `path`, which is used by
+    /// several single-target operations.
+    #[serde(default)]
+    from_path: Option<String>,
+    #[serde(default)]
+    to_path: Option<String>,
+    /// code-path/code-impact/code-context traversal bound.
+    #[serde(default)]
+    depth: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
     /// map op: personalize the ranking toward this term.
@@ -154,6 +164,14 @@ pub struct Response {
     pub code_hits: Option<Vec<serve::WireFindHit>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub map: Option<serve::WireMap>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_path: Option<crate::graph::DependencyPath>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_impact: Option<crate::graph::DependencyImpact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_context: Option<crate::graph::DependencyContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_context: Option<crate::graph::SymbolContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub knowledge_graph: Option<crate::knowledge_graph::KnowledgeGraph>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -705,6 +723,10 @@ impl Channel {
                     | "expand"
                     | "find"
                     | "map"
+                    | "code-path"
+                    | "code-impact"
+                    | "code-context"
+                    | "code-symbol"
                     | "graph"
                     | "slices"
                     | "generation"
@@ -1547,6 +1569,92 @@ fn handle(req: &Request, ctx: &Ctx) -> (Response, bool) {
                 false,
             )
         }
+        "code-path" => {
+            let from = req.from_path.clone().unwrap_or_default();
+            let to = req.to_path.clone().unwrap_or_default();
+            let depth = req.depth.unwrap_or(crate::graph::DEFAULT_PATH_DEPTH);
+            (
+                serve_query(ctx, |conn| {
+                    let cfg = Config::load()?;
+                    let path = crate::graph::dependency_path(
+                        conn,
+                        &cfg.effective_code_roots(),
+                        &from,
+                        &to,
+                        depth,
+                    )?;
+                    Ok(Response {
+                        dependency_path: Some(path),
+                        ..Response::default()
+                    })
+                }),
+                false,
+            )
+        }
+        "code-impact" => {
+            let target = req.path.clone().unwrap_or_default();
+            let depth = req.depth.unwrap_or(crate::graph::DEFAULT_IMPACT_DEPTH);
+            let limit = req.limit.unwrap_or(crate::graph::DEFAULT_IMPACT_LIMIT);
+            (
+                serve_query(ctx, |conn| {
+                    let cfg = Config::load()?;
+                    let impact = crate::graph::dependency_impact(
+                        conn,
+                        &cfg.effective_code_roots(),
+                        &target,
+                        depth,
+                        limit,
+                    )?;
+                    Ok(Response {
+                        dependency_impact: Some(impact),
+                        ..Response::default()
+                    })
+                }),
+                false,
+            )
+        }
+        "code-context" => {
+            let target = req.path.clone().unwrap_or_default();
+            let depth = req.depth.unwrap_or(crate::graph::DEFAULT_CONTEXT_DEPTH);
+            let limit = req.limit.unwrap_or(crate::graph::DEFAULT_CONTEXT_LIMIT);
+            (
+                serve_query(ctx, |conn| {
+                    let cfg = Config::load()?;
+                    let context = crate::graph::dependency_context(
+                        conn,
+                        &cfg.effective_code_roots(),
+                        &target,
+                        depth,
+                        limit,
+                    )?;
+                    Ok(Response {
+                        dependency_context: Some(context),
+                        ..Response::default()
+                    })
+                }),
+                false,
+            )
+        }
+        "code-symbol" => {
+            let query = req.query.clone().unwrap_or_default();
+            let limit = req.limit.unwrap_or(crate::graph::DEFAULT_SYMBOL_LIMIT);
+            (
+                serve_query(ctx, |conn| {
+                    let cfg = Config::load()?;
+                    let context = crate::graph::symbol_context(
+                        conn,
+                        &cfg.effective_code_roots(),
+                        &query,
+                        limit,
+                    )?;
+                    Ok(Response {
+                        symbol_context: Some(context),
+                        ..Response::default()
+                    })
+                }),
+                false,
+            )
+        }
         "graph" => {
             let focus = req.focus.as_deref();
             let limit = req.limit.unwrap_or(40);
@@ -2148,6 +2256,10 @@ mod tests {
             "expand",
             "find",
             "map",
+            "code-path",
+            "code-impact",
+            "code-context",
+            "code-symbol",
             "graph",
             "slices",
             "generation",

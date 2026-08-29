@@ -87,9 +87,13 @@ file.
 Each admitted registry entry also repeats the current semantic-profile and
 admission-policy digests and points to the byte-hashed, passing exact-cohort
 report. Updating a global header cannot make stale evidence current. Runtime
-acceptance additionally uses a fresh nonce and an Ed25519 response signature
-from the globally unique public key bound to that exact packaged scope; copying
-public registry fields into another endpoint is insufficient.
+acceptance additionally binds a fresh nonce and the exact request/response
+bytes with an Ed25519 signature from the scope key. For `supervised-local`,
+that key is distributed with the package and is therefore a consistency check
+inside cfetch's hash-pinned launcher, manifest, bearer, and child-process
+boundary—not independent producer identity. For `remote-attested`, the key is
+operator-held and copying public registry fields into another endpoint is
+insufficient.
 
 ## Numeric compatibility
 
@@ -106,15 +110,23 @@ document backends. That query-dependent adversary is stricter than any real
 store, whose producer is fixed per content hash.
 
 SciFact does not exercise every compiled sequence shape, so a separate
-profile-pinned semantic fixture runs twice through each 32, 64, 128, 256, 512,
-1,024, and 2,048-token bucket. At every bucket, the relevant document must
-rank strictly before the irrelevant document for every ordered query/document
-scope pair. The gate also constructs the derive-once adversary for each query
-scope and bucket: the minimum relevant score and maximum irrelevant score may
-come from different document scopes, and the former must still rank strictly
-first. The public report retains the exact integer dots, norms, checks, and
-counts needed to replay those decisions; cache hashes bind the canonical probe
-arrays without publishing them in the report.
+profile-pinned semantic fixture runs twice through each 32, 64, 128, 257, 512,
+1,024, and 2,048-token bucket. Its query and both documents must tokenize to
+the exact limit of the selected bucket under the frozen tokenizer. At every
+bucket, the relevant document must rank strictly before the irrelevant
+document for every ordered query/document scope pair. The gate also constructs
+the derive-once adversary for each query scope and bucket: the minimum relevant
+score and maximum irrelevant score may come from different document scopes,
+and the former must still rank strictly first. The public report retains the
+exact integer dots, norms, checks, and counts needed to replay those decisions;
+cache hashes bind the canonical probe arrays without publishing them in the
+report.
+
+The 257-token boundary is intentional. Pre-activation physical diagnostics on
+the first Lunar Lake NPU cohort found a deterministic semantic failure only at
+an exact static length of 256; 255, 257, 258, and the other profile shapes
+passed. Since no producer had been activated, the shared profile moved the
+published bucket to 257 instead of disguising an internal padding workaround.
 
 Every pairing must independently meet the same fixed absolute SciFact floors:
 

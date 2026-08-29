@@ -645,6 +645,99 @@ fn daemon_scans_code_itself_and_serves_the_same_map_locally_and_remotely() {
     let tcp_map = tcp_req(&addr, token, &json!({"op": "map", "budget_tokens": 4000}));
     assert_eq!(tcp_map["map"]["lines"], sock_map["map"]["lines"], "tcp map must equal socket map");
 
+    // Dependency explanations use the same committed graph and coherence
+    // envelope on both serving transports. Host-absolute paths must never
+    // cross the wire.
+    let path_request = json!({
+        "op": "code-path",
+        "from_path": "proj/src/main.rs",
+        "to_path": "proj/src/lib.rs",
+        "depth": 4,
+    });
+    let sock_path = daemon.local().req(&path_request);
+    assert_eq!(sock_path["ok"], true, "{sock_path}");
+    assert_eq!(sock_path["dependency_path"]["found"], true, "{sock_path}");
+    assert_eq!(sock_path["dependency_path"]["edges"][0]["relation"], "imports");
+    assert_eq!(sock_path["dependency_path"]["edges"][0]["evidence"]["class"], "resolved");
+    assert_eq!(sock_path["dependency_path"]["edges"][0]["evidence"]["path"], "proj/src/main.rs");
+    assert_eq!(sock_path["dependency_path"]["edges"][0]["evidence"]["start_line"], 1);
+    let storage_root = code.path().to_string_lossy();
+    assert!(
+        !sock_path.to_string().contains(storage_root.as_ref()),
+        "served dependency paths must not expose the storage host root: {sock_path}"
+    );
+    let tcp_path = tcp_req(&addr, token, &path_request);
+    assert_eq!(
+        tcp_path["dependency_path"], sock_path["dependency_path"],
+        "TCP and local serving must explain the identical path"
+    );
+
+    let impact_request = json!({
+        "op": "code-impact",
+        "path": "proj/src/lib.rs",
+        "depth": 4,
+        "limit": 10,
+    });
+    let sock_impact = daemon.local().req(&impact_request);
+    assert_eq!(sock_impact["ok"], true, "{sock_impact}");
+    assert_eq!(sock_impact["dependency_impact"]["total"], 1, "{sock_impact}");
+    assert_eq!(sock_impact["dependency_impact"]["nodes"][0]["path"], "proj/src/main.rs");
+    let tcp_impact = tcp_req(&addr, token, &impact_request);
+    assert_eq!(
+        tcp_impact["dependency_impact"], sock_impact["dependency_impact"],
+        "TCP and local serving must expose the identical blast radius"
+    );
+
+    let context_request = json!({
+        "op": "code-context",
+        "path": "proj/src/lib.rs",
+        "depth": 1,
+        "limit": 10,
+    });
+    let sock_context = daemon.local().req(&context_request);
+    assert_eq!(sock_context["ok"], true, "{sock_context}");
+    assert_eq!(sock_context["dependency_context"]["total"], 1, "{sock_context}");
+    assert_eq!(
+        sock_context["dependency_context"]["nodes"][0]["edge"]["source"],
+        "proj/src/main.rs"
+    );
+    assert_eq!(
+        sock_context["dependency_context"]["nodes"][0]["edge"]["target"],
+        "proj/src/lib.rs"
+    );
+    assert!(
+        !sock_context.to_string().contains(storage_root.as_ref()),
+        "served dependency context must not expose the storage host root: {sock_context}"
+    );
+    let tcp_context = tcp_req(&addr, token, &context_request);
+    assert_eq!(
+        tcp_context["dependency_context"], sock_context["dependency_context"],
+        "TCP and local serving must expose identical dependency context"
+    );
+
+    let symbol_request = json!({"op": "code-symbol", "query": "main", "limit": 10});
+    let sock_symbol = daemon.local().req(&symbol_request);
+    assert_eq!(sock_symbol["ok"], true, "{sock_symbol}");
+    assert_eq!(sock_symbol["symbol_context"]["total_symbols"], 1, "{sock_symbol}");
+    assert_eq!(
+        sock_symbol["symbol_context"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|edge| edge["relation"] == "calls")
+            .unwrap()["target"]["name"],
+        "alpha_helper"
+    );
+    assert!(
+        !sock_symbol.to_string().contains(storage_root.as_ref()),
+        "served symbol context must not expose the storage host root: {sock_symbol}"
+    );
+    let tcp_symbol = tcp_req(&addr, token, &symbol_request);
+    assert_eq!(
+        tcp_symbol["symbol_context"], sock_symbol["symbol_context"],
+        "TCP and local serving must expose identical symbol context"
+    );
+
     // The serving host's own CLI, reading its local index directly.
     let cli_home = tempfile::tempdir().unwrap();
     let local_out = Command::new(BIN)
@@ -700,9 +793,77 @@ fn daemon_scans_code_itself_and_serves_the_same_map_locally_and_remotely() {
         .collect();
     assert_eq!(remote_lines, lines, "map must read the same locally and remotely");
     assert!(remote_stdout.contains("served by storage-host"), "coherence footer missing: {remote_stdout}");
+
+    let remote_path = Command::new(BIN)
+        .args([
+            "code-graph",
+            "path",
+            "proj/src/main.rs",
+            "proj/src/lib.rs",
+            "--depth",
+            "4",
+            "--json",
+        ])
+        .env("CFETCH_STATE_DIR", client_state.path())
+        .env("CFETCH_CONFIG", &client_cfg)
+        .env("HOME", client_home.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        remote_path.status.success(),
+        "none-tier dependency path failed: {}",
+        String::from_utf8_lossy(&remote_path.stderr)
+    );
+    let remote_path: Value = serde_json::from_slice(&remote_path.stdout).unwrap();
+    assert_eq!(remote_path["path"], sock_path["dependency_path"]);
+    assert_eq!(remote_path["origin"], "storage-host");
+
+    let remote_context = Command::new(BIN)
+        .args([
+            "code-graph",
+            "context",
+            "proj/src/lib.rs",
+            "--depth",
+            "1",
+            "--limit",
+            "10",
+            "--json",
+        ])
+        .env("CFETCH_STATE_DIR", client_state.path())
+        .env("CFETCH_CONFIG", &client_cfg)
+        .env("HOME", client_home.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        remote_context.status.success(),
+        "none-tier dependency context failed: {}",
+        String::from_utf8_lossy(&remote_context.stderr)
+    );
+    let remote_context: Value = serde_json::from_slice(&remote_context.stdout).unwrap();
+    assert_eq!(remote_context["context"], sock_context["dependency_context"]);
+    assert_eq!(remote_context["origin"], "storage-host");
+
+    let remote_symbol = Command::new(BIN)
+        .args(["code-graph", "symbol", "main", "--limit", "10", "--json"])
+        .env("CFETCH_STATE_DIR", client_state.path())
+        .env("CFETCH_CONFIG", &client_cfg)
+        .env("HOME", client_home.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        remote_symbol.status.success(),
+        "none-tier symbol context failed: {}",
+        String::from_utf8_lossy(&remote_symbol.stderr)
+    );
+    let remote_symbol: Value = serde_json::from_slice(&remote_symbol.stdout).unwrap();
+    assert_eq!(remote_symbol["symbol"], sock_symbol["symbol_context"]);
+    assert_eq!(remote_symbol["origin"], "storage-host");
     assert!(
         !client_state.path().join("index.db").exists(),
-        "a none-tier map must open no local index"
+        "none-tier map and graph queries must open no local index"
     );
 }
 
