@@ -16,6 +16,7 @@ fn doctor_json_is_read_only_and_labels_unmeasured_state() {
     let output = Command::new(env!("CARGO_BIN_EXE_cfetch"))
         .args(["doctor", "--json", "--no-network"])
         .env("HOME", &home)
+        .env("APPDATA", &home)
         .env("CFETCH_STATE_DIR", &state)
         .env("CFETCH_BRAIN", &brain)
         .output()
@@ -65,6 +66,7 @@ fn doctor_json_is_read_only_and_labels_unmeasured_state() {
     let output = Command::new(env!("CARGO_BIN_EXE_cfetch"))
         .args(["doctor", "--no-network"])
         .env("HOME", &home)
+        .env("APPDATA", &home)
         .env("CFETCH_STATE_DIR", &state)
         .env("CFETCH_BRAIN", &brain)
         .output()
@@ -83,4 +85,74 @@ fn doctor_json_is_read_only_and_labels_unmeasured_state() {
     assert!(text.contains("live utilization: not reported"), "{text}");
     assert!(text.contains("peer artifacts iroh-blobs"), "{text}");
     assert!(text.contains("no network identity yet"), "{text}");
+}
+
+#[test]
+fn deep_doctor_uses_a_temporary_retrieval_fixture() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let state = root.path().join("state");
+    let brain = root.path().join("brain");
+    for dir in [&home, &state, &brain] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let sentinel = brain.join("knowledge/sentinel.md");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&sentinel, "- user data must stay untouched\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cfetch"))
+        .args(["doctor", "--deep", "--json", "--no-network"])
+        .env("HOME", &home)
+        .env("APPDATA", &home)
+        .env("CFETCH_STATE_DIR", &state)
+        .env("CFETCH_BRAIN", &brain)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "deep doctor failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let probe = &report["retrieval_probe"];
+    assert_eq!(probe["schema_version"], 2);
+    assert_eq!(probe["temporary_data"], true);
+    assert_eq!(probe["gates"]["production_ready"], false);
+    assert_eq!(probe["gates"]["checks"][0]["id"], "bm25");
+    assert_eq!(probe["gates"]["checks"][0]["status"], "pass");
+    assert_eq!(probe["vector"]["active"], false);
+    assert_eq!(probe["rankings"]["bm25"][0], "knowledge/deployment-metrics.md");
+    assert_eq!(
+        probe["graph"]["neighbors"][0],
+        "knowledge/recovery-checklist.md"
+    );
+    assert_eq!(probe["graph"]["fixture_edge_active"], true);
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        "- user data must stay untouched\n"
+    );
+    assert!(!state.join("index.db").exists());
+
+    let gated = Command::new(env!("CARGO_BIN_EXE_cfetch"))
+        .args([
+            "doctor",
+            "--deep",
+            "--json",
+            "--no-network",
+            "--require",
+            "vector",
+        ])
+        .env("HOME", &home)
+        .env("APPDATA", &home)
+        .env("CFETCH_STATE_DIR", &state)
+        .env("CFETCH_BRAIN", &brain)
+        .output()
+        .unwrap();
+    assert!(!gated.status.success());
+    let gated_report: serde_json::Value = serde_json::from_slice(&gated.stdout).unwrap();
+    assert_eq!(gated_report["retrieval_probe"]["gates"]["production_ready"], false);
+    assert!(
+        String::from_utf8_lossy(&gated.stderr)
+            .contains("required vector gate did not pass: vector_output (not run)")
+    );
 }
