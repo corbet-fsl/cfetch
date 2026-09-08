@@ -6,15 +6,15 @@
 //! recreated on any corruption. The git-tracked markdown stays the only source
 //! of truth.
 //!
-//! Citations are content-addressed: `r<ring>-<prefix of sha256(normalized
-//! block)>`. They survive reordering and unrelated edits; an edited entry
-//! becomes a new citation by construction. The ring prefix makes the trust
+//! Citations are content-addressed: `r<ring>-<prefix of the versioned exact
+//! block-body hash>`. They survive reordering and unrelated edits; an edited
+//! entry becomes a new citation by construction. The ring prefix makes the trust
 //! level of a hit visible in the id itself.
 //!
-//! The FULL digest behind that prefix is the block's content address, and it
-//! is what every derived artifact is keyed by â€” so vectors survive a rebuild
-//! that recycles every rowid in the file, and an edit costs the embeddings of
-//! exactly the blocks that changed.
+//! The full body digest preserves citation provenance. Vectors instead use
+//! the exact rendered document payload's digest, so a context edit requeues
+//! its dependent blocks without changing their citations. Both identities
+//! survive a rebuild that recycles every rowid in the file.
 
 use std::path::{Path, PathBuf};
 
@@ -47,14 +47,15 @@ pub struct Hit {
     pub end_line: usize,
     pub snippet: String,
     /// Paths of suppressed duplicate copies of this logical block: same
-    /// content hash AND same heading chain on a higher (or equal) ring â€”
+    /// body identity and full rendered context on a higher (or equal) ring â€”
     /// e.g. the native auto-memory mirror of a brain file. Identical short
     /// blocks under DIFFERENT sections are different statements, never
     /// mirrors. Empty for a block that exists in exactly one place.
     pub mirrors: Vec<String>,
-    /// Enclosing heading chain ("H1 > H2"), the second half of the mirror
-    /// dedup key. Internal â€” the snippet already displays it.
+    /// Enclosing heading chain ("H1 > H2"). Internal â€” the snippet displays it.
     pub(crate) chain: String,
+    /// Exact contextual payload identity, including full table headers.
+    pub(crate) payload_hash: String,
     /// The block's whole body. Internal â€” `snippet` is the display form, and
     /// it is capped at 160 characters. A consumer that only REORDERS hits can
     /// live with that cap; one that DROPS them cannot, or it would suppress a
@@ -215,10 +216,6 @@ pub(crate) fn frontmatter_ring(text: &str) -> (Option<u8>, usize) {
     (None, 0)
 }
 
-fn normalize(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
-}
-
 /// Extracts `[[wikilink]]` targets: alias (`|â€¦`) and heading (`#â€¦`) parts
 /// dropped, lowercased; slash-qualified targets (`[[hosts/zfs]]`) survive
 /// whole. Fenced code blocks are skipped first (brain-lint parity): a
@@ -309,26 +306,30 @@ pub fn markdown_links(text: &str) -> Vec<String> {
     out
 }
 
-/// THE content address of a statement: the full sha256 hex of its normalized
-/// text. Every derived artifact â€” vectors today, rerank scores tomorrow â€” is
-/// keyed by this, and it is stable across hosts, rescans and reorderings
-/// because it is a function of the content alone.
+/// THE content address of a statement: the full SHA-256 hex of a versioned
+/// domain followed by its exact segmented body bytes. Case, indentation and
+/// internal line breaks are preserved.
+/// The domain separates these keys from legacy normalized-body hashes, whose
+/// citations may have described different raw text. The body address is
+/// stable across hosts, rescans and context-only edits.
 ///
-/// ONE hashing site: [`cite_from_hash`] shows a truncated PREFIX of this same
-/// digest, so a citation and the vector stored under its hash can never end
-/// up describing different content.
+/// [`cite_from_hash`] shows a truncated prefix of this digest. Vector keys
+/// are separate: [`crate::embedding_input::hash`] includes rendered context.
 pub fn content_hash(text: &str) -> String {
-    crate::hashing::hex_lower(sha2::Sha256::digest(normalize(text).as_bytes()))
+    let mut hash = sha2::Sha256::new();
+    hash.update(b"cfetch-statement-body-v1\0");
+    hash.update(text.as_bytes());
+    crate::hashing::hex_lower(hash.finalize())
 }
 
 /// 40 hash bits: at ~20k blocks the birthday collision expectation is ~0.0002
 /// â€” the 24-bit version measurably collided in the real corpus. The citation
-/// TRUNCATES the content address; the full digest keys the artifacts.
+/// TRUNCATES the body address; embedding payloads have their own digest.
 const CITE_HASH_HEX: usize = 10;
 
 /// Citation id of a block: its ring, then a prefix of its content address.
 /// Takes the hash rather than the text so no caller ever hashes twice â€” the
-/// citation and the block's derived artifacts come from one digest.
+/// citation and the block's body address come from one digest.
 pub fn cite_from_hash(ring: u8, hash: &str) -> String {
     format!("r{ring}-{}", &hash[..CITE_HASH_HEX])
 }
@@ -513,19 +514,29 @@ pub(crate) fn db_exists(state_dir: &Path) -> bool {
 
 /// READ-ONLY open for diagnostics: never creates the file, never repairs a
 /// corrupt one (`open`'s delete-and-rebuild is the writer's recovery, and a
-/// diagnostic must not be the thing that first writes an index). Reading a
-/// corrupt database surfaces as an error from the first query, not here —
-/// SQLite opens lazily.
+/// diagnostic must not be the thing that first writes an index). The schema
+/// check rejects a corrupt or outdated catalog without attempting repairs.
 pub fn open_read_only(state_dir: &Path) -> anyhow::Result<Connection> {
     let path = db_path(state_dir);
-    Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| anyhow::anyhow!("open {} read-only: {e}", path.display()))
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| anyhow::anyhow!("open {} read-only: {e}", path.display()))?;
+    ensure_current_schema(&conn)?;
+    Ok(conn)
 }
 
 /// Bump whenever tables/columns/id formats change: an old DB with a new
 /// binary is silently wrong (e.g. stale cite widths), and the cache is
 /// disposable â€” mismatches are handled by delete-and-rebuild in `open()`.
-const SCHEMA_VERSION: i64 = 7; // 7: blocks.hash + content-hash-keyed vectors(model, dim)
+const SCHEMA_VERSION: i64 = 9; // 9: distinct body/citation and embedding-payload identities
+
+fn ensure_current_schema(conn: &Connection) -> anyhow::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    anyhow::ensure!(
+        version == SCHEMA_VERSION,
+        "index schema v{version} != v{SCHEMA_VERSION}; rebuild required"
+    );
+    Ok(())
+}
 
 fn open_at(path: &Path) -> anyhow::Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -565,10 +576,13 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
            text TEXT NOT NULL,
            ctx TEXT NOT NULL DEFAULT '',
            chain TEXT NOT NULL DEFAULT '',
-           hash TEXT NOT NULL DEFAULT ''
+           hash TEXT NOT NULL DEFAULT '',
+           embedding_text TEXT NOT NULL,
+           embedding_hash TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS blocks_cite ON blocks(cite);
          CREATE INDEX IF NOT EXISTS blocks_hash ON blocks(hash);
+         CREATE INDEX IF NOT EXISTS blocks_embedding_hash ON blocks(embedding_hash);
          CREATE INDEX IF NOT EXISTS blocks_doc ON blocks(doc_id);
          CREATE TABLE IF NOT EXISTS links(
            from_doc INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
@@ -1008,15 +1022,18 @@ fn insert_doc(
     // table's header row. `chain` is the dedup key part, `ctx` the searchable
     // and displayed form.
     let mut chain: Vec<(u8, String)> = Vec::new();
+    // Keep the full header for embedding; `ctx` still uses its display preview.
     let mut table_header: Option<String> = None;
     let mut last_row_end = 0usize;
     for (start, end, body) in segment(&blanked, fm_lines) {
         let chain_key;
         let ctx;
+        let embedding_ctx;
         if let Some((level, text)) = heading_of(&body) {
             chain.retain(|(l, _)| *l < level);
             chain_key = chain_text(&chain);
             ctx = chain_key.clone();
+            embedding_ctx = chain_key.clone();
             chain.push((level, text));
             table_header = None;
         } else if body.trim_start().starts_with('|') {
@@ -1028,7 +1045,13 @@ fn insert_doc(
             last_row_end = end;
             match &table_header {
                 Some(header) => {
+                    let preview = snippet_of(header);
                     ctx = if chain_key.is_empty() {
+                        preview
+                    } else {
+                        format!("{chain_key} > {preview}")
+                    };
+                    embedding_ctx = if chain_key.is_empty() {
                         header.clone()
                     } else {
                         format!("{chain_key} > {header}")
@@ -1036,14 +1059,16 @@ fn insert_doc(
                 }
                 None => {
                     // This row IS the table's header.
-                    table_header = Some(snippet_of(&body));
+                    table_header = Some(body.clone());
                     ctx = chain_key.clone();
+                    embedding_ctx = chain_key.clone();
                 }
             }
         } else {
             table_header = None;
             chain_key = chain_text(&chain);
             ctx = chain_key.clone();
+            embedding_ctx = chain_key.clone();
         }
         // Refused AFTER the chain and table bookkeeping above, never before:
         // every neighboring statement then keeps byte-identical context, so
@@ -1056,11 +1081,13 @@ fn insert_doc(
         }
         let hash = content_hash(&body);
         let cite = cite_from_hash(ring, &hash);
+        let embedding_text = crate::embedding_input::render(&body, &embedding_ctx);
+        let embedding_hash = crate::embedding_input::hash(&embedding_text);
         tx.prepare_cached(
-            "INSERT INTO blocks(cite, doc_id, start_line, end_line, text, ctx, chain, hash)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO blocks(cite, doc_id, start_line, end_line, text, ctx, chain, hash, embedding_text, embedding_hash)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?
-        .execute(rusqlite::params![cite, doc_id, start as i64, end as i64, body, ctx, chain_key, hash])?;
+        .execute(rusqlite::params![cite, doc_id, start as i64, end as i64, body, ctx, chain_key, hash, embedding_text, embedding_hash])?;
         let block_id = tx.last_insert_rowid();
         tx.prepare_cached("INSERT INTO blocks_fts(rowid, text, ctx) VALUES(?1, ?2, ?3)")?
             .execute(rusqlite::params![block_id, body, ctx])?;
@@ -1199,9 +1226,9 @@ pub fn scan(
         })
         .collect();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // Vectors deliberately SURVIVE the rebuild: they are keyed by content
+    // Vectors deliberately SURVIVE the rebuild: they are keyed by payload
     // hash, not by a block rowid, so a rebuilt catalog re-joins every vector
-    // whose text is still in the tree. They used to be dropped here because
+    // whose rendered input is still in the tree. They used to be dropped here because
     // rowids are recycled â€” which made one markdown edit cost 100% of the
     // embeddings. `prune_vectors` below drops exactly the hashes that left.
     tx.execute_batch(
@@ -1229,7 +1256,7 @@ pub fn scan(
 /// Removes one doc's rows everywhere: FTS rows (external-content FTS5 must be
 /// told each removed row's old values), blocks, the doc row (links and
 /// doc_links cascade), and any `skipped_docs` entry. Vectors are NOT touched
-/// here â€” they belong to content, not to a doc, and the same text in another
+/// here â€” they belong to payloads, not to a doc, and the same input in another
 /// file keeps them alive; [`prune_vectors`] settles that at the end of a scan.
 fn delete_doc(tx: &rusqlite::Transaction<'_>, path: &str) -> anyhow::Result<()> {
     tx.execute("DELETE FROM skipped_docs WHERE path=?1", [path])?;
@@ -1387,7 +1414,8 @@ pub fn generation(conn: &Connection) -> u64 {
 }
 
 /// Deterministic digest of the catalog: sha256 over the sorted
-/// (cite, path, ring) rows. Two catalogs built from the same tree â€” by ANY
+/// (cite, path, ring, embedding_hash) rows. Context changes affect the digest
+/// even when the body's citation stays fixed. Two catalogs built from the same tree â€” by ANY
 /// derivation path (fresh scan, event-driven rebuild, post-crash backstop) â€”
 /// must produce the same checksum: the coherence invariant's cross-holder
 /// verification value. Generation is deliberately NOT part of the digest.
@@ -1402,13 +1430,14 @@ pub fn catalog_checksum_matching(
     include: impl Fn(&str) -> bool,
 ) -> anyhow::Result<String> {
     let mut stmt = conn.prepare(
-        "SELECT b.cite, d.path, d.ring FROM blocks b JOIN docs d ON d.id = b.doc_id
-         ORDER BY b.cite, d.path, d.ring",
+        "SELECT b.cite, d.path, d.ring, b.embedding_hash FROM blocks b JOIN docs d ON d.id = b.doc_id
+         ORDER BY b.cite, d.path, d.ring, b.embedding_hash",
     )?;
-    let rows =
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
+    })?;
     let mut hasher = sha2::Sha256::new();
-    for (cite, path, ring) in rows.filter_map(Result::ok) {
+    for (cite, path, ring, embedding_hash) in rows.filter_map(Result::ok) {
         if !include(&path) {
             continue;
         }
@@ -1417,14 +1446,16 @@ pub fn catalog_checksum_matching(
         hasher.update(path.as_bytes());
         hasher.update([0u8]);
         hasher.update(ring.to_le_bytes());
+        hasher.update([0u8]);
+        hasher.update(embedding_hash.as_bytes());
         hasher.update([0xffu8]);
     }
     Ok(crate::hashing::hex_lower(hasher.finalize()))
 }
 
 /// Read-only open for serving-side query threads: never contends for the
-/// write lock, never creates or migrates schema. Fails when no index exists
-/// yet â€” the caller reports that instead of racing the builder.
+/// write lock, never creates or migrates schema. Fails when no current-schema
+/// index exists yet â€” the caller reports that instead of racing the builder.
 pub fn open_ro(state_dir: &Path) -> anyhow::Result<Connection> {
     use rusqlite::OpenFlags;
     let conn = Connection::open_with_flags(
@@ -1432,6 +1463,7 @@ pub fn open_ro(state_dir: &Path) -> anyhow::Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(std::time::Duration::from_millis(1000))?;
+    ensure_current_schema(&conn)?;
     Ok(conn)
 }
 
@@ -1520,8 +1552,8 @@ fn cite_hash(cite: &str) -> &str {
     cite.split_once('-').map_or(cite, |(_, hash)| hash)
 }
 
-/// Collapses hits carrying the same content hash UNDER THE SAME heading
-/// chain: the native auto-memory store mirrors brain files, so one logical
+/// Collapses hits carrying the same body citation and exact rendered context:
+/// the native auto-memory store mirrors brain files, so one logical
 /// block would otherwise surface once per store. Identical short blocks in
 /// DIFFERENT sections (a bare "yes", a repeated table row) are different
 /// statements and are NOT collapsed. The lowest-ring copy survives, at the
@@ -1532,7 +1564,7 @@ fn dedup_by_content(hits: Vec<Hit>) -> Vec<Hit> {
     let mut slot_by_key: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
     for hit in hits {
-        let key = (cite_hash(&hit.cite).to_string(), hit.chain.clone());
+        let key = (cite_hash(&hit.cite).to_string(), hit.payload_hash.clone());
         match slot_by_key.get(&key) {
             Some(&slot) => {
                 let kept = &mut out[slot];
@@ -1612,6 +1644,18 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
     recall_in(conn, query, limit, &[])
 }
 
+/// Reserve only the first lexical slot for the best matching ring-0/1
+/// candidate. Every other candidate keeps its relative BM25(+prior) order.
+/// Both displayed recall and the lexical input to hybrid use this policy.
+fn reserve_top_trust<T>(candidates: &mut Vec<T>, ring: impl Fn(&T) -> u8) {
+    if let Some(pos) = candidates.iter().position(|candidate| ring(candidate) <= 1)
+        && pos > 0
+    {
+        let reserved = candidates.remove(pos);
+        candidates.insert(0, reserved);
+    }
+}
+
 /// Recall restricted to documents under `prefixes` â€” the slice filter. An
 /// empty slice restricts nothing, which is what the root slice is.
 pub fn recall_in(
@@ -1633,7 +1677,7 @@ pub fn recall_in(
     let mut hits;
     loop {
         let mut stmt = conn.prepare(&ranked_match_sql(
-            "b.cite, d.path, d.ring, b.start_line, b.end_line, b.text, b.ctx, b.chain",
+            "b.cite, d.path, d.ring, b.start_line, b.end_line, b.text, b.ctx, b.chain, b.embedding_text",
             prefixes.len(),
         ))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(ranked_params(&fts, pool, prefixes)), |r| {
@@ -1647,6 +1691,7 @@ pub fn recall_in(
                 snippet: snippet_with_ctx(&r.get::<_, String>(6)?, &text),
                 mirrors: Vec::new(),
                 chain: r.get(7)?,
+                payload_hash: crate::embedding_input::hash(&r.get::<_, String>(8)?),
                 text,
             })
         })?;
@@ -1656,15 +1701,7 @@ pub fn recall_in(
         }
         pool *= 2;
     }
-    // Ring-band slot reservation: rings 0-1 are the top-trust band â€” when
-    // any of them matches at all, the top slot carries the best of them.
-    // Everything else stays in BM25(+prior) order.
-    if let Some(pos) = hits.iter().position(|h| h.ring <= 1)
-        && pos > 0
-    {
-        let reserved = hits.remove(pos);
-        hits.insert(0, reserved);
-    }
+    reserve_top_trust(&mut hits, |hit| hit.ring);
     hits.truncate(limit);
     Ok(hits)
 }
@@ -1902,27 +1939,27 @@ pub fn ensure_vector_spec(conn: &Connection, spec: &VectorSpec) -> anyhow::Resul
     Ok(dropping)
 }
 
-/// Drops cached vectors whose content is no longer anywhere in the catalog.
-/// Called at the end of every scan: an edited block's old vector goes, every
-/// unchanged block's vector stays.
+/// Drops cached vectors whose rendered input is no longer in the catalog.
+/// A body or context edit retires the old vector only when no other block
+/// still uses that payload. Unchanged payloads keep their vectors.
 fn prune_vectors(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
-    tx.execute("DELETE FROM vectors WHERE content_hash NOT IN (SELECT hash FROM blocks)", [])?;
+    tx.execute("DELETE FROM vectors WHERE content_hash NOT IN (SELECT embedding_hash FROM blocks)", [])?;
     Ok(())
 }
 
-/// The embed work queue: content hashes with no cached vector, each with one
-/// representative text, in document order. DISTINCT by hash â€” the same
-/// statement in two files is one artifact, embedded once.
+/// The embed work queue: payload hashes with no cached vector, each with its
+/// exact rendered text before the encoder prefix, in document order. The same
+/// payload across files/rings is embedded once; different context has its own key.
 pub fn hashes_without_vectors(
     conn: &Connection,
     spec: &VectorSpec,
     limit: usize,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT b.hash, min(b.text), min(b.id) FROM blocks b
-         LEFT JOIN vectors v ON v.content_hash = b.hash AND v.model = ?1 AND v.dim = ?2
+        "SELECT b.embedding_hash, min(b.embedding_text), min(b.id) FROM blocks b
+         LEFT JOIN vectors v ON v.content_hash = b.embedding_hash AND v.model = ?1 AND v.dim = ?2
          WHERE v.content_hash IS NULL
-         GROUP BY b.hash ORDER BY min(b.id) LIMIT ?3",
+         GROUP BY b.embedding_hash ORDER BY min(b.id) LIMIT ?3",
     )?;
     // SQLite reads a negative LIMIT as unbounded â€” which is exactly what a
     // caller asking for usize::MAX (a full hydrate) means.
@@ -1940,7 +1977,7 @@ pub fn hashes_without_vectors(
 pub fn vector_coverage(conn: &Connection, spec: &VectorSpec) -> anyhow::Result<(usize, usize)> {
     let (v, b): (i64, i64) = conn.query_row(
         "SELECT (SELECT count(*) FROM blocks b JOIN vectors v
-                   ON v.content_hash = b.hash AND v.model = ?1 AND v.dim = ?2),
+                   ON v.content_hash = b.embedding_hash AND v.model = ?1 AND v.dim = ?2),
                 (SELECT count(*) FROM blocks)",
         rusqlite::params![spec.model, spec.dim as i64],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1948,7 +1985,9 @@ pub fn vector_coverage(conn: &Connection, spec: &VectorSpec) -> anyhow::Result<(
     Ok((v as usize, b as usize))
 }
 
-/// Caches one content hash's embedding at the spec's width. INT8 must use the
+/// Caches one payload hash's embedding at the spec's width. The vector table
+/// retains its `content_hash` column name; it never contains citation hashes.
+/// INT8 must use the
 /// exact same max-absolute codec as the shared record; an extra floating-point
 /// normalization here could otherwise put different bytes in the disposable
 /// cache than in the authoritative store. Legacy F16/F32 caches retain their
@@ -1986,7 +2025,7 @@ pub fn insert_vector(
 /// longer exist (index moved on) are silently skipped.
 fn hits_for_block_ids(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<Hit>> {
     let mut stmt = conn.prepare(
-        "SELECT b.cite, d.path, d.ring, b.start_line, b.end_line, b.text, b.ctx, b.chain
+        "SELECT b.cite, d.path, d.ring, b.start_line, b.end_line, b.text, b.ctx, b.chain, b.embedding_text
          FROM blocks b JOIN docs d ON d.id = b.doc_id WHERE b.id = ?1",
     )?;
     let mut out = Vec::with_capacity(ids.len());
@@ -2002,6 +2041,7 @@ fn hits_for_block_ids(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<Hit>
                 snippet: snippet_with_ctx(&r.get::<_, String>(6)?, &text),
                 mirrors: Vec::new(),
                 chain: r.get(7)?,
+                payload_hash: crate::embedding_input::hash(&r.get::<_, String>(8)?),
                 text,
             })
         });
@@ -2030,7 +2070,7 @@ fn semantic_block_ids(
     // was restricted to.
     let mut stmt = conn.prepare(&format!(
         "SELECT b.id, v.embedding FROM vectors v
-         JOIN blocks b ON b.hash = v.content_hash
+         JOIN blocks b ON b.embedding_hash = v.content_hash
          JOIN docs d ON d.id = b.doc_id
          WHERE v.model = ?1 AND v.dim = ?2{}",
         slice_filter_sql(prefixes.len())
@@ -2122,14 +2162,15 @@ pub fn semantic_recall(
     prefixes: &[String],
 ) -> anyhow::Result<Vec<Hit>> {
     let ids = semantic_block_ids(conn, spec, query_vec, limit, prefixes)?;
-    // Same mirror suppression as lexical recall: a block mirrored in the
-    // native store has the SAME content hash and therefore the SAME vector -
-    // it ranks adjacent to itself, and without this pass the fused result
-    // carries one logical statement twice while displacing a distinct block.
+    // Keep the existing body+heading-chain mirror policy shared with lexical
+    // recall. Vector identity is finer: table-header context can distinguish
+    // payloads even when this display policy treats the statements as mirrors.
     Ok(dedup_by_content(hits_for_block_ids(conn, &ids)?))
 }
 
-/// BM25-ranked block ids for the same query shape and order [`recall`] uses.
+/// Lexical candidate ids in BM25(+prior) order with the same single top-trust
+/// slot reservation as [`recall`]. Fusion needs block ids; mirror suppression
+/// still happens after fusion, whereas standalone recall suppresses first.
 fn bm25_block_ids(
     conn: &Connection,
     query: &str,
@@ -2140,10 +2181,14 @@ fn bm25_block_ids(
     if fts.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(&ranked_match_sql("b.id", prefixes.len()))?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(ranked_params(&fts, limit, prefixes)), |r| r.get(0))?;
-    Ok(rows.filter_map(Result::ok).collect())
+    let mut stmt = conn.prepare(&ranked_match_sql("b.id, d.ring", prefixes.len()))?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(ranked_params(&fts, limit, prefixes)),
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as u8)),
+    )?;
+    let mut candidates: Vec<(i64, u8)> = rows.filter_map(Result::ok).collect();
+    reserve_top_trust(&mut candidates, |(_, ring)| *ring);
+    Ok(candidates.into_iter().map(|(id, _)| id).collect())
 }
 
 /// Reciprocal rank fusion over ranked id lists: score(d) = Î£ 1/(k + rank),
@@ -2622,13 +2667,14 @@ mod tests {
     }
 
     #[test]
-    fn citation_is_stable_under_reorder_and_case() {
+    fn citation_preserves_exact_body_identity_and_ring() {
         let a = cite_id(3, "The  Quick   Fox");
         let b = cite_id(3, "the quick fox");
-        assert_eq!(a, b);
+        assert_ne!(a, b, "different embedding input must not share a citation hash");
+        assert_eq!(a, cite_id(3, "The  Quick   Fox"));
         assert!(a.starts_with("r3-"));
         assert_ne!(a, cite_id(3, "the quick foxes"));
-        assert_ne!(a, cite_id(2, "the quick fox"), "ring is part of the id");
+        assert_ne!(a, cite_id(2, "The  Quick   Fox"), "ring is part of the id");
     }
 
     #[test]
@@ -3219,6 +3265,25 @@ mod tests {
     }
 
     #[test]
+    fn catalog_checksum_detects_context_changes_with_the_same_body_citations() {
+        let dir = brain(&[("knowledge/a.md", "# First\n\n- alpha\n\n# Second\n\n- beta\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let citations = |conn: &Connection| -> Vec<String> {
+            conn.prepare("SELECT cite FROM blocks ORDER BY cite").unwrap()
+                .query_map([], |row| row.get(0)).unwrap()
+                .collect::<Result<_, _>>().unwrap()
+        };
+        let before_citations = citations(&conn);
+        let before_checksum = catalog_checksum(&conn).unwrap();
+        std::fs::write(dir.path().join("knowledge/a.md"), "# First\n\n- beta\n\n# Second\n\n- alpha\n").unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(citations(&conn), before_citations, "the source-body multiset is unchanged");
+        assert_ne!(catalog_checksum(&conn).unwrap(), before_checksum, "context changed the semantic inputs");
+    }
+
+    #[test]
     fn open_ro_serves_the_committed_snapshot() {
         let dir = brain(&[("knowledge/a.md", "royw fact\n")]);
         let state = tempfile::tempdir().unwrap();
@@ -3233,20 +3298,81 @@ mod tests {
     }
 
     #[test]
-    fn old_schema_version_triggers_rebuild_not_silent_reuse() {
+    fn normalized_body_schema_is_rejected_read_only_and_rebuilt_from_markdown() {
+        let dir = brain(&[("knowledge/a.md", "- US\n")]);
         let state = tempfile::tempdir().unwrap();
+        let spec = test_spec(2);
+        let legacy_hash = crate::hashing::hex_lower(sha2::Sha256::digest(b"- us"));
         {
-            let conn = open(state.path()).unwrap();
+            let mut conn = open(state.path()).unwrap();
+            scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+            conn.execute(
+                "UPDATE blocks SET hash=?1, cite=?2, embedding_hash=?1",
+                rusqlite::params![legacy_hash, cite_from_hash(3, &legacy_hash)],
+            )
+            .unwrap();
+            ensure_vector_spec(&conn, &spec).unwrap();
+            insert_vector(&conn, &legacy_hash, &spec, &[1.0, 0.0]).unwrap();
             conn.execute("INSERT INTO meta(key,value) VALUES('marker','old')", []).unwrap();
-            conn.pragma_update(None, "user_version", 1i64).unwrap();
+            conn.pragma_update(None, "user_version", 7i64).unwrap();
+
+            for result in [open_ro(state.path()), open_read_only(state.path())] {
+                let error = result.expect_err("read-only opens must reject normalized-body schema");
+                assert!(error.to_string().contains("index schema v7 != v9"), "{error}");
+            }
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(version, 7, "read-only opens do not migrate the catalog");
+            assert_eq!(vector_coverage(&conn, &spec).unwrap(), (1, 1));
         }
-        let conn = open(state.path()).unwrap();
+        let conn = ensure_fresh(state.path(), dir.path(), None, &RingRules::default()).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
         let marker: Option<String> = conn
             .query_row("SELECT value FROM meta WHERE key='marker'", [], |r| r.get(0))
             .ok();
         assert!(marker.is_none(), "old-schema DB must be discarded, not reused");
+        let hits = recall(&conn, "US", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].cite, cite_id(3, "- US"));
+        assert!(expand(&conn, &cite_from_hash(3, &legacy_hash)).unwrap().is_empty());
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (0, 1));
+        assert_eq!(
+            hashes_without_vectors(&conn, &spec, 10).unwrap(),
+            vec![(crate::embedding_input::hash("- US"), "- US".to_string())]
+        );
+    }
+
+    #[test]
+    fn body_key_vector_schema_is_rebuilt_without_changing_citations() {
+        let dir = brain(&[("knowledge/a.md", "# Policy\n\n- unchanged\n")]);
+        let state = tempfile::tempdir().unwrap();
+        let spec = test_spec(2);
+        let body_hash = content_hash("- unchanged");
+        let cite = cite_id(3, "- unchanged");
+        {
+            let mut conn = open(state.path()).unwrap();
+            scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+            conn.execute("UPDATE blocks SET embedding_hash=hash, embedding_text=text", []).unwrap();
+            ensure_vector_spec(&conn, &spec).unwrap();
+            insert_vector(&conn, &body_hash, &spec, &[1.0, 0.0]).unwrap();
+            conn.pragma_update(None, "user_version", 8i64).unwrap();
+            for result in [open_ro(state.path()), open_read_only(state.path())] {
+                let error = result.expect_err("body-key vector schema needs a rebuild");
+                assert!(error.to_string().contains("index schema v8 != v9"), "{error}");
+            }
+        }
+        let conn = ensure_fresh(state.path(), dir.path(), None, &RingRules::default()).unwrap();
+        assert_eq!(expand(&conn, &cite).unwrap().len(), 1, "context migration preserves body citations");
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (0, 2));
+        // Even an old record arriving after the rebuild cannot satisfy the
+        // new queue or join semantically, including context-free headings.
+        insert_vector(&conn, &body_hash, &spec, &[1.0, 0.0]).unwrap();
+        insert_vector(&conn, &content_hash("# Policy"), &spec, &[1.0, 0.0]).unwrap();
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (0, 2));
+        assert!(semantic_recall(&conn, &spec, &[1.0, 0.0], 10, &[]).unwrap().is_empty());
+        let pending: std::collections::BTreeMap<_, _> = hashes_without_vectors(&conn, &spec, 10).unwrap().into_iter().collect();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.get(&crate::embedding_input::hash("Policy\n\n- unchanged")).map(String::as_str), Some("Policy\n\n- unchanged"));
     }
 
     #[test]
@@ -3423,14 +3549,183 @@ mod tests {
 
     #[test]
     fn content_hash_is_the_full_digest_the_citation_truncates() {
-        // ONE hashing site: the citation is a prefix of the content address,
-        // so a vector keyed by hash always belongs to the cited block.
+        // Citation provenance stays body-addressed even when vectors include
+        // context under a separate payload address.
         let h = content_hash("The  Quick   Fox");
         assert_eq!(h.len(), 64, "full sha256 hex");
-        assert_eq!(h, content_hash("the quick fox"), "same normalization the citation uses");
-        assert_eq!(cite_id(3, "the quick fox"), format!("r3-{}", &h[..10]));
-        assert_eq!(cite_id(1, "the quick fox"), format!("r1-{}", &h[..10]), "ring labels, hash addresses");
+        assert_ne!(h, content_hash("the quick fox"), "body identity is case and whitespace sensitive");
+        assert_eq!(cite_id(3, "The  Quick   Fox"), format!("r3-{}", &h[..10]));
+        assert_eq!(cite_id(1, "The  Quick   Fox"), format!("r1-{}", &h[..10]), "ring labels, hash addresses");
         assert_ne!(h, content_hash("the quick foxes"));
+    }
+
+    #[test]
+    fn vector_queue_preserves_case_spacing_and_line_breaks_but_deduplicates_exact_copies() {
+        let dir = brain(&[
+            ("knowledge/upper.md", "- US\n"),
+            ("knowledge/lower.md", "- us\n"),
+            ("knowledge/spaced.md", "- us  value\n"),
+            ("knowledge/single.md", "- us value\n"),
+            ("knowledge/tab.md", "- us\tvalue\n"),
+            ("knowledge/lines.md", "US\nstate\n"),
+            ("knowledge/inline.md", "US state\n"),
+            ("knowledge/copy.md", "---\nring: 1\n---\n- US\n"),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
+        let pending: std::collections::BTreeMap<String, String> =
+            hashes_without_vectors(&conn, &spec, 20).unwrap().into_iter().collect();
+        let bodies = [
+            "- US", "- us", "- us  value", "- us value", "- us\tvalue", "US\nstate", "US state",
+        ];
+        assert_eq!(pending.len(), bodies.len());
+        for body in bodies {
+            assert_eq!(pending.get(&crate::embedding_input::hash(body)).map(String::as_str), Some(body));
+        }
+        insert_vector(&conn, &crate::embedding_input::hash("- US"), &spec, &[1.0, 0.0]).unwrap();
+        assert_eq!(
+            vector_coverage(&conn, &spec).unwrap(),
+            (2, 8),
+            "identical copies share one artifact across rings"
+        );
+        assert_eq!(hashes_without_vectors(&conn, &spec, 20).unwrap().len(), 6);
+        let copies = expand(&conn, &cite_id(3, "- US")).unwrap();
+        assert_eq!(copies.len(), 2);
+        assert_eq!(copies[0].ring, 1);
+        assert_eq!(copies[1].ring, 3);
+    }
+
+    #[test]
+    fn exact_body_edits_invalidate_only_the_changed_vector_on_full_and_incremental_scans() {
+        for incremental in [false, true] {
+            let dir = brain(&[("knowledge/a.md", "- US\n- unchanged\n")]);
+            let path = dir.path().join("knowledge/a.md");
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let mut conn = open(state.path()).unwrap();
+            scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+            let spec = test_spec(2);
+            embed_everything(&conn, &spec, &[1.0, 0.0]);
+            let mut previous = "- US";
+            for (step, body) in ["- us", "- us  ", "- us\t ", "- us\n  value"].into_iter().enumerate() {
+                std::fs::write(&path, format!("{body}\n- unchanged\n")).unwrap();
+                // Make same-size edits visible on filesystems with coarse mtimes.
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(
+                        modified + std::time::Duration::from_secs(step as u64 + 1),
+                    ))
+                    .unwrap();
+                if incremental {
+                    rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().unwrap();
+                } else {
+                    scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+                }
+                assert_eq!(
+                    hashes_without_vectors(&conn, &spec, 10).unwrap(),
+                    vec![(crate::embedding_input::hash(body), body.to_string())],
+                    "only the exact edited body is queued, incremental={incremental}"
+                );
+                assert_eq!(vector_coverage(&conn, &spec).unwrap(), (1, 2));
+                assert!(expand(&conn, &cite_id(3, previous)).unwrap().is_empty());
+                let rows: i64 = conn.query_row("SELECT count(*) FROM vectors", [], |r| r.get(0)).unwrap();
+                assert_eq!(rows, 1, "the superseded vector is pruned");
+                embed_everything(&conn, &spec, &[0.0, 1.0]);
+                previous = body;
+            }
+            // Moving an unchanged body does not change its address or requeue it.
+            std::fs::write(&path, format!("- unchanged\n{previous}\n")).unwrap();
+            scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+            assert!(hashes_without_vectors(&conn, &spec, 10).unwrap().is_empty());
+            assert_eq!(expand(&conn, &cite_id(3, previous)).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn context_edits_requeue_only_dependents_and_keep_vectors_needed_by_other_occurrences() {
+        for incremental in [false, true] {
+            let dir = brain(&[
+                ("knowledge/a.md", "# First\n\n- shared\n\n# Stable\n\n- keep\n"),
+                ("knowledge/copy.md", "---\nring: 1\n---\n# First\n\n- shared\n"),
+                ("knowledge/other.md", "# Second\n\n- shared\n"),
+            ]);
+            let state = tempfile::tempdir().unwrap();
+            let mut conn = open(state.path()).unwrap();
+            scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+            let spec = test_spec(2);
+            let first = crate::embedding_input::hash("First\n\n- shared");
+            let second = crate::embedding_input::hash("Second\n\n- shared");
+            let pending: std::collections::BTreeMap<_, _> = hashes_without_vectors(&conn, &spec, 20).unwrap().into_iter().collect();
+            assert_eq!(pending.len(), 6, "same payload across files and rings is queued once");
+            assert_eq!(pending.get(&first).map(String::as_str), Some("First\n\n- shared"));
+            assert_eq!(pending.get(&second).map(String::as_str), Some("Second\n\n- shared"));
+            assert_ne!(first, second);
+            assert_eq!(expand(&conn, &cite_id(3, "- shared")).unwrap().len(), 3);
+            insert_vector(&conn, &first, &spec, &[1.0, 0.0]).unwrap();
+            insert_vector(&conn, &second, &spec, &[0.0, 1.0]).unwrap();
+            assert_eq!(vector_coverage(&conn, &spec).unwrap(), (3, 8));
+            let hits = semantic_recall(&conn, &spec, &[0.0, 1.0], 10, &[]).unwrap();
+            assert_eq!(hits[0].path, "knowledge/other.md", "same body can rank differently under different headings");
+            assert_eq!(hits[0].cite, cite_id(3, "- shared"));
+            embed_everything(&conn, &spec, &[1.0, 0.0]);
+
+            std::fs::write(dir.path().join("knowledge/a.md"), "# Changed\n\n- shared\n\n# Stable\n\n- keep\n").unwrap();
+            if incremental {
+                rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().unwrap();
+            } else {
+                scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+            }
+            let queued: std::collections::BTreeSet<_> = hashes_without_vectors(&conn, &spec, 20).unwrap().into_iter().map(|(_, text)| text).collect();
+            assert_eq!(queued, ["# Changed".to_string(), "Changed\n\n- shared".to_string()].into_iter().collect());
+            assert_eq!(vector_coverage(&conn, &spec).unwrap(), (6, 8));
+            assert_eq!(expand(&conn, &cite_id(3, "- shared")).unwrap().len(), 3, "a context edit keeps body citations");
+            let old_present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM vectors WHERE content_hash=?1)", [&first], |row| row.get(0)).unwrap();
+            assert!(old_present, "the mirror still depends on the old payload");
+
+            std::fs::remove_file(dir.path().join("knowledge/copy.md")).unwrap();
+            if incremental {
+                rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().unwrap();
+            } else {
+                scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+            }
+            let old_present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM vectors WHERE content_hash=?1)", [&first], |row| row.get(0)).unwrap();
+            assert!(!old_present, "the last dependent occurrence left, so its vector is pruned");
+            assert_eq!(vector_coverage(&conn, &spec).unwrap(), (4, 6));
+            assert_eq!(hashes_without_vectors(&conn, &spec, 20).unwrap().len(), 2, "unrelated vectors remain usable");
+        }
+    }
+
+    #[test]
+    fn full_table_header_edits_invalidate_rows_beyond_the_display_preview() {
+        let old_header = format!("| {} OLD  units | Value |", "column ".repeat(30));
+        let new_header = old_header.replace("OLD", "CURRENT");
+        let row = "| reading | 42 |";
+        let dir = brain(&[("knowledge/a.md", &format!("# Measurements\n\n{old_header}\n{row}\n\n- unrelated\n"))]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
+        let row_state = |conn: &Connection| -> (String, String, String, String) {
+            conn.query_row("SELECT cite, ctx, embedding_text, embedding_hash FROM blocks WHERE text=?1", [row], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap()
+        };
+        let before = row_state(&conn);
+        assert_eq!(before.2, format!("Measurements > {old_header}\n\n{row}"));
+        assert!(!before.1.contains("OLD"), "the fixture changes text beyond the preview boundary");
+        embed_everything(&conn, &spec, &[1.0, 0.0]);
+        std::fs::write(dir.path().join("knowledge/a.md"), format!("# Measurements\n\n{new_header}\n{row}\n\n- unrelated\n")).unwrap();
+        rescan_changed(&mut conn, dir.path(), None, &RingRules::default()).unwrap().unwrap();
+        let after = row_state(&conn);
+        assert_eq!(after.0, before.0, "row citation is unchanged");
+        assert_eq!(after.1, before.1, "display context keeps its existing preview behavior");
+        assert_eq!(after.2, format!("Measurements > {new_header}\n\n{row}"));
+        assert_ne!(after.3, before.3, "full header meaning reaches the embedding key");
+        assert_eq!(vector_coverage(&conn, &spec).unwrap(), (2, 4), "heading and unrelated prose keep their vectors");
+        let queued: std::collections::BTreeSet<_> = hashes_without_vectors(&conn, &spec, 10).unwrap().into_iter().map(|(_, text)| text).collect();
+        assert_eq!(queued, [format!("Measurements\n\n{new_header}"), after.2].into_iter().collect());
     }
 
     #[test]
@@ -3534,7 +3829,7 @@ mod tests {
         let missing = hashes_without_vectors(&conn, &spec, 10).unwrap();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].1, "- one");
-        assert_eq!(missing[0].0, content_hash("- one"), "the queue is keyed by content address");
+        assert_eq!(missing[0].0, crate::embedding_input::hash("- one"), "the queue is keyed by payload address");
         insert_vector(&conn, &missing[0].0, &spec, &[3.0, 4.0]).unwrap();
         let blob: Vec<u8> = conn
             .query_row("SELECT embedding FROM vectors WHERE content_hash=?1", [&missing[0].0], |r| r.get(0))
@@ -3622,7 +3917,7 @@ mod tests {
         scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let spec = test_spec(2);
         embed_everything(&conn, &spec, &[1.0, 0.0]);
-        let gone = content_hash("- two");
+        let gone = crate::embedding_input::hash("- two");
 
         std::fs::write(dir.path().join("knowledge/a.md"), "- one\n- two, corrected\n").unwrap();
         scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
@@ -3653,7 +3948,7 @@ mod tests {
         let assign = |text_frag: &str, v: &[f32]| {
             let hash: String = conn
                 .query_row(
-                    "SELECT hash FROM blocks WHERE text LIKE '%' || ?1 || '%'",
+                    "SELECT embedding_hash FROM blocks WHERE text LIKE '%' || ?1 || '%'",
                     [text_frag],
                     |r| r.get(0),
                 )
@@ -3686,7 +3981,7 @@ mod tests {
         let mut conn = open(state.path()).unwrap();
         scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
         let spec = test_spec(2);
-        let mut stmt = conn.prepare("SELECT hash FROM blocks ORDER BY id").unwrap();
+        let mut stmt = conn.prepare("SELECT embedding_hash FROM blocks ORDER BY id").unwrap();
         let hashes: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect();
         drop(stmt);
         insert_vector(&conn, &hashes[0], &spec, &[1.0, 0.0]).unwrap(); // a.md: far from query
@@ -3699,6 +3994,50 @@ mod tests {
         // a.md: rank 1 lexical (1/3) + rank 2 semantic (1/4) = 0.583
         // b.md: rank 1 semantic (1/3) = 0.333
         assert_eq!(paths[0], "knowledge/a.md");
+    }
+
+    #[test]
+    fn hybrid_preserves_agreement_between_reserved_lexical_and_semantic_top_policy() {
+        let obsolete = "- approval";
+        let current = "- A production restart needs explicit approval for this particular action, even during maintenance.";
+        for ring in [0, 1] {
+            let dir = brain(&[
+                ("knowledge/a-old.md", &format!("---\nring: 4\n---\n{obsolete}\n")),
+                ("knowledge/z-current.md", &format!("---\nring: {ring}\n---\n{current}\n")),
+                // Keep IDF positive so the short obsolete block wins raw BM25.
+                ("knowledge/fill.md", "- one\n- two\n- three\n- four\n- five\n- six\n- seven\n- eight\n"),
+            ]);
+            let state = tempfile::tempdir().unwrap();
+            let mut conn = open(state.path()).unwrap();
+            scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+            let spec = test_spec(2);
+            insert_vector(&conn, &crate::embedding_input::hash(current), &spec, &[1.0, 0.0]).unwrap();
+            insert_vector(&conn, &crate::embedding_input::hash(obsolete), &spec, &[0.8, 0.6]).unwrap();
+            let query = "approval";
+            let vector = [1.0, 0.0];
+
+            let raw_first: String = conn.query_row(
+                &ranked_match_sql("d.path", 0),
+                rusqlite::params_from_iter(ranked_params(&fts_query(query), 20, &[])),
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(raw_first, "knowledge/a-old.md", "fixture must exercise the reservation");
+            let lexical = recall(&conn, query, 10).unwrap();
+            let semantic = semantic_recall(&conn, &spec, &vector, 10, &[]).unwrap();
+            assert_eq!(lexical[0].path, "knowledge/z-current.md");
+            assert_eq!(semantic[0].path, "knowledge/z-current.md");
+
+            let lexical_ids = bm25_block_ids(&conn, query, 20, &[]).unwrap();
+            let fusion_input = hits_for_block_ids(&conn, &lexical_ids).unwrap();
+            assert_eq!(
+                fusion_input.iter().map(|hit| &hit.path).collect::<Vec<_>>(),
+                lexical.iter().map(|hit| &hit.path).collect::<Vec<_>>(),
+                "hybrid must receive the same reserved lexical order"
+            );
+            let hybrid = hybrid_recall(&conn, &spec, query, &vector, 10, 2.0, &[]).unwrap();
+            assert_eq!(hybrid[0].path, "knowledge/z-current.md", "both ranking inputs agree on current policy");
+            assert_eq!(hybrid[1].path, "knowledge/a-old.md");
+        }
     }
 
     #[test]
@@ -3736,6 +4075,7 @@ mod tests {
             snippet: String::new(),
             mirrors: Vec::new(),
             chain: chain.into(),
+            payload_hash: crate::embedding_input::hash(chain),
             text: String::new(),
         };
         let hits = vec![
@@ -3762,6 +4102,7 @@ mod tests {
             snippet: String::new(),
             mirrors: Vec::new(),
             chain: chain.into(),
+            payload_hash: crate::embedding_input::hash(chain),
             text: String::new(),
         };
         let hits = vec![
@@ -3771,6 +4112,35 @@ mod tests {
         let out = dedup_by_content(hits);
         assert_eq!(out.len(), 2, "same hash under different heading chains = two statements");
         assert!(out.iter().all(|h| h.mirrors.is_empty()));
+    }
+
+    #[test]
+    fn identical_rows_under_different_table_headers_are_not_mirrors() {
+        let temperature = "# Sensors\n\n| Temperature | Value |\n| port | 42 |\n";
+        let pressure = "# Sensors\n\n| Pressure | Value |\n| port | 42 |\n";
+        let dir = brain(&[
+            ("knowledge/temperature.md", temperature),
+            ("knowledge/pressure.md", pressure),
+            ("knowledge/mirror.md", &format!("---\nring: 1\n---\n{temperature}")),
+        ]);
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = open(state.path()).unwrap();
+        scan(&mut conn, dir.path(), None, &RingRules::default()).unwrap();
+        let spec = test_spec(2);
+        for (hash, payload) in hashes_without_vectors(&conn, &spec, 20).unwrap() {
+            if payload.ends_with("| port | 42 |") {
+                insert_vector(&conn, &hash, &spec, &[1.0, 0.0]).unwrap();
+            }
+        }
+        for hits in [
+            recall(&conn, "42", 10).unwrap(),
+            semantic_recall(&conn, &spec, &[1.0, 0.0], 10, &[]).unwrap(),
+        ] {
+            assert_eq!(hits.len(), 2, "same body and heading can carry different table meaning");
+            let mirror = hits.iter().find(|hit| hit.path == "knowledge/mirror.md").unwrap();
+            assert_eq!(mirror.mirrors, ["knowledge/temperature.md"]);
+            assert!(hits.iter().any(|hit| hit.path == "knowledge/pressure.md" && hit.mirrors.is_empty()));
+        }
     }
 
     #[test]

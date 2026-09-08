@@ -26,7 +26,7 @@ PROFILE_MANIFEST_SHA256 = (
     "59210a333494f788eb8e607fe38cabb6af1a7aa7cdf604ddf52e3fa6004b5afb"
 )
 ADMISSION_POLICY_SHA256 = (
-    "ee80d7320f1bac3e80302e91de3c3967946d52634f68c01dd4db11b9fefc2ac5"
+    "e58b10f7d5e1ea9d86ca83c8454a466545208a584c0e1f4d3d4339424b7489f7"
 )
 MODEL = "google/embeddinggemma-300m"
 MODEL_REVISION = "57c266a740f537b4dc058e1b0cda161fd15afa75"
@@ -84,6 +84,7 @@ HOST_FILE_PREFIXES = (
     PurePosixPath("/lib64"),
     PurePosixPath("/opt/intel"),
 )
+GOVERNOR_POLICY_PATH = PurePosixPath("/var/lib/cfetch/inference/policy.json")
 
 
 class ManifestError(ValueError):
@@ -265,7 +266,8 @@ def _host_binding(value: Any, label: str) -> HostBinding:
             not pure.is_absolute()
             or str(pure) != text
             or any(part in ("", ".", "..") for part in pure.parts)
-            or not any(pure.is_relative_to(prefix) for prefix in HOST_FILE_PREFIXES)
+            or (pure != GOVERNOR_POLICY_PATH
+                and not any(pure.is_relative_to(prefix) for prefix in HOST_FILE_PREFIXES))
         ):
             raise ManifestError(
                 f"{file_label}.path must be a normalized absolute file under an "

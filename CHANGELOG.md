@@ -5,6 +5,44 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Resumable physical qualification.** Optional journals reserve nonces before
+  requests and persist authenticated responses. Resume revalidates complete
+  trials and preserves interrupted evidence; partial trials restart with fresh
+  warmups. Final snapshots are durable and refuse overwrite. The admission
+  implementation and policy identities include the new checkpoint code.
+- **Canonical long-input OpenVINO attention.** Conversion now uses the pinned
+  model's effective bidirectional window. Independent upstream parity includes
+  actual 258- and 1,946-token probes, detecting defects hidden by padded short
+  inputs. The corrected CPU candidate is measured; backend admission is open.
+- **Host-wide native operation budgets.** Operational OpenVINO startup requires
+  an explicitly provisioned, evidence-bound governor policy. Every compilation
+  and inference has a durable lease, finite budget, cooldown and kernel alarm.
+  Interrupted operations refuse further work until external recovery; no
+  device safety limits or activation are supplied automatically.
+- **Exact statement identity and vector invalidation.** Case, spacing, and
+  line-break changes produce distinct body hashes. Schema 9 separates those
+  citation hashes from vector payload hashes: documents include enclosing
+  headings and full table headers under the unchanged encoder prefix.
+  Context-only edits invalidate dependent vectors and preserve citations.
+  Legacy vectors remain stored but cannot hydrate the new keys; identical
+  table rows under different headers remain distinct recall hits.
+- **Bounded derivation failures.** Only an explicit overlength-input refusal
+  triggers row isolation. Transport, authentication, scope, malformed output,
+  and invalid-vector failures stop immediately. Refused rows are not retried
+  during the same run; completed work remains resumable. An unresponsive
+  adapter is stopped, and failed scopes remain disabled across its restart.
+- **Hybrid recall keeps lexical trust reservation.** The lexical input to
+  fusion now applies the same single top-trust slot as standalone recall,
+  preventing fusion from silently using a different lexical ordering.
+- **Replayable memory-retrieval measurements.** `retrieval-eval` exports exact
+  inputs and evaluates labeled synthetic Markdown with the real rankers and
+  INT8 codec in an isolated catalog. Experimental heading context and imported
+  candidate vectors do not activate or change production embedding semantics.
+- **Resumable signed adapter exports and bounded child cleanup.** Opt-in
+  export checkpoints authenticate completed transactions on resume while
+  keeping independent repeatability trials separate. Package-local adapter
+  cleanup has a deadline and refuses further launch after unconfirmed cleanup
+  or exhaustion of the single crash restart.
 - **Explicit, read-only FastEmbed model diagnostics.** `embed-model --model`
   passes the selected catalogue variant to the loader, including distinct
   quantized variants. `list` uses the linked library's actual catalogue.

@@ -1063,7 +1063,7 @@ mod tests {
 
         let old = VectorSpec { model: "old-model".into(), ..spec(2, Precision::F16) };
         index::ensure_vector_spec(&conn, &old).unwrap();
-        let hash = index::content_hash("- one");
+        let hash = crate::embedding_input::hash("- one");
         index::insert_vector(&conn, &hash, &old, &[1.0, 0.0]).unwrap();
 
         let s = spec(2, Precision::F16);
@@ -1099,6 +1099,123 @@ mod tests {
         assert_eq!(hydrate(&conn, &store).unwrap(), 2);
         assert_eq!(index::vector_coverage(&conn, &s).unwrap(), (2, 2));
         assert_eq!(hydrate(&conn, &store).unwrap(), 0, "a second hydrate imports nothing");
+    }
+
+    #[test]
+    fn offline_context_edit_reunites_by_payload_and_retains_each_first_record() {
+        // Two holders may derive different valid bytes while disconnected.
+        // Reunion must keep the first local record, and a changed context
+        // must never hydrate from the old statement's vector.
+        let s = canonical_spec();
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let left_state = tempfile::tempdir().unwrap();
+        let right_state = tempfile::tempdir().unwrap();
+        let rules = crate::config::RingRules::default();
+        for brain in [left.path(), right.path()] {
+            std::fs::create_dir_all(brain.join("knowledge")).unwrap();
+            std::fs::write(brain.join("knowledge/a.md"), "# Alpha\n\n- Keep backups.\n").unwrap();
+        }
+        let mut left_conn = index::open(left_state.path()).unwrap();
+        let mut right_conn = index::open(right_state.path()).unwrap();
+        index::scan(&mut left_conn, left.path(), None, &rules).unwrap();
+        index::scan(&mut right_conn, right.path(), None, &rules).unwrap();
+        let mut first = vec![0.0; s.dim];
+        first[0] = 1.0;
+        let mut second = first.clone();
+        second[1] = 0.05;
+        let mut left_store = VectorStore::open(left.path(), &s).unwrap();
+        let mut right_store = VectorStore::open(right.path(), &s).unwrap();
+        let original = index::hashes_without_vectors(&left_conn, &s, 10).unwrap();
+        for (store, vector) in [(&mut left_store, &first), (&mut right_store, &second)] {
+            let mut writer = store.begin_write().unwrap();
+            for (hash, _) in &original {
+                writer.put(hash, vector).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        hydrate(&left_conn, &left_store).unwrap();
+        hydrate(&right_conn, &right_store).unwrap();
+        std::fs::write(left.path().join("knowledge/a.md"), "# Beta\n\n- Keep backups.\n").unwrap();
+        index::scan(&mut left_conn, left.path(), None, &rules).unwrap();
+        assert_eq!(hydrate(&left_conn, &left_store).unwrap(), 0);
+        assert_eq!(index::vector_coverage(&left_conn, &s).unwrap(), (0, 2));
+        let changed = index::hashes_without_vectors(&left_conn, &s, 10).unwrap();
+        assert!(changed.iter().all(|(hash, _)| original.iter().all(|(old, _)| old != hash)));
+        {
+            let mut writer = left_store.begin_write().unwrap();
+            for (hash, _) in &changed {
+                writer.put(hash, &first).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        // Exchange the actual wire representation, including old payloads.
+        {
+            let mut writer = right_store.begin_write().unwrap();
+            for (hash, _) in original.iter().chain(changed.iter()) {
+                let record = left_store.get_blob(hash).unwrap().unwrap();
+                let wire = encode_peer_artifact(hash, &record, [4; 32]).unwrap();
+                let decoded = decode_peer_artifact(&wire, &s, hash).unwrap();
+                let inserted = writer.put_encoded(hash, &decoded).unwrap();
+                assert_eq!(inserted, changed.iter().any(|(new, _)| new == hash));
+            }
+            writer.flush().unwrap();
+        }
+        for (hash, _) in &original {
+            assert_eq!(left_store.get_blob(hash).unwrap().unwrap(), index::vec_to_blob(&first, Precision::I8));
+            assert_eq!(right_store.get_blob(hash).unwrap().unwrap(), index::vec_to_blob(&second, Precision::I8));
+        }
+        std::fs::write(right.path().join("knowledge/a.md"), "# Beta\n\n- Keep backups.\n").unwrap();
+        index::scan(&mut right_conn, right.path(), None, &rules).unwrap();
+        assert_eq!(hydrate(&right_conn, &right_store).unwrap(), 2);
+        assert_eq!(index::vector_coverage(&right_conn, &s).unwrap(), (2, 2));
+        assert_eq!(index::catalog_checksum(&left_conn).unwrap(), index::catalog_checksum(&right_conn).unwrap());
+    }
+
+    #[test]
+    fn legacy_normalized_record_cannot_hydrate_a_payload_key() {
+        use sha2::Digest as _;
+
+        let brain = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(brain.path().join("knowledge")).unwrap();
+        std::fs::write(brain.path().join("knowledge/a.md"), "- us\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut conn = index::open(state.path()).unwrap();
+        index::scan(&mut conn, brain.path(), None, &crate::config::RingRules::default()).unwrap();
+
+        let s = spec(2, Precision::F16);
+        // The legacy key for "- US" was SHA256("- us"), even though the
+        // model saw the uppercase body. Plain SHA256(body) would reuse it.
+        let legacy_hash = crate::hashing::hex_lower(sha2::Sha256::digest(b"- us"));
+        let current_hash = crate::embedding_input::hash("- us");
+        let mut store = VectorStore::open(brain.path(), &s).unwrap();
+        {
+            let mut writer = store.begin_write().unwrap();
+            writer.put(&legacy_hash, &[1.0, 0.0]).unwrap();
+            writer.flush().unwrap();
+        }
+        let legacy_record = store.get_blob(&legacy_hash).unwrap().unwrap();
+        assert_eq!(hydrate(&conn, &store).unwrap(), 0);
+        assert_eq!(index::vector_coverage(&conn, &s).unwrap(), (0, 1));
+        assert_eq!(
+            index::hashes_without_vectors(&conn, &s, 10).unwrap(),
+            vec![(current_hash.clone(), "- us".to_string())]
+        );
+        {
+            let mut writer = store.begin_write().unwrap();
+            writer.put(&current_hash, &[0.0, 1.0]).unwrap();
+            writer.flush().unwrap();
+        }
+        let reopened = VectorStore::open(brain.path(), &s).unwrap();
+        assert_eq!(hydrate(&conn, &reopened).unwrap(), 1);
+        assert_eq!(index::vector_coverage(&conn, &s).unwrap(), (1, 1));
+        assert_eq!(reopened.len(), 2, "legacy artifacts remain in the append-only store");
+        assert_eq!(reopened.get_blob(&legacy_hash).unwrap().unwrap(), legacy_record);
+        let cached: Vec<u8> = conn
+            .query_row("SELECT embedding FROM vectors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached, reopened.get_blob(&current_hash).unwrap().unwrap());
+        assert_ne!(cached, legacy_record);
     }
 
     // ---- document prefix as artifact identity
