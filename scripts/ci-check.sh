@@ -14,7 +14,7 @@ for check in "$@"; do
     catalog)
       bash scripts/check-packaging-variants.sh
       bash scripts/variant-matrix.sh >/dev/null
-      "$python_bin" -m unittest -v scripts.test_stage_local_inference scripts.test_variant_matrix
+      "$python_bin" -m unittest -v scripts.test_stage_local_inference scripts.test_variant_matrix scripts.test_ci_variants
       ;;
     rust)
       version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
@@ -34,10 +34,19 @@ for check in "$@"; do
       [[ $(uname -s) == Linux ]] || { echo 'variants requires Linux' >&2; exit 2; }
       architecture=$(uname -m)
       matrix=$(bash scripts/variant-matrix.sh)
-      selected=$(jq -r --arg arch "$architecture" '.include[] | select(.os == "linux" and .arch == $arch) | .id' <<<"$matrix")
+      selected=$(jq -c --arg arch "$architecture" '.include[] | select(.os == "linux" and .arch == $arch)' <<<"$matrix")
       [[ -n $selected ]] || { echo 'No native Linux variant for this worker' >&2; exit 2; }
-      while IFS= read -r variant; do
-        CFETCH_VARIANT="$variant" cargo check --release --locked
+      while IFS= read -r row; do
+        variant=$(jq -r '.id' <<<"$row")
+        target=$(jq -r '.target // ""' <<<"$row")
+        features=$(jq -r '.cargo_features // ""' <<<"$row")
+        # Match ci.yml's release-check arguments, including an empty feature list.
+        cargo_args=(check --release --locked)
+        if [[ -n $target ]]; then
+          cargo_args+=(--target "$target")
+        fi
+        cargo_args+=(--features "$features")
+        CFETCH_VARIANT="$variant" cargo "${cargo_args[@]}"
       done <<<"$selected"
       ;;
     licenses)
@@ -46,6 +55,19 @@ for check in "$@"; do
       trap 'rm -f -- "$generated"' EXIT
       bash scripts/generate-third-party-licenses.sh "$generated"
       diff -u THIRD-PARTY-LICENSES.txt "$generated"
+      ;;
+    ort-foundation-build)
+      "$python_bin" experiments/npu-ort-foundation/build_cached_probe.py
+      ;;
+    ort-foundation-cpu)
+      "$python_bin" -m unittest discover -s experiments/npu-ort-foundation -p test_pinned_cache.py -v
+      "$python_bin" experiments/npu-ort-foundation/run_cached_cpu.py
+      ;;
+    governor)
+      # Native deadline and persisted load policy; no model/runtime dependency.
+      "$python_bin" -m unittest -v \
+        packages.openvino.tests.test_inference_governor \
+        packages.openvino.tests.test_native_deadline
       ;;
     profile)
       # The caller supplies the environment from requirements-lock.txt.
@@ -75,6 +97,6 @@ for check in "$@"; do
         "$python_bin" "$command" --help >/dev/null
       done
       ;;
-    *) echo "Unknown check: $check (catalog rust variants licenses profile)" >&2; exit 2 ;;
+    *) echo "Unknown check: $check (catalog rust variants licenses governor profile ort-foundation-build ort-foundation-cpu)" >&2; exit 2 ;;
   esac
 done
