@@ -4,6 +4,41 @@ This standalone probe starts with runtime loading, then runs one built-in
 FastEmbed model through an explicitly selected OpenVINO device. It does not
 change cfetch's model, vector store or admitted backends.
 
+The [CPU diagnostic evidence](cpu-diagnostic-evidence.json) and
+[actual vector](cpu-diagnostic-vector.json) record one successful built-in
+EmbeddingGemma call: 13 tokens, 768 finite components, 6.208 seconds to
+initialize and 0.119 seconds for the first embedding. These are single-call
+observations, not a warm-latency benchmark or semantic admission.
+OpenVINO executed 99 subgraphs, while ORT's CPU provider executed 24
+`MultiHeadAttention` and 48 `RotaryEmbedding` operations. Those are model
+computation, not shape bookkeeping. On this short input their summed profile
+time was 3.418 ms, versus 112.528 ms for the OpenVINO kernels. Long-input cost
+and device handoff overhead remain unmeasured; this does not prove that an
+explicitly qualified mixed route is impractical. This exact graph/runtime pair
+therefore
+does not establish exclusive accelerator execution; the strict mode correctly
+refuses it. NPU/GPU execution and canonical long-input compatibility remain
+unqualified.
+
+For this CPU-only investigation, the new probe accepts
+`--cpu-fallback diagnostic`. The CPU wrapper requires an explicit
+`CFETCH_FOUNDATION_PROBE_DIR` build receipt and
+`CFETCH_FOUNDATION_CPU_DIAGNOSTIC=1`. NPU mode rejects that flag and retains
+strict fallback and provider checks. Vector, timing and placement files are
+synced before success; the supervisor rechecks model, probe and runtime bytes.
+
+For one retained CPU comparison input, set `CFETCH_FOUNDATION_CPU_INPUT` and
+its `CFETCH_FOUNDATION_CPU_INPUT_SHA256`. The JSON fixture contains
+`schema_version: 1`, `id`, `text`, `tokens`, and canonical `token_ids_sha256`.
+The token digest hashes the UTF-8 compact JSON array (comma separators, no spaces).
+The fixture is copied into
+the fresh result directory and hashed before and after execution. The worker's
+`--cpu-input` option requires CPU and EmbeddingGemma before loading the runtime,
+allows at most 2048 tokens and 128 KiB of JSON, and rejects a differing token
+count or truncation before the single embedding call. The supervisor verifies
+the returned token IDs against the retained digest before recording success.
+NPU inputs remain fixed.
+
 The measured stack is FastEmbed 6.0.2, `ort` 2.0.0-rc.13 with **API 24 only**,
 and Intel's ONNX Runtime OpenVINO 1.24.1 package containing OpenVINO 2025.4.1.
 Enabling `ort`'s default features would raise the required API version.
