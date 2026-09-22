@@ -18,13 +18,13 @@ class ReleaseTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
-        self.tool_environment = {key: os.environ[key] for key in ("CI_TOOL_ARCHIVE", "CI_TOOL_SHA256") if key in os.environ}
+        self.tool_environment = {key: os.environ[key] for key in ("CI_TOOL_ARCHIVE", "CI_TOOL_SHA256", "CFETCH_PUBLISHER_ARCHIVE", "CFETCH_PUBLISHER_SHA256") if key in os.environ}
         self.environment = patch.dict(os.environ, {}, clear=True)
         self.environment.start()
         self.addCleanup(self.environment.stop)
 
     def source(self, directory, entries=None):
-        entries = entries or {"Cargo.toml": b'[package]\nname="cfetch"\nversion="0.9.9"\nrepository="https://github.com/corbet-labs/cfetch"\n',
+        entries = entries or {"Cargo.toml": b'[package]\nname="cfetch"\nversion="0.9.9"\nrepository="https://github.com/corbet-libs/cfetch"\n',
                               "Cargo.lock": b"locked", **{name: name.encode() for name in r.METADATA.values()}}
         with tarfile.open(directory / "source.tar", "w", format=tarfile.PAX_FORMAT, pax_headers={"comment": "1" * 40}) as archive:
             for name, payload in entries.items():
@@ -184,7 +184,7 @@ class ReleaseTests(unittest.TestCase):
                 raise r.Failure("unknown response")
             return []
         core = SimpleNamespace(Failure=r.Failure)
-        remote = SimpleNamespace(api="https://api.github.com/repos/corbet-labs/cfetch", bundle=SimpleNamespace(manifest={"tag": "v0.9.9"}),
+        remote = SimpleNamespace(api="https://api.github.com/repos/corbet-libs/cfetch", bundle=SimpleNamespace(manifest={"tag": "v0.9.9"}),
                                  http=SimpleNamespace(json=request), github_headers=lambda: {})
         os.environ["GH_TOKEN"] = "fixture-only"
         for _ in range(2):
@@ -198,7 +198,7 @@ class ReleaseTests(unittest.TestCase):
             if "/git/ref/tags/" in url:
                 return {"object": {"type": "commit", "sha": "1" * 40}}
             return [{"id": 1, "tag_name": "v0.9.9"}, {"id": 2, "tag_name": "v0.9.9"}]
-        remote = SimpleNamespace(api="https://api.github.com/repos/corbet-labs/cfetch", bundle=SimpleNamespace(manifest={"tag": "v0.9.9"}),
+        remote = SimpleNamespace(api="https://api.github.com/repos/corbet-libs/cfetch", bundle=SimpleNamespace(manifest={"tag": "v0.9.9"}),
                                  http=SimpleNamespace(json=request), github_headers=lambda: {})
         with self.assertRaisesRegex(r.Failure, "Multiple release objects"):
             r.release_object(SimpleNamespace(), remote, {"producing_commit": "1" * 40}, self.base, create=True)

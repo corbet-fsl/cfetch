@@ -15,6 +15,10 @@ commands = [["bash", "scripts/ci-check.sh", "catalog"]]
 kind = "commands"
 commands = [["bash", "scripts/ci-check.sh", "rust"]]
 
+[checks.memory]
+kind = "commands"
+commands = [["bash", "scripts/ci-check.sh", "memory"]]
+
 [checks.variants]
 kind = "commands"
 commands = [["bash", "scripts/ci-check.sh", "variants"]]
@@ -54,3 +58,19 @@ commands = [["python3", "scripts/release_maintenance.py"]]
 [checks.staging]
 kind = "commands"
 commands = [["bash", "scripts/ci-check.sh", "staging"]]
+
+[checks.local-model]
+kind = "commands"
+commands = [["bash", "scripts/ci-local-model.sh"]]
+
+[checks.local-release]
+kind = "commands"
+commands = [["bash", "scripts/ci-local-release.sh"]]
+
+[checks.nix]
+kind = "commands"
+commands = [["bash", "scripts/ci-nix.sh"]]
+
+[checks.release-inputs]
+kind = "commands"
+commands = [["bash", "scripts/ci-release-inputs.sh"]]

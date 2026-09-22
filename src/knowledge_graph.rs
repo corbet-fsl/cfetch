@@ -49,6 +49,129 @@ pub struct KnowledgeGraph {
     pub omitted_edges: usize,
 }
 
+/// A shortest explanation through visible, explicitly authored links.
+/// Traversal may follow a backlink; each returned edge retains its original
+/// direction. Missing or ambiguous endpoints produce no invented route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgePath {
+    pub generation: u64,
+    pub from_matches: Vec<String>,
+    pub to_matches: Vec<String>,
+    pub max_depth: usize,
+    pub found: bool,
+    pub paths: Vec<String>,
+    pub edges: Vec<KnowledgeEdge>,
+}
+
+pub fn trace(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    max_depth: usize,
+) -> anyhow::Result<KnowledgePath> {
+    anyhow::ensure!(
+        (1..=32).contains(&max_depth),
+        "graph depth must be between 1 and 32"
+    );
+    let mut statement = conn.prepare("SELECT id, path FROM docs WHERE ring <= 4 ORDER BY path")?;
+    let docs = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let matches = |query: &str| {
+        let scored: Vec<_> = docs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, path))| focus_score(path, query).map(|score| (index, score)))
+            .collect();
+        let best = scored.iter().map(|(_, score)| *score).max();
+        scored
+            .into_iter()
+            .filter_map(|(index, score)| (Some(score) == best).then_some(index))
+            .collect::<Vec<_>>()
+    };
+    let from_matches = matches(from);
+    let to_matches = matches(to);
+    let mut result = KnowledgePath {
+        generation: crate::index::generation(conn),
+        from_matches: from_matches.iter().map(|&i| docs[i].1.clone()).collect(),
+        to_matches: to_matches.iter().map(|&i| docs[i].1.clone()).collect(),
+        max_depth,
+        found: false,
+        paths: Vec::new(),
+        edges: Vec::new(),
+    };
+    if from_matches.len() != 1 || to_matches.len() != 1 {
+        return Ok(result);
+    }
+    let (start, end) = (from_matches[0], to_matches[0]);
+    let by_id: HashMap<_, _> = docs
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (*id, index))
+        .collect();
+    let mut statement =
+        conn.prepare("SELECT from_doc, to_doc FROM links ORDER BY from_doc, to_doc")?;
+    let edges = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut adjacency = vec![Vec::new(); docs.len()];
+    let mut directed = BTreeSet::new();
+    for (from, to) in edges {
+        if let (Some(&from), Some(&to)) = (by_id.get(&from), by_id.get(&to)) {
+            adjacency[from].push(to);
+            adjacency[to].push(from);
+            directed.insert((from, to));
+        }
+    }
+    for neighbors in &mut adjacency {
+        neighbors.sort_unstable();
+        neighbors.dedup();
+    }
+    let mut visited = vec![false; docs.len()];
+    let mut parent = vec![None; docs.len()];
+    let mut queue = VecDeque::from([(start, 0)]);
+    visited[start] = true;
+    while let Some((node, depth)) = queue.pop_front() {
+        if node == end {
+            let mut route = vec![end];
+            let mut current = end;
+            while let Some(previous) = parent[current] {
+                route.push(previous);
+                current = previous;
+            }
+            route.reverse();
+            result.paths = route.iter().map(|&index| docs[index].1.clone()).collect();
+            for pair in route.windows(2) {
+                let (a, b) = if directed.contains(&(pair[0], pair[1])) {
+                    (pair[0], pair[1])
+                } else {
+                    (pair[1], pair[0])
+                };
+                result.edges.push(KnowledgeEdge {
+                    from: docs[a].1.clone(),
+                    to: docs[b].1.clone(),
+                    relation: "curated_link".into(),
+                });
+            }
+            result.found = true;
+            return Ok(result);
+        }
+        if depth == max_depth {
+            continue;
+        }
+        for &next in &adjacency[node] {
+            if !visited[next] {
+                visited[next] = true;
+                parent[next] = Some(node);
+                queue.push_back((next, depth + 1));
+            }
+        }
+    }
+    Ok(result)
+}
+
 #[derive(Debug)]
 struct Doc {
     id: i64,
@@ -140,9 +263,8 @@ pub fn build_matching(
         .collect();
 
     let mut link_stmt = conn.prepare("SELECT from_doc, to_doc FROM links")?;
-    let link_rows = link_stmt.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-    })?;
+    let link_rows =
+        link_stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
     let resolved_links: Vec<(usize, usize)> = link_rows
         .filter_map(Result::ok)
         .filter_map(|(from, to)| Some((*by_id.get(&from)?, *by_id.get(&to)?)))
@@ -151,7 +273,10 @@ pub fn build_matching(
     // same doc: they are valid links (resolve_links deliberately refuses to
     // insert them into `links`), but counting them as unresolved inflated
     // the broken-link metric by exactly the self-reference count.
-    let self_references = resolved_links.iter().filter(|(from, to)| from == to).count();
+    let self_references = resolved_links
+        .iter()
+        .filter(|(from, to)| from == to)
+        .count();
     let resolved_references = resolved_links.len().saturating_sub(self_references);
     let mut links: Vec<(usize, usize)> = resolved_links
         .into_iter()
@@ -180,7 +305,9 @@ pub fn build_matching(
             let scored: Vec<(usize, u8)> = docs
                 .iter()
                 .enumerate()
-                .filter_map(|(index, doc)| focus_score(&doc.path, query).map(|score| (index, score)))
+                .filter_map(|(index, doc)| {
+                    focus_score(&doc.path, query).map(|score| (index, score))
+                })
                 .collect();
             let best = scored.iter().map(|(_, score)| *score).max();
             scored
@@ -272,9 +399,7 @@ pub fn build_matching(
     edges.truncate(edge_limit);
 
     let raw_references = conn
-        .prepare(
-            "SELECT d.path FROM doc_links dl JOIN docs d ON d.id = dl.doc_id",
-        )
+        .prepare("SELECT d.path FROM doc_links dl JOIN docs d ON d.id = dl.doc_id")
         .and_then(|mut statement| {
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
             Ok(rows
@@ -299,122 +424,4 @@ pub fn build_matching(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn graph_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE docs(
-               id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, ring INTEGER NOT NULL,
-               mtime INTEGER NOT NULL, size INTEGER NOT NULL
-             );
-             CREATE TABLE blocks(
-               id INTEGER PRIMARY KEY, cite TEXT NOT NULL, doc_id INTEGER NOT NULL,
-               start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, text TEXT NOT NULL,
-               ctx TEXT NOT NULL DEFAULT '', chain TEXT NOT NULL DEFAULT '',
-               hash TEXT NOT NULL DEFAULT '',
-               embedding_text TEXT NOT NULL, embedding_hash TEXT NOT NULL
-             );
-             CREATE TABLE links(from_doc INTEGER NOT NULL, to_doc INTEGER NOT NULL);
-             CREATE TABLE doc_links(doc_id INTEGER NOT NULL, target TEXT NOT NULL);
-             INSERT INTO meta(key, value) VALUES('generation', '7');",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO docs(id, path, ring, mtime, size) VALUES
-             (1, 'mind/overview.md', 1, 1, 1),
-             (2, 'projects/alpha.md', 3, 1, 1),
-             (3, 'knowledge/rust.md', 4, 1, 1),
-             (4, 'knowledge/isolated.md', 4, 1, 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blocks(cite, doc_id, start_line, end_line, text, ctx, chain, hash, embedding_text, embedding_hash)
-             VALUES ('r1-a', 1, 1, 1, 'overview', '', '', 'a', 'overview', 'payload-a'),
-                    ('r3-b', 2, 1, 1, 'alpha', '', '', 'b', 'alpha', 'payload-b')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO links(from_doc, to_doc) VALUES (1, 2), (2, 3)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO doc_links(doc_id, target) VALUES
-             (1, 'alpha'), (2, 'rust'), (3, 'missing')",
-            [],
-        )
-        .unwrap();
-        conn
-    }
-
-    #[test]
-    fn focus_resolves_a_doc_and_walks_its_curated_neighborhood() {
-        let graph = build(&graph_db(), Some("alpha"), 3).unwrap();
-        assert!(graph.focus_matched);
-        assert_eq!(graph.resolved_focus.as_deref(), Some("projects/alpha.md"));
-        assert_eq!(graph.nodes.len(), 3);
-        assert!(graph.nodes[0].focused);
-        assert_eq!(graph.edges.len(), 2);
-        assert_eq!(graph.unresolved_references, 1);
-    }
-
-    #[test]
-    fn slice_filter_removes_hidden_nodes_and_incident_edges() {
-        let graph = build_matching(&graph_db(), None, 20, |path| path.starts_with("knowledge/"))
-            .unwrap();
-        assert_eq!(graph.total_nodes, 2);
-        assert!(graph.edges.is_empty());
-        assert!(graph.nodes.iter().all(|node| node.path.starts_with("knowledge/")));
-    }
-
-    #[test]
-    fn missing_focus_is_truthful_and_falls_back_to_ranked_overview() {
-        let graph = build(&graph_db(), Some("absent"), 2).unwrap();
-        assert!(!graph.focus_matched);
-        assert!(graph.resolved_focus.is_none());
-        assert_eq!(graph.nodes.len(), 2);
-    }
-
-    #[test]
-    fn ambiguous_note_name_is_reported_instead_of_guessed() {
-        let conn = graph_db();
-        conn.execute(
-            "INSERT INTO docs(id, path, ring, mtime, size) VALUES
-             (5, 'projects/other/alpha.md', 2, 1, 1)",
-            [],
-        )
-        .unwrap();
-
-        let graph = build(&conn, Some("alpha"), 3).unwrap();
-
-        assert!(!graph.focus_matched);
-        assert!(graph.resolved_focus.is_none());
-        assert_eq!(
-            graph.ambiguous_focus,
-            vec!["projects/alpha.md", "projects/other/alpha.md"]
-        );
-        assert!(!graph.nodes.iter().any(|node| node.focused));
-    }
-
-    #[test]
-    fn repeated_links_are_edges_not_false_unresolved_references() {
-        let conn = graph_db();
-        conn.execute("INSERT INTO links(from_doc, to_doc) VALUES (1, 2)", [])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO doc_links(doc_id, target) VALUES (1, 'alpha')",
-            [],
-        )
-        .unwrap();
-
-        let graph = build(&conn, None, 20).unwrap();
-
-        assert_eq!(graph.total_edges, 2);
-        assert_eq!(graph.unresolved_references, 1);
-    }
-}
+mod tests;

@@ -8,6 +8,17 @@ variables:
   CI_TOOL_ARCHIVE: {default: ""}
   CI_TOOL_SHA256: {default: ""}
   CHECKS: {default: catalog}
+  CFETCH_TEST_LOCAL_MODEL: {default: ""}
+  CFETCH_LOCAL_RELEASE_OUTPUT: {default: ""}
+  CFETCH_NIX_OUTPUT: {default: ""}
+  CFETCH_RELEASE_INPUTS_OUTPUT: {default: ""}
+  CFETCH_PUBLISHER_ARCHIVE: {default: ""}
+  CFETCH_PUBLISHER_SHA256: {default: ""}
+  CFETCH_LOCAL_MODEL_SOURCE: {default: ""}
+  CFETCH_LOCAL_MODEL_OUTPUT: {default: ""}
+  CFETCH_LOCAL_MODEL_REFERENCE: {default: ""}
+  CFETCH_MODEL_BUILD_LIBRARIES: {default: ""}
+  CFETCH_PIP_BOOTSTRAP: {default: ""}
   CFETCH_POLICY_PYTHON: {default: python3}
   CFETCH_FOUNDATION_BUNDLE: {default: ""}
   CFETCH_FOUNDATION_OUTPUT: {default: ""}

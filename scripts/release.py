@@ -23,10 +23,11 @@ import urllib.request
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-REPOSITORY = "corbet-labs/cfetch"
-PUBLISHER_REVISION = "00daadaeaa757320178715cac4e66ed388421f7e"
+REPOSITORY = "corbet-libs/cfetch"
+PUBLISHER_REVISION = "33600b394910c643c5a6af6dff479fb16418428a"
 TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "CARGO_REGISTRY_TOKEN", "NPM_TOKEN", "JSR_TOKEN", "PYPI_TOKEN", "PACKAGES_TOKEN")
-METADATA = {"LICENSE.md": "LICENSE.md", "THIRD-PARTY-LICENSES.txt": "THIRD-PARTY-LICENSES.txt",
+METADATA = {"onnxruntime-LICENSE.txt": "release/onnxruntime-LICENSE.txt",
+            "onnxruntime-NOTICES.txt": "release/onnxruntime-NOTICES.txt", "LICENSE.md": "LICENSE.md", "THIRD-PARTY-LICENSES.txt": "THIRD-PARTY-LICENSES.txt",
             "variants.json": "release/variants.json", "inference-backends.json": "release/inference-backends.json"}
 MAX_FILE = 2 * 1024**3
 MAX_TOTAL = 12 * 1024**3
@@ -343,8 +344,9 @@ def prepare(directory, selected):
 
 def publisher():
     """Use the existing audited Cargo/immutable-intent protocol, without compiling it."""
-    path = os.environ.get("CI_TOOL_ARCHIVE", "")
-    require(path and sha(path) == os.environ.get("CI_TOOL_SHA256"), "Supply the verified ccid tool archive and checksum")
+    path = os.environ.get("CFETCH_PUBLISHER_ARCHIVE") or os.environ.get("CI_TOOL_ARCHIVE", "")
+    digest = os.environ.get("CFETCH_PUBLISHER_SHA256") if os.environ.get("CFETCH_PUBLISHER_ARCHIVE") else os.environ.get("CI_TOOL_SHA256")
+    require(path and sha(path) == digest, "Supply the verified ccid publisher archive and checksum")
     with tarfile.open(path) as archive:
         require(archive.pax_headers.get("comment", "").strip() == PUBLISHER_REVISION, "Publisher source revision mismatch")
         member = archive.getmember("adapters/registry_publish.py")

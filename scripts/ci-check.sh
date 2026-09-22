@@ -30,6 +30,10 @@ for check in "$@"; do
       cargo test --locked --bin cfetch import::tests
       cargo test --locked --bin cfetch index::tests
       ;;
+    memory)
+      rustc --version
+      cargo test --locked --features embedded-embeddings --bin cfetch
+      ;;
     rust)
       version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
       case "$version" in
