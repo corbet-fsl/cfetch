@@ -83,9 +83,24 @@ def durable(path, value):
 
 
 def command(args, *, env=None, capture=False):
-    return subprocess.run(args, cwd=ROOT, env=env, check=True, text=True,
-                          stdout=subprocess.PIPE if capture else None,
-                          stderr=subprocess.PIPE if capture else None).stdout
+    if args[0] == "bash" and os.name == "nt":
+        # Python's native process lookup can select the WSL launcher. These
+        # repository scripts need the Git installation's native MSYS shell.
+        git = shutil.which("git")
+        shells = [parent / "bin/bash.exe" for parent in Path(git).resolve().parents] if git else []
+        shell = next((path for path in shells if path.is_file()), None)
+        require(shell is not None, "Git Bash must be installed for native Windows release checks")
+        args = [str(shell), *args[1:]]
+    try:
+        return subprocess.run(args, cwd=ROOT, env=env, check=True, text=True,
+                              stdout=subprocess.PIPE if capture else None,
+                              stderr=subprocess.PIPE if capture else None).stdout
+    except subprocess.CalledProcessError as error:
+        if capture:
+            diagnostic = error.stderr or error.stdout
+            if diagnostic:
+                print(diagnostic[-16384:], file=sys.stderr, end="")
+        raise
 
 
 def no_credentials():
@@ -204,7 +219,7 @@ def matrix(files):
         directory = Path(temporary)
         (directory / "variants.json").write_bytes(files["release/variants.json"])
         (directory / "registry.json").write_bytes(files["release/inference-backends.json"])
-        return json.loads(command(["bash", "scripts/variant-matrix.sh", "--release", str(directory / "variants.json"), str(directory / "registry.json")],
+        return json.loads(command(["bash", "scripts/variant-matrix.sh", "--release", (directory / "variants.json").as_posix(), (directory / "registry.json").as_posix()],
                                   env={key: value for key, value in os.environ.items() if key not in TOKENS}, capture=True))["include"]
 
 
