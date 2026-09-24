@@ -1,11 +1,10 @@
 //! Canonical request/response core for the package-local native adapter.
 //!
-//! This is staged integration, not an admitted producer. There is deliberately
-//! no HTTP/CLI entrypoint: the native package/runtime-closure loader must be
-//! ported before `from_installation` can construct a service. Test fixtures
-//! cannot enter a production build. The wire contract and profile stay fixed.
+//! The final client validates compiled admission; the separately built sibling
+//! revalidates the private parent permit and complete native package closure.
+//! Fixture constructors remain test-only. The shared vector profile is fixed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -97,6 +96,7 @@ struct PreparedInput {
 struct Scope {
     id: String,
     execution: serde_json::Value,
+    actual_host: serde_json::Value,
     identity: Identity,
     compile: Operation,
     signer: ed25519_dalek::SigningKey,
@@ -137,6 +137,7 @@ impl Scope {
         .validate()
     }
 
+    #[cfg(test)]
     fn validate_admission(&self) -> anyhow::Result<()> {
         self.validate_shape()?;
         let key: String = self
@@ -153,14 +154,14 @@ impl Scope {
 /// A confirmed controlled failure affects one scope. Every uncertain outcome
 /// latches this entire service, including CPU, until explicit recovery.
 #[derive(Debug)]
-enum Failure {
+pub(crate) enum Failure {
     Rejected(String),
     ScopeUnavailable(String),
     HardStop(anyhow::Error),
 }
 
 impl Failure {
-    fn wire_error(&self) -> (u16, serde_json::Value) {
+    pub(crate) fn wire_error(&self) -> (u16, serde_json::Value) {
         match self {
             Self::ScopeUnavailable(scope) => (
                 503,
@@ -169,12 +170,7 @@ impl Failure {
                     "message": "requested admitted scope could not initialize or execute"
                 }}),
             ),
-            Self::Rejected(message) => (
-                400,
-                json!({"error": {
-                    "code": "invalid_request", "message": message
-                }}),
-            ),
+            Self::Rejected(message) => (400, json!({"error": message})),
             Self::HardStop(_) => (
                 500,
                 json!({"error": {
@@ -185,13 +181,58 @@ impl Failure {
     }
 }
 
-struct SignedReply {
-    body: Vec<u8>,
-    signature: String,
+pub(crate) struct SignedReply {
+    pub(crate) body: Vec<u8>,
+    pub(crate) signature: String,
+}
+
+struct NativeEmbedding {
+    vector: Vec<f32>,
+    execution_devices: Vec<String>,
+    execution_properties: BTreeMap<String, String>,
+}
+
+impl NativeEmbedding {
+    fn bucket_evidence(&self, scope: &Scope, bucket: usize) -> anyhow::Result<serde_json::Value> {
+        // These are the completed worker's observations, not a projection of
+        // required properties. Recheck at this boundary before signing them.
+        ensure!(
+            self.execution_devices == scope.identity.execution.devices
+                && self.execution_properties == scope.identity.execution.properties,
+            "completed worker placement differs from the scope binding"
+        );
+        let mut properties = serde_json::Map::new();
+        for (name, value) in &self.execution_properties {
+            let typed = if name.starts_with("NPU_") {
+                let parsed: serde_json::Value = serde_json::from_str(value)?;
+                ensure!(
+                    parsed.is_i64() || parsed.is_u64(),
+                    "native NPU version is not an integer"
+                );
+                parsed
+            } else {
+                serde_json::Value::String(value.clone())
+            };
+            properties.insert(name.clone(), typed);
+        }
+        Ok(
+            json!({"bucket":bucket,"requested_device":match scope.identity.device {
+            crate::inference_governor::Device::Npu => "NPU",
+            crate::inference_governor::Device::Gpu => "GPU",
+            crate::inference_governor::Device::Cpu => "CPU"},
+            "execution_devices":self.execution_devices,
+            "execution_devices_source":"compiled_model.get_property(EXECUTION_DEVICES)",
+            "device_properties":properties,"device_properties_source":"core.get_property"}),
+        )
+    }
 }
 
 trait Engine {
-    fn embed(&mut self, scope: &Scope, input: &PreparedInput) -> Result<Vec<f32>, NativeFailure>;
+    fn embed(
+        &mut self,
+        scope: &Scope,
+        input: &PreparedInput,
+    ) -> Result<NativeEmbedding, NativeFailure>;
     fn preferred_bucket(&self, _scope: &Scope) -> Option<usize> {
         None
     }
@@ -326,7 +367,11 @@ impl<F: WorkerFactory> Engine for NativeEngine<F> {
         Ok(())
     }
 
-    fn embed(&mut self, scope: &Scope, input: &PreparedInput) -> Result<Vec<f32>, NativeFailure> {
+    fn embed(
+        &mut self,
+        scope: &Scope,
+        input: &PreparedInput,
+    ) -> Result<NativeEmbedding, NativeFailure> {
         scope.validate_shape().map_err(NativeFailure::HardStop)?;
         let response = self.worker(scope, input.bucket)?.execute(&Self::command(
             scope,
@@ -336,10 +381,14 @@ impl<F: WorkerFactory> Engine for NativeEngine<F> {
                 token_type_ids: None,
             },
         ))?;
-        response
-            .output
-            .context("native worker omitted its vector")
-            .map_err(NativeFailure::HardStop)
+        Ok(NativeEmbedding {
+            vector: response
+                .output
+                .context("native worker omitted its vector")
+                .map_err(NativeFailure::HardStop)?,
+            execution_devices: response.execution_devices,
+            execution_properties: response.execution_properties,
+        })
     }
 }
 
@@ -351,15 +400,95 @@ struct ServingCore<T: TextTokenizer, E: Engine> {
     stopped: bool,
 }
 
-impl ServingCore<PinnedTokenizer, NativeEngine<GovernedFactory>> {
-    fn from_installation() -> anyhow::Result<Self> {
-        // This check cannot be replaced by a manifest's own claim of admission.
-        crate::local_inference::selected_local_package_plan()?
-            .context("no admitted package-local native producer in this release")?;
-        anyhow::bail!(
-            "native package/runtime closure verification and serving transport are not installed"
-        )
+pub(crate) struct NativeService {
+    core: ServingCore<PinnedTokenizer, NativeEngine<GovernedFactory>>,
+    request_budget: std::time::Duration,
+}
+
+impl NativeService {
+    pub(crate) fn from_startup(permit: &crate::native_http::StartupPermit) -> anyhow::Result<Self> {
+        Self::from_verified(crate::native_manifest::from_startup(permit)?)
     }
+    pub(crate) fn from_qualification_startup(
+        permit: &crate::native_http::StartupPermit,
+    ) -> anyhow::Result<Self> {
+        Self::from_verified(crate::native_manifest::from_qualification_startup(permit)?)
+    }
+    fn from_verified(package: crate::native_manifest::VerifiedPackage) -> anyhow::Result<Self> {
+        let tokenizer = PinnedTokenizer::from_bytes(&package.tokenizer)?;
+        let governor = Arc::new(Governor::installed(package.policy_sha256)?);
+        let scopes = package
+            .scopes
+            .into_iter()
+            .map(|scope| Scope {
+                id: scope.id,
+                execution: scope.execution,
+                actual_host: scope.actual_host,
+                identity: scope.identity,
+                compile: scope.compile,
+                signer: scope.signer,
+            })
+            .collect::<Vec<_>>();
+        for scope in &scopes {
+            scope.validate_shape()?;
+        }
+        // Use the existing per-user state owner. Receipts are durable and
+        // content-addressed; they are never removed when a service exits.
+        let evidence = evidence_directory()?;
+        Ok(Self {
+            core: ServingCore {
+                tokenizer,
+                engine: NativeEngine {
+                    factory: GovernedFactory { governor, evidence },
+                    cached: None,
+                },
+                scopes,
+                unavailable: BTreeSet::new(),
+                stopped: false,
+            },
+            request_budget: package.request_budget,
+        })
+    }
+    pub(crate) fn scope_ids(&self) -> Vec<String> {
+        self.core
+            .scopes
+            .iter()
+            .map(|scope| scope.id.clone())
+            .collect()
+    }
+    pub(crate) fn request_budget(&self) -> std::time::Duration {
+        self.request_budget
+    }
+    pub(crate) fn handle(&mut self, body: &[u8], nonce: &[u8; 32]) -> Result<SignedReply, Failure> {
+        self.core.handle(body, nonce)
+    }
+    pub(crate) fn stop(&mut self) -> anyhow::Result<()> {
+        self.core.stopped = true;
+        self.core.engine.stop()
+    }
+}
+
+fn evidence_directory() -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    let owner = crate::paths::state_dir();
+    ensure!(
+        owner.is_absolute() && owner.canonicalize()?.as_os_str() == owner.as_os_str(),
+        "native receipt state owner must already be a canonical directory"
+    );
+    let directory = owner.join("native-inference-receipts");
+    match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => std::fs::File::open(&owner)?.sync_all()?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = std::fs::symlink_metadata(&directory)?;
+    ensure!(
+        metadata.is_dir()
+            && metadata.uid() == rustix::process::geteuid().as_raw()
+            && metadata.mode() & 0o077 == 0,
+        "native receipt directory has unsafe ownership or permissions"
+    );
+    Ok(directory)
 }
 
 impl<T: TextTokenizer, E: Engine> ServingCore<T, E> {
@@ -442,7 +571,7 @@ impl<T: TextTokenizer, E: Engine> ServingCore<T, E> {
                 .find(|bucket| *bucket >= count)
                 .ok_or_else(|| {
                     Failure::Rejected(format!(
-                        "prefixed input contains {count} tokens; truncation is forbidden"
+                        "prefixed input contains {count} tokens; the profile limit is {} and truncation is forbidden", profile::MAX_TOKENS
                     ))
                 })?;
             ids.resize(bucket, 0);
@@ -465,16 +594,28 @@ impl<T: TextTokenizer, E: Engine> ServingCore<T, E> {
             (Some(bucket) != preferred, bucket, *index)
         });
         let mut rows = vec![serde_json::Value::Null; prepared.len()];
+        let mut bucket_results = BTreeMap::new();
         for index in order {
             let input = &prepared[index];
-            let vector = match self.engine.embed(scope, input) {
-                Ok(vector) => vector,
+            let completed = match self.engine.embed(scope, input) {
+                Ok(completed) => completed,
                 Err(NativeFailure::Controlled(_completed)) => {
                     self.unavailable.insert(scope.id.clone());
                     return Err(Failure::ScopeUnavailable(scope.id.clone()));
                 }
                 Err(NativeFailure::HardStop(error)) => return Err(Failure::HardStop(error)),
             };
+            let proof = completed
+                .bucket_evidence(scope, input.bucket)
+                .map_err(Failure::HardStop)?;
+            if let Some(previous) = bucket_results.insert(input.bucket, proof.clone()) {
+                if previous != proof {
+                    return Err(Failure::HardStop(anyhow::anyhow!(
+                        "worker placement changed within a bucket group"
+                    )));
+                }
+            }
+            let vector = completed.vector;
             let norm: f64 = vector.iter().map(|v| f64::from(*v).powi(2)).sum();
             if vector.len() != profile::DIMENSIONS
                 || !vector.iter().all(|v| v.is_finite())
@@ -492,7 +633,10 @@ impl<T: TextTokenizer, E: Engine> ServingCore<T, E> {
             "cfetch_profile_manifest_sha256": profile::PROFILE_MANIFEST_SHA256,
             "cfetch_admission_policy_sha256": profile::ADMISSION_POLICY_SHA256,
             "cfetch_model_revision": profile::MODEL_REVISION,
-            "cfetch_execution": scope.execution, "data": rows
+            "cfetch_execution": scope.execution, "data": rows,
+            "cfetch_runtime_evidence":{"schema_version":1,"provider":"openvino","scope_id":scope.id,
+                "host":scope.actual_host,"host_source":"platform-and-sha256",
+                "bucket_results":bucket_results.into_values().collect::<Vec<_>>()}
         }))
         .map_err(|error| Failure::HardStop(error.into()))?;
         if response.len() > MAX_BODY {
@@ -547,7 +691,9 @@ mod tests {
         Scope {
             id: class.into(),
             signer,
-            execution: json!({"scope_id": class, "transport":"supervised-local", "device_class":class,
+            actual_host: json!({"system":"Linux","machine":"x86_64","kernel_release":"fixture",
+                "files":[{"path":"/fixture/library.so","sha256":"d".repeat(64)}]}),
+            execution: json!({"package_state":"release","scope_id": class, "transport":"supervised-local", "device_class":class,
                 "backend":"openvino", "runtime":"fixture-runtime", "compiler":"fixture-compiler",
                 "package_target":"linux-x86_64", "artifact_source":"fixture", "device":class,
                 "artifact_sha256":"a".repeat(64), "internal_precision":"fp32",
@@ -564,12 +710,21 @@ mod tests {
                 output_name: "embedding".into(),
                 pooling: Pooling::SentenceL2,
                 dimensions: profile::DIMENSIONS,
+                execution: crate::native_worker::fixture_execution(device),
             },
             compile: Operation::Compile {
                 model_path: "/fixture/model.xml".into(),
                 weights_path: Some("/fixture/model.bin".into()),
                 runtime_library_path: "/fixture/runtime.so".into(),
                 runtime_library_sha256: "c".repeat(64),
+                plugin_library_path: "/fixture/plugin.so".into(),
+                plugin_library_sha256: "d".repeat(64),
+                closure: crate::native_worker::fixture_closure(&[
+                    ("/fixture/model.xml", &"a".repeat(64)),
+                    ("/fixture/model.bin", &"b".repeat(64)),
+                    ("/fixture/runtime.so", &"c".repeat(64)),
+                    ("/fixture/plugin.so", &"d".repeat(64)),
+                ]),
                 bucket: 32,
                 precision: Precision::F32,
                 threads: 1,
@@ -598,6 +753,7 @@ mod tests {
         calls: Vec<RecordedCall>,
         failures: std::collections::VecDeque<NativeFailure>,
         output: Option<Vec<f32>>,
+        wrong_placement: bool,
         stops: usize,
     }
     impl Engine for FixtureEngine {
@@ -609,7 +765,7 @@ mod tests {
             &mut self,
             scope: &Scope,
             input: &PreparedInput,
-        ) -> Result<Vec<f32>, NativeFailure> {
+        ) -> Result<NativeEmbedding, NativeFailure> {
             self.calls.push((
                 scope.id.clone(),
                 input.bucket,
@@ -619,7 +775,15 @@ mod tests {
             if let Some(error) = self.failures.pop_front() {
                 return Err(error);
             }
-            Ok(self.output.clone().unwrap_or_else(vector))
+            Ok(NativeEmbedding {
+                vector: self.output.clone().unwrap_or_else(vector),
+                execution_devices: if self.wrong_placement {
+                    vec!["OTHER.0".into()]
+                } else {
+                    scope.identity.execution.devices.clone()
+                },
+                execution_properties: scope.identity.execution.properties.clone(),
+            })
         }
     }
     fn service(engine: FixtureEngine) -> ServingCore<FixtureTokenizer, FixtureEngine> {
@@ -697,6 +861,106 @@ mod tests {
                 &changed
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn signed_runtime_evidence_uses_validated_worker_observations_in_bucket_order() {
+        let mut core = service(FixtureEngine::default());
+        let reply = core
+            .handle(
+                &body("npu", &[&"x".repeat(65), "short", &"z".repeat(65)]),
+                &[0; 32],
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let proof = &value["cfetch_runtime_evidence"];
+        assert_eq!(proof["host"], core.scopes[0].actual_host);
+        assert_eq!(
+            proof["bucket_results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["bucket"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![32, 128]
+        );
+        let actual = &proof["bucket_results"][0]["device_properties"];
+        assert!(actual["NPU_COMPILER_VERSION"].is_number());
+        assert_eq!(
+            actual["FULL_DEVICE_NAME"],
+            core.scopes[0].identity.execution.properties["FULL_DEVICE_NAME"]
+        );
+        let mut wrong = service(FixtureEngine {
+            wrong_placement: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            wrong.handle(&body("npu", &["text"]), &[0; 32]),
+            Err(Failure::HardStop(_))
+        ));
+        assert!(matches!(
+            wrong.handle(&body("cpu", &["text"]), &[0; 32]),
+            Err(Failure::HardStop(_))
+        ));
+        assert_eq!(wrong.engine.calls.len(), 1);
+    }
+
+    #[test]
+    fn signed_qualification_state_cannot_enter_normal_client_admission() {
+        for state in ["physical-probe", "candidate"] {
+            let mut core = service(FixtureEngine::default());
+            core.scopes[2].execution["package_state"] = json!(state);
+            let request = body("cpu", &["text"]);
+            let reply = core.handle(&request, &[9; 32]).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(value["cfetch_execution"]["package_state"], state);
+            let key = core.scopes[2]
+                .signer
+                .verifying_key()
+                .as_bytes()
+                .iter()
+                .map(|v| format!("{v:02x}"))
+                .collect::<String>();
+            crate::embed::verify_execution_signature(
+                &key,
+                &reply.signature,
+                &[9; 32],
+                &request,
+                &reply.body,
+            )
+            .unwrap();
+            let error = crate::embed::validate_native_serving_scope(
+                &value["cfetch_execution"],
+                "cpu",
+                &key,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("qualification output is forbidden"),
+                "{error:#}"
+            );
+        }
+        let canonical = scope(Device::Cpu);
+        let key = canonical
+            .signer
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect::<String>();
+        let error = crate::embed::validate_native_serving_scope(&canonical.execution, "cpu", &key)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not an admitted backend"),
+            "release must pass lifecycle: {error:#}"
+        );
+        let mut missing = canonical.execution.clone();
+        missing.as_object_mut().unwrap().remove("package_state");
+        let error = crate::embed::validate_native_serving_scope(&missing, "cpu", &key).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("qualification output is forbidden"),
+            "{error:#}"
         );
     }
 
@@ -867,7 +1131,11 @@ mod tests {
 
     #[test]
     fn production_constructor_and_scope_admission_remain_closed() {
-        assert!(ServingCore::from_installation().is_err());
+        assert!(
+            crate::local_inference::selected_local_package_plan()
+                .unwrap()
+                .is_none()
+        );
         let mut canonical = scope(Device::Cpu);
         assert!(
             canonical.validate_admission().is_err(),
@@ -902,7 +1170,8 @@ mod tests {
                 request_sha256: "f".repeat(64),
                 identity: Some(command.identity.clone()),
                 runtime_build: Some(command.identity.runtime_build.clone()),
-                execution_devices: vec!["CPU".into()],
+                execution_devices: command.identity.execution.devices.clone(),
+                execution_properties: command.identity.execution.properties.clone(),
                 output: match &command.operation {
                     Operation::Compile { .. } => None,
                     Operation::Infer { input_ids, .. } => {
