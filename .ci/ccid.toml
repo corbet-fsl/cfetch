@@ -78,3 +78,23 @@ commands = [["bash", "scripts/ci-release-inputs.sh"]]
 [checks.embedding-candidates]
 kind = "commands"
 commands = [["bash", "scripts/ci-candidates.sh"]]
+
+[checks.native-governor]
+kind = "commands"
+commands = [["bash", "scripts/ci-check.sh", "native-governor"]]
+
+[checks.native-worker]
+kind = "commands"
+commands = [["bash", "scripts/ci-check.sh", "native-worker"]]
+
+[checks.admission-origin]
+kind = "commands"
+commands = [["bash", "scripts/ci-check.sh", "admission-origin"]]
+
+[checks.freshness]
+kind = "commands"
+commands = [["bash", "scripts/ci-check.sh", "freshness"]]
+
+[checks.hook-deadline]
+kind = "commands"
+commands = [["bash", "scripts/ci-check.sh", "hook-deadline"]]

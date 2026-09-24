@@ -84,6 +84,52 @@ for check in "$@"; do
       fi
       "$python_bin" experiments/npu-ort-foundation/run_cached_cpu.py
       ;;
+    hook-deadline)
+      cargo test --locked --bin cfetch runtime_status::tests
+      cargo test --locked --bin cfetch hooks::tests
+      cargo test --locked --bin cfetch daemon::tests
+      cargo test --locked --test hook_deadline
+      cargo test --locked --test freshness_cli
+      cargo clippy --locked --bin cfetch -- -D warnings
+      ;;
+    freshness)
+      cargo test --locked --bin cfetch serve::tests
+      cargo test --locked --bin cfetch daemon::tests
+      cargo test --locked --bin cfetch mcp::tests
+      cargo test --locked --test freshness_cli
+      cargo check --locked --features embedded-embeddings --test local_memory
+      cargo test --locked --test coherence
+      cargo test --locked --test mcp_stdio
+      cargo clippy --locked --bin cfetch -- -D warnings
+      ;;
+    native-worker)
+      rustc --version
+      cargo test --locked --features native-openvino --bin cfetch inference_governor::tests
+      cargo test --locked --features native-openvino --bin cfetch native_worker::tests
+      cargo test --locked --features native-openvino --bin cfetch native_adapter::tests
+      cargo test --locked --features native-openvino --bin cfetch native_serving::tests
+      cargo test --locked --features native-openvino --test native_worker_cli
+      cargo clippy --locked --features native-openvino --bin cfetch -- -D warnings
+      ;;
+    native-governor)
+      rustc --version
+      cargo test --locked --bin cfetch inference_governor::tests
+      cargo test --locked --bin cfetch local_adapter::tests
+      cargo clippy --locked --bin cfetch -- -D warnings
+      ;;
+    admission-origin)
+      export PYTHONDONTWRITEBYTECODE=1
+      cargo test --locked --bin cfetch local_inference::tests
+      cargo test --locked --bin cfetch embedding_profile::tests
+      "$python_bin" -m unittest -v scripts.test_stage_local_inference scripts.test_apply_admission_activation
+      "$python_bin" -m unittest -v packages.openvino.tests.test_manifest
+      (
+        cd experiments/embedding-profile
+        "$python_bin" -m unittest -v test_admission_origin
+        "$python_bin" cross_backend_eval.py --verify-implementation-bundle
+        "$python_bin" cross_backend_eval.py --verify-release-registry
+      )
+      ;;
     governor)
       # Native deadline and persisted load policy; no model/runtime dependency.
       "$python_bin" -m unittest -v \

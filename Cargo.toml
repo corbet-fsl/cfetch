@@ -17,6 +17,7 @@ include = [
   "/Cargo.lock",
   "/README.md",
   "/docs/local-inference.md",
+  "/docs/native-inference-qualification.md",
   "/docs/local-embedding-adapter.md",
   "/docs/ai-maintenance.md",
   "/docs/embedding-profile-v1.md",
@@ -80,9 +81,18 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # counterpart (FILE_SHARE_NONE opens, %COMPUTERNAME%), so the dependency
 # simply does not exist in a Windows build.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs", "system", "process"] }
+rustix = { version = "1", features = ["fs", "system", "process", "time", "stdio", "net"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Vendor native implementation stays behind the official safe Rust API.
+openvino = { version = "=0.11.0", optional = true, features = ["runtime-linking"] }
+# The canonical adapter uses the already locked tokenizer implementation.
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
+# Safe explicit-library loader; no ambient runtime discovery in qualified probes.
+openvino-sys = { version = "=0.11.0", optional = true, features = ["runtime-linking"] }
 
 [features]
+native-openvino = ["dep:openvino", "dep:openvino-sys", "dep:tokenizers"]
 # Experimental standalone Nomic model probe. Enabling it adds diagnostic
 # download/status/test commands, never a producer for cfetch's shared vectors.
 embedded-embeddings = ["fastembed"]
