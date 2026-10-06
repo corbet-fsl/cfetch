@@ -20,7 +20,11 @@ def selected_checks(value, config):
     if not selected or any(not part or part not in PUBLIC_CHECKS for part in selected) or len(set(selected)) != len(selected):
         raise ValueError("Select unique public checks; hardware/runtime bundle selectors require Crow")
     for check in selected:
-        if config["checks"].get(check) != {"kind": "commands", "commands": [["bash", "scripts/ci-check.sh", check]]}:
+        entry = config["checks"].get(check)
+        # Cache fingerprint keys (cache_tools/cache_env/cache_outputs) are execution
+        # metadata for result reuse; selection validity rests on the exact command.
+        if (not isinstance(entry, dict) or entry.get("kind") != "commands"
+                or entry.get("commands") != [["bash", "scripts/ci-check.sh", check]]):
             raise ValueError("Hosted command differs from the declared Crow check")
     return selected
 

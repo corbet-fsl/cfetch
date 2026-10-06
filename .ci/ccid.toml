@@ -3,98 +3,155 @@ project = "cfetch"
 
 [checks.ci-config]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "ci-config"]]
 
 # Profile dependencies must already exist. Native accelerator and macOS/Windows qualification remain explicit separate gates.
 
 [checks.catalog]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "catalog"]]
 
 [checks.rust]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "rust"]]
 
 [checks.memory]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "memory"]]
 
 [checks.variants]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "variants"]]
 
 [checks.licenses]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "licenses"]]
 
 [checks.profile]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "profile"]]
 
 [checks.governor]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "governor"]]
 
 [checks.ort-foundation-cpu]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "ort-foundation-cpu"]]
 
 [checks.ort-foundation-build]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "ort-foundation-build"]]
 
 [checks.release-guards]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "release-guards"]]
 
 [checks.release]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["python3", "scripts/release.py"]]
 
 [checks.maintenance]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["python3", "scripts/release_maintenance.py"]]
 
 [checks.staging]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "staging"]]
 
 [checks.local-model]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-local-model.sh"]]
 
 [checks.local-release]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-local-release.sh"]]
 
 [checks.nix]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-nix.sh"]]
 
 [checks.release-inputs]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-release-inputs.sh"]]
 
 [checks.embedding-candidates]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-candidates.sh"]]
 
 [checks.native-governor]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "native-governor"]]
 
 [checks.native-worker]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "native-worker"]]
 
 [checks.admission-origin]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "admission-origin"]]
 
 [checks.freshness]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "freshness"]]
 
 [checks.hook-deadline]
 kind = "commands"
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["python3", "--version"], ["jq", "--version"], ["shellcheck", "--version"], ["actionlint", "-version"], ["cargo-deny", "--version"], ["cargo-about", "--version"]]
+cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "hook-deadline"]]
+
+[render]
+tool_revision = "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58"
+
+[jobs.verify]
+scheduler = "crow"
+checks = ["ci-config", "catalog", "rust", "memory", "variants", "licenses", "profile", "governor", "release-guards", "staging", "admission-origin", "freshness", "hook-deadline"]
+workflow = "repository-jobs"
+command = ["bash", ".ci/run-cached.sh"]

@@ -36,6 +36,12 @@ class HostedSelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             hosted.selected_checks("rust", config)
 
+    def test_accepts_cache_fingerprint_keys_without_changing_command(self):
+        config = self.config()
+        config["checks"]["catalog"]["cache_tools"] = [["rustc", "-vV"]]
+        config["checks"]["catalog"]["cache_env"] = ["CFETCH_POLICY_FINGERPRINT"]
+        self.assertEqual(hosted.selected_checks("catalog", config), ["catalog"])
+
     def test_model_free_checks_do_not_request_rust_or_policy_installs(self):
         self.assertEqual(hosted.flags(["catalog", "governor"]),
                          {"rust": False, "profile": False, "licenses": False, "ci_config": False})

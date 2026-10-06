@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "generator": "ccid render v1",
+  "tool_revision": "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58",
+  "manifest_sha256": "aee7b362e116040a8dbc59df21cee94c52e32a0773072b2edf10de1b2f3335e2",
+  "jobs": {
+    "verify": {
+      "job": "verify",
+      "scheduler": "crow",
+      "checks": [
+        "ci-config",
+        "catalog",
+        "rust",
+        "memory",
+        "variants",
+        "licenses",
+        "profile",
+        "governor",
+        "release-guards",
+        "staging",
+        "admission-origin",
+        "freshness",
+        "hook-deadline"
+      ],
+      "workflow": "repository-jobs",
+      "command": [
+        "bash",
+        ".ci/run-cached.sh"
+      ]
+    }
+  }
+}
