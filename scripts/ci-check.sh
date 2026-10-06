@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Provider-independent checks; run on a build worker with existing tools.
 set -euo pipefail
+exec 2>&1
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
 export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
@@ -20,7 +21,9 @@ for check in "$@"; do
       ;;
     catalog)
       bash scripts/check-packaging-variants.sh
+      echo 'catalog: variant-matrix validation'
       bash scripts/variant-matrix.sh >/dev/null
+      echo 'catalog: python unit gates'
       "$python_bin" -m unittest -v scripts.test_stage_local_inference scripts.test_variant_matrix scripts.test_ci_variants scripts.test_release.ReleaseTests.test_native_host_spellings
       ;;
     staging)
