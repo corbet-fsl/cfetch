@@ -1,7 +1,7 @@
 {
   "date": "2026-09-09",
   "scope": "One CPU-only diagnostic call; no physical accelerator qualification",
-  "source_commit": "73d8dcb3e8b9e7ccaf4697327678026d9495c97d",
+  "source_commit": "bdac2dc7ce9ed90f254537b99d39684cc692155c",
   "model": {
     "builtin": "EmbeddingGemma300M",
     "repository": "onnx-community/embeddinggemma-300m-ONNX",

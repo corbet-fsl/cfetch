@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "purpose": "CPU FastEmbed ORT placement and retained-reference comparison",
-  "source_commit": "d626627c25c5c862013ce8ef322ba81fa560a57c",
+  "source_commit": "800edfffe8d8f45a01d3445f69afbafaf213a49e",
   "admission": "not-evaluated",
   "accelerator_qualified": false,
   "binary_sha256": "db57a144c66bf5805131686718eb9612d9bf58337c3fcdb692560a4f29e95a75",
