@@ -45,8 +45,8 @@ ranking only cares about the margin, which widens by 55%. On the live corpus
 the effect was not subtle: for "what stops one machine from showing me an
 answer that is already out of date", the unprefixed top-3 was unrelated
 (a project note, a backup skill, a reimage log); the prefixed top-3 was the
-memory about deleting stale claims and AGENT.md's own "stale memories
-mislead". Fixed by `embeddings.query_prefix`, which applies to queries and to
+memory about deleting stale claims and the top-level instructions' own
+"stale memories mislead". Fixed by `embeddings.query_prefix`, which applies to queries and to
 nothing else — a document-side prefix would change every stored vector and so
 would have to join the artifact identity first.
 
@@ -60,9 +60,9 @@ the silent default.
 **Reranking earns its cost.** For "why must I never force a virtual machine
 off", lexical returned a guest-agent note about Windows shutdown times, a bare
 "## Virtual Machines" heading, and a page about the box never suspending. The
-same candidates through the cross-encoder returned the server README's
-`NEVER FORCE OFF VMs` hard rule first and AGENT.md's ring-1 statement of the
-same rule second — neither of which lexical had in its top three. The
+same candidates through the cross-encoder returned the corpus's hard rule against
+forcing a virtual machine off first and the top-level instructions' statement of
+the same rule second — neither of which lexical had in its top three. The
 authoritative, highest-privilege statement of the rule was in the candidate
 set all along; only the reranker could see that it was the answer.
 
