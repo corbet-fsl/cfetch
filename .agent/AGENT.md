@@ -1,7 +1,7 @@
 # cfetch — agent knowledge
 
-- The governing documents live in the operator's private knowledge tree under
-  `todo/active/cfetch/`: **PRD.md** (product requirements — wins on conflict),
+- The governing documents (kept outside this repository):
+  **PRD.md** (product requirements — wins on conflict),
   **VOCAB.md** (canonical terms — use these words, not synonyms), DESIGN.md
   (mechanism dossiers + decision history) and STATUS.md (current state).
   Read PRD + VOCAB before implementing anything.
