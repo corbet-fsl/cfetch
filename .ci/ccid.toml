@@ -148,8 +148,8 @@ cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "hook-deadline"]]
 
 [render]
-tool_revision = "44960243c4e694d637574d5947110db267353ddd"
-tool_sha256 = "3e0554f67163b06727eba831f6241a0433c46d5fc1f99460eddebc598fa45001"
+tool_revision = "65f4969b57e8e581e4bc7c08016e80288e50d756"
+tool_sha256 = "67d81d2876ff3172b11b8c09676b89943fd5721c41f46ec6220d499c6d1e64ee"
 
 [jobs.verify]
 scheduler = "forgejo"

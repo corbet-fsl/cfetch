@@ -29,13 +29,15 @@ jobs:
           git init --quiet .
           git remote remove origin 2>/dev/null || true
           git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
-          git -c "http.extraHeader=Authorization: token $CCID_FORGE_TOKEN" fetch --quiet --depth 1 origin "${{ github.sha }}"
+          fetch() { git -c "http.extraHeader=Authorization: token $CCID_FORGE_TOKEN" fetch --quiet --depth 1 origin "${{ github.sha }}"; }
+          # A runner may route the fetch to a local copy of the repository (its own git configuration); that copy can lag the push by seconds. Then ask the forge itself.
+          fetch || { echo "local copy lacks ${{ github.sha }}, fetching from the forge" >&2; GIT_CONFIG_COUNT=0 fetch; }
           git checkout --quiet --force --detach FETCH_HEAD
           git clean --quiet -ffdx
       - name: Run the declared checks
         env:
-          CCID_REVISION: 44960243c4e694d637574d5947110db267353ddd
-          CCID_TOOL_SHA256: 3e0554f67163b06727eba831f6241a0433c46d5fc1f99460eddebc598fa45001
+          CCID_REVISION: 65f4969b57e8e581e4bc7c08016e80288e50d756
+          CCID_TOOL_SHA256: 67d81d2876ff3172b11b8c09676b89943fd5721c41f46ec6220d499c6d1e64ee
         run: |
           set -eu
           : "${CCID_TOOL_ROOT:?the runner must provide CCID_TOOL_ROOT}"
