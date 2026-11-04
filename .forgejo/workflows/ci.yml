@@ -34,12 +34,21 @@ jobs:
           git clean --quiet -ffdx
       - name: Run the declared checks
         env:
-          CCID_REVISION: 659469fdbc89b4fb18c31036bd2a54465e481d69
+          CCID_REVISION: 44960243c4e694d637574d5947110db267353ddd
+          CCID_TOOL_SHA256: 3e0554f67163b06727eba831f6241a0433c46d5fc1f99460eddebc598fa45001
         run: |
           set -eu
           : "${CCID_TOOL_ROOT:?the runner must provide CCID_TOOL_ROOT}"
           triple="${CCID_TOOL_TRIPLE:-$(uname -m)-unknown-linux-gnu}"
           tool="$CCID_TOOL_ROOT/ccid/$CCID_REVISION/$triple/ccid"
+          # A runner without the declared tool fetches the pinned release by hash: CCID_TOOL_URL (runner environment) is the package base, the digest comes from the manifest.
+          if [ ! -x "$tool" ] && [ -n "${CCID_TOOL_URL:-}" ] && [ -n "${CCID_TOOL_SHA256:-}" ]; then
+            mkdir -p "$(dirname "$tool")"
+            curl --fail --silent --show-error --location "$CCID_TOOL_URL/$CCID_REVISION/ccid-$triple" --output "$tool.part"
+            echo "$CCID_TOOL_SHA256  $tool.part" | sha256sum --check --strict
+            chmod 0555 "$tool.part"
+            mv "$tool.part" "$tool"
+          fi
           test -x "$tool" || { echo "ccid $CCID_REVISION is not provisioned at $tool" >&2; exit 2; }
           test "$("$tool" source-revision)" = "$CCID_REVISION"
           export CCID_SOURCE_REVISION="${{ github.sha }}"
