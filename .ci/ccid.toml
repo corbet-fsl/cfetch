@@ -148,10 +148,11 @@ cache_env = ["CFETCH_POLICY_FINGERPRINT", "CFETCH_TOOL_FINGERPRINT"]
 commands = [["bash", "scripts/ci-check.sh", "hook-deadline"]]
 
 [render]
-tool_revision = "223adb5a008f4ed1ba36d1f52796ccd29077db6e"
+tool_revision = "659469fdbc89b4fb18c31036bd2a54465e481d69"
 
 [jobs.verify]
-scheduler = "crow"
+scheduler = "forgejo"
+runs_on = "heavy"
 checks = ["ci-config", "catalog", "rust", "memory", "variants", "licenses", "profile", "governor", "release-guards", "staging", "admission-origin", "freshness", "hook-deadline"]
-workflow = "repository-jobs"
+workflow = "ci"
 command = ["bash", ".ci/run-cached.sh"]
