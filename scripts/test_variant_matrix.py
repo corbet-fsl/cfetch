@@ -60,7 +60,7 @@ class VariantMatrixTests(unittest.TestCase):
             "arch": self.local["arch"],
             "package_sha256": digest,
             "package_format": "tar.gz",
-            "package_url": f"https://github.com/corbet-labs/cfetch/releases/download/evidence-v1/{digest}.tar.gz",
+            "package_url": f"https://github.com/corbet-libs/cfetch/releases/download/evidence-v1/{digest}.tar.gz",
             "package_manifest_sha256": "2" * 64,
             "dispatcher": {"binary": "cfetch-inference", "sha256": "3" * 64},
             "ordered_scope_ids": ["scope-npu", "scope-gpu", "scope-cpu"],
