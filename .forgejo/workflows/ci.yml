@@ -36,8 +36,8 @@ jobs:
           git clean --quiet -ffdx
       - name: Run the declared checks
         env:
-          CCID_REVISION: 014fbb6fe06586e1d356472f089d0ffdabbcb11c
-          CCID_TOOL_SHA256: 2a8b3adac14c7e2b4315e6838c1ef599bcad3a483f38486bded73c4937bc60d2
+          CCID_REVISION: bd9aff07073185fb0a3503bab331aedefb6d8fd2
+          CCID_TOOL_SHA256: 38c0eadf2a2adb406f83c7d4892bc01a0a10b95671e1e671358e43a257bb5d23
         run: |
           set -eu
           : "${CCID_TOOL_ROOT:?the runner must provide CCID_TOOL_ROOT}"
@@ -59,3 +59,11 @@ jobs:
           "$tool" render --repo "$PWD" --check
           export CCID_BIN="$tool" CI_COMMIT_SHA="${{ github.sha }}" CI_REPOSITORY_URL="${{ github.server_url }}/${{ github.repository }}" CHECKS='ci-config,catalog,rust,memory,variants,licenses,profile,governor,release-guards,staging,admission-origin,freshness,hook-deadline'
           exec 'bash' '.ci/run-cached.sh'
+      - name: Archive the locked flake inputs
+        run: |
+          set -eu
+          if [ -f flake.lock ] && [ -n "${CCID_FLAKE_ARCHIVE_PUSH:-}" ]; then
+            nix flake archive --json . | jq -r '[.. | .path? // empty] | unique | .[]' | xargs --no-run-if-empty $CCID_FLAKE_ARCHIVE_PUSH
+          else
+            echo "no flake.lock or no archive target on this runner: nothing archived"
+          fi

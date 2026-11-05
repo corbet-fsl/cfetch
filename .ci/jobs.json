@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "generator": "ccid render v1",
-  "tool_revision": "014fbb6fe06586e1d356472f089d0ffdabbcb11c",
-  "manifest_sha256": "0e5e61f874bdcb2f70a9db1f6fe385c61ce10d88d3e090a47963b1923c1d0cb2",
+  "tool_revision": "bd9aff07073185fb0a3503bab331aedefb6d8fd2",
+  "manifest_sha256": "f149bc4866c810428209d1e41018898f469f59b2560fa741cbefe72d4f7ab3d9",
   "jobs": {
     "verify": {
       "job": "verify",
@@ -27,7 +27,8 @@
         "bash",
         ".ci/run-cached.sh"
       ],
-      "runs_on": "heavy"
+      "runs_on": "heavy",
+      "archive_inputs": true
     }
   }
 }
