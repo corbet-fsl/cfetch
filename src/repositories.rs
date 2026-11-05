@@ -99,7 +99,45 @@ struct RepositoryLock {
 
 impl Drop for RepositoryLock {
     fn drop(&mut self) {
+        for name in ["owner", "owner.tmp", "info"] {
+            let _ = std::fs::remove_file(self.path.join(name));
+        }
         let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+/// Start time of this process in clock ticks since boot (field 22 of /proc/self/stat); empty off Linux.
+/// Together with the pid it identifies the process even after the pid is reused.
+fn process_start() -> String {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| {
+            let after = stat.rsplit_once(") ")?.1.to_owned();
+            after.split_whitespace().nth(19).map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+/// The owner record other cooperating writers (brain-commit) use to tell a live lock from a dead one: the
+/// same `key=value` lines, written right after the directory is created. A holder that crashed leaves
+/// a record whose pid is gone or reused, which lets them clear the lock; a lock without a record is never broken.
+fn write_owner(path: &Path) {
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_default();
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = format!(
+        "host={}\npid={}\nstart={}\nepoch={epoch}\ntime={epoch}\n",
+        host.trim(),
+        std::process::id(),
+        process_start(),
+    );
+    let temporary = path.join("owner.tmp");
+    if std::fs::write(&temporary, record).is_ok() {
+        let _ = std::fs::rename(&temporary, path.join("owner"));
     }
 }
 
@@ -111,6 +149,7 @@ fn lock(root: &Path, timeout: Duration) -> anyhow::Result<RepositoryLock> {
     let path = root.join(common.trim()).join("cfetch-repository.lock");
     std::fs::create_dir(&path)
         .with_context(|| format!("repository busy or lock inaccessible: {}", path.display()))?;
+    write_owner(&path);
     Ok(RepositoryLock { path })
 }
 

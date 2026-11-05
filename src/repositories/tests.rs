@@ -175,3 +175,29 @@ fn unavailable_remote_does_not_block_another_repository() {
     assert_eq!(statuses[1].state, "synchronized");
     assert!(f.remote.is_dir());
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_lock_carries_an_owner_record_and_removes_it_with_the_lock() {
+    let root = tempfile::tempdir().unwrap();
+    git_output(root.path(), &["init", "-q"], TIMEOUT).unwrap();
+    let lock_path = root.path().join(".git").join("cfetch-repository.lock");
+    {
+        let held = lock(root.path(), TIMEOUT).unwrap();
+        let owner = std::fs::read_to_string(held.path.join("owner")).unwrap();
+        let field = |name: &str| {
+            owner
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(field("pid"), std::process::id().to_string());
+        assert!(!field("host").is_empty());
+        assert!(field("start").parse::<u64>().is_ok());
+        assert!(field("epoch").parse::<u64>().unwrap() > 1_700_000_000);
+        assert!(lock(root.path(), TIMEOUT).is_err(), "a second holder is refused");
+        assert!(!held.path.join("owner.tmp").exists());
+    }
+    assert!(!lock_path.exists(), "the lock and its record are gone after release");
+}

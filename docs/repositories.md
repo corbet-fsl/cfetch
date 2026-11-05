@@ -28,7 +28,7 @@ Automatic synchronization requires Git with `merge-tree --write-tree` support
 for divergent branches. cfetch never resets, stashes, rebases or force pushes.
 Its atomic lock is `cfetch-repository.lock` in Git's common directory, shared
 across cooperating processes and linked worktrees. A crash may leave that lock;
-inspect for a live writer before removing it. Locks are never stolen by age.
+inspect for a live writer before removing it. Locks are never stolen by age. The lock directory holds an `owner` record (`host`, `pid`, `start` = the process start time in clock ticks, `epoch`) written right after the directory is created and removed with it; cooperating writers (brain-commit) use it to clear a lock whose owner is gone or whose pid was reused, so a crashed synchronizer no longer blocks the repository.
 Other writers should cooperate with this lock or perform their work while the
 synchronizer is paused. Repository state is cached locally in `repositories.json`.
 
