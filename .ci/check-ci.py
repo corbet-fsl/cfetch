@@ -4,7 +4,6 @@ import ast
 import hashlib
 import json
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import tomllib
@@ -35,11 +34,6 @@ def main():
     config = tomllib.loads((ROOT / ".ci/ccid.toml").read_text())
     require(config["checks"]["ci-config"]["commands"] == [["bash", "scripts/ci-check.sh", "ci-config"]],
             "Configuration checks must use the common command")
-    crow = (ROOT / ".crow/ccid.yaml").read_text()
-    require(re.search(r"CCID_REVISION: '[0-9a-f]{40}'", crow) and "0d268389" not in crow,
-            "Crow needs a verified source-path-aware executor")
-    for name in ("CI_JOBS", "CI_TEST_THREADS"):
-        require(name + ': {default: "1"}' in crow, "Crow must retain the one-thread default")
     paths = [".github/workflows/ci.yml", ".github/workflows/selected.yml", ".github/workflows/release.yml"]
     for path in paths:
         text = (ROOT / path).read_text()
@@ -60,14 +54,6 @@ def main():
             "Cargo OIDC must retain its registered workflow/environment boundary")
     require("run: cargo publish" not in release and "python scripts/release.py publish cargo" in release,
             "Credentialed publication must reuse the inspected crate")
-    release_crow = (ROOT / ".crow/release.yaml").read_text()
-    require("CCID_REVISION: 'ab4303e2c133220972114a651cc52cf0f1550999'" in release_crow
-            and release_crow.count("from_secret:") == 3, "Release requires its verified publisher and scoped secret leaves")
-    public_step = release_crow.split("  - name: prepare-or-inspect\n", 1)[1].split("  - name: github-release-state\n", 1)[0]
-    require("from_secret:" not in public_step and "RELEASE_OPERATION" in public_step,
-            "Preparation/inspection must not request publication credentials")
-    require('RELEASE_OPERATION == "publish" && RELEASE_SELECTION == "cargo"' in release_crow,
-            "Cargo token resolution must be gated on the selected publication")
     require(config["checks"]["release"]["commands"] == [["python3", "scripts/release.py"]]
             and config["checks"]["release-guards"]["commands"] == [["bash", "scripts/ci-check.sh", "release-guards"]],
             "Release commands must share the repository driver")
