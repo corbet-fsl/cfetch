@@ -7,6 +7,14 @@ export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
 export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
 python_bin="${CFETCH_POLICY_PYTHON:-python3}"
 
+# Test binaries that link the C++ runtime (onnxruntime in embed_model_cli) must find libstdc++ where the host has no FHS library path (a Nix host): the compiler
+# says where it is. Only the `cargo test` runs get it, never the whole job.
+cxx_runtime() {
+  local lib
+  lib=$(cc -print-file-name=libstdc++.so.6 2>/dev/null || true)
+  if [[ $lib == /* && -e $lib ]]; then LD_LIBRARY_PATH="$(dirname "$lib")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$@"; else "$@"; fi
+}
+
 if (($# == 0)); then
   set -- catalog rust
 fi
@@ -28,14 +36,14 @@ for check in "$@"; do
       ;;
     staging)
       rustc --version
-      cargo test --locked --bin cfetch staging
-      cargo test --locked --bin cfetch init::tests
-      cargo test --locked --bin cfetch import::tests
-      cargo test --locked --bin cfetch index::tests
+      cxx_runtime cargo test --locked --bin cfetch staging
+      cxx_runtime cargo test --locked --bin cfetch init::tests
+      cxx_runtime cargo test --locked --bin cfetch import::tests
+      cxx_runtime cargo test --locked --bin cfetch index::tests
       ;;
     memory)
       rustc --version
-      cargo test --locked --features embedded-embeddings --bin cfetch
+      cxx_runtime cargo test --locked --features embedded-embeddings --bin cfetch
       ;;
     rust)
       version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
@@ -44,10 +52,10 @@ for check in "$@"; do
         *) echo "cfetch 1.0+ is operator-blocked (Cargo.toml has $version)" >&2; exit 1 ;;
       esac
       rustc --version
-      cargo test --locked
+      cxx_runtime cargo test --locked
       cargo check --all-targets --all-features --locked
-      cargo test --locked --features embedded-embeddings --test embed_model_cli
-      cargo test --locked --features embedded-embeddings embedded_embed::tests
+      cxx_runtime cargo test --locked --features embedded-embeddings --test embed_model_cli
+      cxx_runtime cargo test --locked --features embedded-embeddings embedded_embed::tests
       cargo clippy --all-targets --all-features --locked -- -D warnings
       ;;
     variants)
@@ -88,48 +96,48 @@ for check in "$@"; do
       "$python_bin" experiments/npu-ort-foundation/run_cached_cpu.py
       ;;
     hook-deadline)
-      cargo test --locked --bin cfetch runtime_status::tests
-      cargo test --locked --bin cfetch hooks::tests
-      cargo test --locked --bin cfetch daemon::tests
-      cargo test --locked --test hook_deadline
-      cargo test --locked --test freshness_cli
+      cxx_runtime cargo test --locked --bin cfetch runtime_status::tests
+      cxx_runtime cargo test --locked --bin cfetch hooks::tests
+      cxx_runtime cargo test --locked --bin cfetch daemon::tests
+      cxx_runtime cargo test --locked --test hook_deadline
+      cxx_runtime cargo test --locked --test freshness_cli
       cargo clippy --locked --bin cfetch -- -D warnings
       ;;
     freshness)
-      cargo test --locked --bin cfetch serve::tests
-      cargo test --locked --bin cfetch daemon::tests
-      cargo test --locked --bin cfetch mcp::tests
-      cargo test --locked --test freshness_cli
+      cxx_runtime cargo test --locked --bin cfetch serve::tests
+      cxx_runtime cargo test --locked --bin cfetch daemon::tests
+      cxx_runtime cargo test --locked --bin cfetch mcp::tests
+      cxx_runtime cargo test --locked --test freshness_cli
       cargo check --locked --features embedded-embeddings --test local_memory
-      cargo test --locked --test coherence
-      cargo test --locked --test mcp_stdio
+      cxx_runtime cargo test --locked --test coherence
+      cxx_runtime cargo test --locked --test mcp_stdio
       cargo clippy --locked --bin cfetch -- -D warnings
       ;;
     native-worker)
       rustc --version
-      cargo test --locked --features native-openvino --bin cfetch inference_governor::tests
-      cargo test --locked --features native-openvino --bin cfetch native_worker::tests
-      cargo test --locked --features native-openvino --bin cfetch native_adapter::tests
-      cargo test --locked --features native-openvino --bin cfetch native_serving::tests
-      cargo test --locked --features native-openvino --bin cfetch native_manifest::tests
-      cargo test --locked --features native-openvino --bin cfetch native_http::tests
-      cargo test --locked --features native-openvino --bin cfetch local_adapter::tests
-      cargo test --locked --features native-openvino --bin cfetch embed::tests
-      cargo test --locked --features native-openvino --bin cfetch runtime_status::tests
-      cargo test --locked --features native-openvino --bin cfetch rerank::tests
-      cargo test --locked --features native-openvino --test native_worker_cli
+      cxx_runtime cargo test --locked --features native-openvino --bin cfetch inference_governor::tests
+      cxx_runtime cargo test --locked --features native-openvino --bin cfetch native_worker::tests
+      cxx_runtime cargo test --locked --features native-openvino --bin cfetch native_adapter::tests
+      cxx_runtime cargo test --locked --features native-openvino --bin cfetch native_serving::tests
+      cxx_runtime cargo test --locked --features native-openvino --bin cfetch native_manifest::tests
+      cxx_runtime cargo test --locked --features native-openvino --bin cfetch native_http::tests
+      cxx_runtime cargo test --locked --features native-openvino --bin cfetch local_adapter::tests
+      cxx_runtime cargo test --locked --features native-openvino --bin cfetch embed::tests
+      cxx_runtime cargo test --locked --features native-openvino --bin cfetch runtime_status::tests
+      cxx_runtime cargo test --locked --features native-openvino --bin cfetch rerank::tests
+      cxx_runtime cargo test --locked --features native-openvino --test native_worker_cli
       cargo clippy --locked --features native-openvino --bin cfetch -- -D warnings
       ;;
     native-governor)
       rustc --version
-      cargo test --locked --bin cfetch inference_governor::tests
-      cargo test --locked --bin cfetch local_adapter::tests
+      cxx_runtime cargo test --locked --bin cfetch inference_governor::tests
+      cxx_runtime cargo test --locked --bin cfetch local_adapter::tests
       cargo clippy --locked --bin cfetch -- -D warnings
       ;;
     admission-origin)
       export PYTHONDONTWRITEBYTECODE=1
-      cargo test --locked --bin cfetch local_inference::tests
-      cargo test --locked --bin cfetch embedding_profile::tests
+      cxx_runtime cargo test --locked --bin cfetch local_inference::tests
+      cxx_runtime cargo test --locked --bin cfetch embedding_profile::tests
       "$python_bin" -m unittest -v scripts.test_stage_local_inference scripts.test_apply_admission_activation
       "$python_bin" -m unittest -v packages.openvino.tests.test_manifest
       (
