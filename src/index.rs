@@ -537,6 +537,12 @@ pub fn open_read_only(state_dir: &Path) -> anyhow::Result<Connection> {
 /// disposable â€” mismatches are handled by delete-and-rebuild in `open()`.
 const SCHEMA_VERSION: i64 = 9; // 9: distinct body/citation and embedding-payload identities
 
+/// Bytes a write-ahead log keeps on disk once a checkpoint has restarted it.
+/// SQLite reuses the log from its start but never shrinks the file by itself,
+/// so a single burst (a full rescan, a first vector fill) would otherwise keep
+/// its high-water mark, hundreds of MB, for good.
+const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+
 fn ensure_current_schema(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     anyhow::ensure!(
@@ -553,6 +559,7 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_millis(1000))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)?;
     // The ON DELETE CASCADE clauses below (and in code.rs) are load-bearing:
     // enforce them explicitly instead of relying on the bundled build's
     // compile-time default.
@@ -3745,6 +3752,16 @@ mod tests {
             before_checksum,
             "context changed the semantic inputs"
         );
+    }
+
+    #[test]
+    fn writers_bound_the_write_ahead_log_left_on_disk() {
+        let state = tempfile::tempdir().unwrap();
+        let conn = open(state.path()).unwrap();
+        let limit: i64 = conn
+            .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, WAL_SIZE_LIMIT);
     }
 
     #[test]
