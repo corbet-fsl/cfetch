@@ -624,7 +624,12 @@ fn open_at(path: &Path) -> anyhow::Result<Connection> {
            model TEXT NOT NULL,
            dim INTEGER NOT NULL,
            embedding BLOB NOT NULL
-         );",
+         );
+         -- The work-queue and coverage passes check each block's vector
+         -- against the spec; without this covering index every check reads
+         -- the vector's row, embedding included, so one pass reads all
+         -- vector pages.
+         CREATE INDEX IF NOT EXISTS vectors_spec ON vectors(content_hash, model, dim);",
     )?;
     Ok(conn)
 }
@@ -2071,17 +2076,17 @@ fn prune_vectors(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
 /// The embed work queue: payload hashes with no cached vector, each with its
 /// exact rendered text before the encoder prefix, in document order. The same
 /// payload across files/rings is embedded once; different context has its own key.
+const PENDING_SQL: &str = "SELECT b.embedding_hash, min(b.embedding_text), min(b.id) FROM blocks b
+     LEFT JOIN vectors v ON v.content_hash = b.embedding_hash AND v.model = ?1 AND v.dim = ?2
+     WHERE v.content_hash IS NULL
+     GROUP BY b.embedding_hash ORDER BY min(b.id) LIMIT ?3";
+
 pub fn hashes_without_vectors(
     conn: &Connection,
     spec: &VectorSpec,
     limit: usize,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT b.embedding_hash, min(b.embedding_text), min(b.id) FROM blocks b
-         LEFT JOIN vectors v ON v.content_hash = b.embedding_hash AND v.model = ?1 AND v.dim = ?2
-         WHERE v.content_hash IS NULL
-         GROUP BY b.embedding_hash ORDER BY min(b.id) LIMIT ?3",
-    )?;
+    let mut stmt = conn.prepare(PENDING_SQL)?;
     // SQLite reads a negative LIMIT as unbounded â€” which is exactly what a
     // caller asking for usize::MAX (a full hydrate) means.
     let bound = i64::try_from(limit).unwrap_or(-1);
@@ -2094,11 +2099,13 @@ pub fn hashes_without_vectors(
 /// (blocks reachable by semantic recall, blocks total) FOR THIS SPEC â€” the
 /// coverage number every degradation warning quotes. Spec-relative on
 /// purpose: vectors of another model are not coverage, they are ballast.
+const COVERAGE_SQL: &str = "SELECT (SELECT count(*) FROM blocks b JOIN vectors v
+               ON v.content_hash = b.embedding_hash AND v.model = ?1 AND v.dim = ?2),
+            (SELECT count(*) FROM blocks)";
+
 pub fn vector_coverage(conn: &Connection, spec: &VectorSpec) -> anyhow::Result<(usize, usize)> {
     let (v, b): (i64, i64) = conn.query_row(
-        "SELECT (SELECT count(*) FROM blocks b JOIN vectors v
-                   ON v.content_hash = b.embedding_hash AND v.model = ?1 AND v.dim = ?2),
-                (SELECT count(*) FROM blocks)",
+        COVERAGE_SQL,
         rusqlite::params![spec.model, spec.dim as i64],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -3752,6 +3759,31 @@ mod tests {
             before_checksum,
             "context changed the semantic inputs"
         );
+    }
+
+    #[test]
+    fn queue_and_coverage_passes_never_read_vector_rows() {
+        let state = tempfile::tempdir().unwrap();
+        let conn = open(state.path()).unwrap();
+        for sql in [PENDING_SQL, COVERAGE_SQL] {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let unbound = vec![rusqlite::types::Value::Null; stmt.parameter_count()];
+            let plan: Vec<String> = stmt
+                .query_map(rusqlite::params_from_iter(unbound), |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|step| step.contains(" v "))
+                .collect();
+            assert!(
+                !plan.is_empty()
+                    && plan
+                        .iter()
+                        .all(|step| step.contains("COVERING INDEX vectors_spec")),
+                "{sql}: {plan:?}"
+            );
+        }
     }
 
     #[test]
