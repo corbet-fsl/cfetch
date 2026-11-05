@@ -1,4 +1,5 @@
-//! Ring-5 staging as FILES in the tree: `<brain_root>/scratch/cfetch-staging/<id>.md`.
+//! Ring-5 staging as FILES in the tree: `<brain_root>/mind/<mind>/memories/<id>.md`
+//! (`paths::staging_dir`), next to the selected mind's other provisional memories.
 //!
 //! A staged candidate is the ladder's only inward crossing, so it must be
 //! visible to whichever host runs maintenance — a row in one machine's
@@ -8,7 +9,7 @@
 //! deletable by hand.
 //!
 //! Ring 5 keeps them out of recall and injection by the ordinary ring rules —
-//! `scratch/cfetch-staging/` resolves to ring 5 by LOCATION (see `index::default_ring`), and
+//! `mind/` resolves to ring 5 by LOCATION (see `index::default_ring`), and
 //! every file also declares `ring: 5` in its frontmatter, so neither a moved
 //! file nor a stripped default can make a candidate recallable.
 //!
@@ -17,9 +18,10 @@
 //! same recurring failure derive the same id, and the second one finds the
 //! file already there.
 //!
-//! `consume` deletes the file — maintenance has taken the content into a
-//! curated ring-2/3 file, so the candidate is redundant. `dismiss` MOVES it to
-//! `dismissed/`, because nothing in the ladder may be silently destroyed.
+//! `consume` (maintenance has taken the content into a curated ring-2/3 file)
+//! and `dismiss` both MOVE the file to `dismissed/`: nothing in the ladder may
+//! be silently destroyed, and the dismissed copy keeps the id from being
+//! staged again.
 //!
 //! Two hosts noticing the same pattern at the same moment can both write the
 //! same id; because the id IS the identity, they write the same candidate and

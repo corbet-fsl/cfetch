@@ -743,7 +743,7 @@ fn inference_diagnostic(
                     severity: FindingSeverity::Critical,
                     summary: short_error(issue),
                     action: Some(
-                        "inspect scratch/cfetch-staging/maintenance/history and restore the immutable record from version control"
+                        "inspect mind/<mind>/memories/maintenance/history and restore the immutable record from version control"
                             .into(),
                     ),
                 });

@@ -7,8 +7,9 @@
 //! compatibility comes from global ordered-pair and adversarial mixed-store
 //! retrieval tests, never from treating that producer as a numerical
 //! reference. Records live in the tree at
-//! `<brain_root>/state/cfetch/vectors/`, where every host that can reach the
-//! tree reads them. Only a host with the embed capability writes. The per-host
+//! `<brain_root>/scratch/cfetch/vectors/` (`paths::shared_vector_dir`), where
+//! every host that can reach that directory reads them; whether hosts share it
+//! is the deployment's storage placement, which cfetch never configures. Only a host with the embed capability writes. The per-host
 //! index.db keeps a cache of the same vectors for query speed; the cache is
 //! never the record, and losing it costs a re-read, never an embedding run.
 //!
