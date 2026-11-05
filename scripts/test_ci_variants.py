@@ -76,7 +76,7 @@ class NativeVariantCommandTests(unittest.TestCase):
             {"id": "other-arch", "os": "linux", "arch": "aarch64", "target": "", "cargo_features": ""},
         ])
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("No native Linux variant", result.stderr)
+        self.assertIn("No native Linux variant", result.stdout + result.stderr)  # ci-check.sh merges stderr into stdout (exec 2>&1)
         self.assertEqual(calls, [])
 
     def test_failed_variant_stops_without_retrying_or_running_later_variants(self):
