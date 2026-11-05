@@ -1398,28 +1398,103 @@ pub struct EmbedIndexReport {
     /// Vectors taken from the shared store instead of being re-derived.
     pub imported: usize,
     pub total_blocks: usize,
+    /// Payloads still missing because the profile refused them (over the
+    /// token limit), including refusals remembered from earlier runs.
+    pub refused: usize,
 }
 
-/// Derives the vectors this storage group is still missing.
+/// Rows of the work queue read per catalog pass. Selecting the queue is a
+/// full pass over `blocks` (grouped by payload hash), so it is read once per
+/// window and never once per wire batch: with the daemon's one-input batches
+/// a per-batch read turned every embedded or refused block into a scan of
+/// the whole catalog, back to back, for as long as work remained.
+const PENDING_WINDOW: usize = 256;
+const _: () = assert!(PENDING_WINDOW >= crate::embedding_profile::MAX_WIRE_BATCH_SIZE);
+
+/// Payload hashes this process has seen refused under one vector spec.
 ///
-/// COMPUTE-ONCE: the shared store in the tree is the record. The run first
-/// takes everything it already holds (`hydrate`), then embeds only content
-/// hashes no host has derived yet — writing each batch to the SHARED store
-/// before caching it locally, so an interrupted run leaves its work where the
-/// next run (on any host) will find it. A missing vector is the whole
-/// resumability contract; nothing else is remembered between runs.
-pub fn run(
-    conn: &mut Connection,
+/// A refusal is a property of the exact rendered input under the profile's
+/// token limit, and the payload hash names that input: asking again cannot
+/// succeed until the content, and with it the hash, changes. The durable
+/// store still lacks these vectors, so the record is unchanged; this memory
+/// only stops a long-lived caller (the daemon's vector worker) from
+/// re-tokenizing and re-refusing the same inputs on every catalog generation.
+#[derive(Debug, Default)]
+pub struct Refusals {
+    spec: Option<crate::config::VectorSpec>,
+    hashes: std::collections::HashSet<String>,
+}
+
+impl Refusals {
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    /// Binds the memory to `spec` (another model, width or profile forgets
+    /// it) and keeps only payloads some block still uses and that still have
+    /// no vector, so the count stays honest and the set stays bounded.
+    fn refresh(
+        &mut self,
+        conn: &Connection,
+        spec: &crate::config::VectorSpec,
+    ) -> anyhow::Result<()> {
+        if self.spec.as_ref() != Some(spec) {
+            self.hashes.clear();
+            self.spec = Some(spec.clone());
+        }
+        if self.is_empty() {
+            return Ok(());
+        }
+        let mut still_missing = conn.prepare(
+            "SELECT 1 FROM blocks b WHERE b.embedding_hash = ?1 AND NOT EXISTS (
+                 SELECT 1 FROM vectors v
+                 WHERE v.content_hash = ?1 AND v.model = ?2 AND v.dim = ?3)",
+        )?;
+        let mut kept = std::collections::HashSet::with_capacity(self.hashes.len());
+        for hash in &self.hashes {
+            if still_missing.exists(rusqlite::params![hash, spec.model, spec.dim as i64])? {
+                kept.insert(hash.clone());
+            }
+        }
+        self.hashes = kept;
+        Ok(())
+    }
+}
+
+/// The next window of the work queue, without inputs already refused.
+fn pending_window(
+    conn: &Connection,
+    spec: &crate::config::VectorSpec,
+    refusals: &Refusals,
+) -> anyhow::Result<std::collections::VecDeque<(String, String)>> {
+    #[cfg(test)]
+    tests::PENDING_READS.with(|reads| reads.set(reads.get() + 1));
+    // Widen the read by the refused keys, then remove them: an entirely
+    // refused window still advances to the remaining work.
+    Ok(
+        index::hashes_without_vectors(conn, spec, PENDING_WINDOW.saturating_add(refusals.len()))?
+            .into_iter()
+            .filter(|(hash, _)| !refusals.hashes.contains(hash))
+            .take(PENDING_WINDOW)
+            .collect(),
+    )
+}
+
+fn check_run_inputs(
     client: &EmbedClient,
     batch: usize,
-    store: &mut vectors::VectorStore,
-) -> anyhow::Result<EmbedIndexReport> {
+    store: &vectors::VectorStore,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         (1..=crate::embedding_profile::MAX_WIRE_BATCH_SIZE).contains(&batch),
         "embed-index batch must be between 1 and {}",
         crate::embedding_profile::MAX_WIRE_BATCH_SIZE
     );
-    let spec = store.spec().clone();
+    let spec = store.spec();
     anyhow::ensure!(
         spec.model == client.model() && spec.dim == client.dimensions(),
         "the shared store is {} at {} dimensions, the client is {} at {} — one artifact, one spec",
@@ -1428,7 +1503,75 @@ pub fn run(
         client.model(),
         client.dimensions()
     );
-    if index::ensure_vector_spec(conn, &spec)? {
+    Ok(())
+}
+
+/// `prepare` and `derive` for a client at hand, failing on any refusal: the
+/// whole derive in one call, as the tests drive it. Production goes through
+/// `sync_configured`, which builds a client only when there is work.
+#[cfg(test)]
+pub fn run(
+    conn: &mut Connection,
+    client: &EmbedClient,
+    batch: usize,
+    store: &mut vectors::VectorStore,
+) -> anyhow::Result<EmbedIndexReport> {
+    let mut refusals = Refusals::default();
+    let report = run_remembering(conn, client, batch, store, &mut refusals)?;
+    ensure_no_refusals(&report)?;
+    Ok(report)
+}
+
+fn ensure_no_refusals(report: &EmbedIndexReport) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        report.refused == 0,
+        "embedding incomplete: {} input(s) exceeded the profile token limit; \
+         {} newly derived vector(s) and earlier committed work are kept",
+        report.refused,
+        report.embedded
+    );
+    Ok(())
+}
+
+/// `run`, skipping inputs `refusals` already holds and adding new ones to it.
+/// Refused inputs are reported in the result, not as an error.
+#[cfg(test)]
+fn run_remembering(
+    conn: &mut Connection,
+    client: &EmbedClient,
+    batch: usize,
+    store: &mut vectors::VectorStore,
+    refusals: &mut Refusals,
+) -> anyhow::Result<EmbedIndexReport> {
+    check_run_inputs(client, batch, store)?;
+    let (imported, queue) = prepare(conn, store, refusals)?;
+    let embedded = derive(conn, client, batch, store, refusals, queue)?;
+    let (_, total_blocks) = index::vector_coverage(conn, store.spec())?;
+    Ok(EmbedIndexReport {
+        embedded,
+        imported,
+        total_blocks,
+        refused: refusals.len(),
+    })
+}
+
+/// Readies one derive: the local cache matches the store's spec, takes what
+/// the shared store already holds, and the first window of what is still
+/// missing (without remembered refusals). Returns (imported, first window).
+///
+/// COMPUTE-ONCE: the shared store in the tree is the record. A derive first
+/// takes everything it already holds (`hydrate`), then embeds only content
+/// hashes no host has derived yet — writing each batch to the SHARED store
+/// before caching it locally, so an interrupted run leaves its work where the
+/// next run (on any host) will find it. A missing vector is the whole
+/// resumability contract; refusals are only remembered in memory.
+fn prepare(
+    conn: &Connection,
+    store: &vectors::VectorStore,
+    refusals: &mut Refusals,
+) -> anyhow::Result<(usize, std::collections::VecDeque<(String, String)>)> {
+    let spec = store.spec();
+    if index::ensure_vector_spec(conn, spec)? {
         println!(
             "embedding spec changed -> local vector cache dropped, re-filling for {}",
             spec.model
@@ -1440,17 +1583,31 @@ pub fn run(
             "imported {imported} vector(s) from the shared store (already derived by this group)"
         );
     }
+    refusals.refresh(conn, spec)?;
+    Ok((imported, pending_window(conn, spec, refusals)?))
+}
+
+/// Embeds `queue` and every later window of missing payloads, `batch` inputs
+/// per request. Returns how many vectors it derived; refused inputs are added
+/// to `refusals`.
+fn derive(
+    conn: &mut Connection,
+    client: &EmbedClient,
+    batch: usize,
+    store: &mut vectors::VectorStore,
+    refusals: &mut Refusals,
+    mut queue: std::collections::VecDeque<(String, String)>,
+) -> anyhow::Result<usize> {
+    let spec = store.spec().clone();
     let mut embedded = 0usize;
-    // Refusals stay missing in the durable store, but must not be selected
-    // again during this run or a poisoned head would starve later inputs.
-    let mut refused = std::collections::HashSet::new();
-    let mut pending = index::hashes_without_vectors(conn, &spec, batch)?;
-    if !pending.is_empty() {
+    let mut reported = 0usize;
+    if !queue.is_empty() {
         // The write lock is taken only when there IS something to derive: a
         // host that only reads never needs the store to be writable.
         let mut writer = store.begin_write()?;
         loop {
-            let refused_before = refused.len();
+            let pending: Vec<(String, String)> = queue.drain(..batch.min(queue.len())).collect();
+            let refused_before = refusals.len();
             let texts: Vec<&str> = pending.iter().map(|(_, t)| t.as_str()).collect();
             // Only a proven input refusal justifies isolating the rows. A
             // transport, auth, scope, protocol, or model failure stops at once;
@@ -1460,8 +1617,10 @@ pub fn run(
                 Ok(v) => v,
                 Err(first) if first.downcast_ref::<InputRefusal>().is_some() => {
                     if texts.len() == 1 {
-                        eprintln!("cfetch embed-index: skipping one block this run: {first:#}");
-                        refused.insert(pending[0].0.clone());
+                        eprintln!(
+                            "cfetch embed-index: skipping one block until its content changes: {first:#}"
+                        );
+                        refusals.hashes.insert(pending[0].0.clone());
                         vec![Vec::new()]
                     } else {
                         eprintln!("cfetch embed-index: input refused ({first:#}); isolating rows");
@@ -1470,8 +1629,8 @@ pub fn run(
                             match client.embed_documents_batch(std::slice::from_ref(t)) {
                                 Ok(mut v) => single.append(&mut v),
                                 Err(row) if row.downcast_ref::<InputRefusal>().is_some() => {
-                                    eprintln!("cfetch embed-index: skipping one block this run: {row:#}");
-                                    refused.insert(hash.clone());
+                                    eprintln!("cfetch embed-index: skipping one block until its content changes: {row:#}");
+                                    refusals.hashes.insert(hash.clone());
                                     single.push(Vec::new());
                                 }
                                 Err(error) => return Err(error)
@@ -1507,7 +1666,7 @@ pub fn run(
             }
             let succeeded = cached.len();
             anyhow::ensure!(
-                succeeded > 0 || refused.len() > refused_before,
+                succeeded > 0 || refusals.len() > refused_before,
                 "embedding made no progress: no cacheable vectors or newly refused inputs; earlier committed work is kept"
             );
             if succeeded > 0 {
@@ -1518,40 +1677,34 @@ pub fn run(
                 }
                 tx.commit()?;
                 embedded += succeeded;
-                let (done, total) = index::vector_coverage(conn, &spec)?;
-                println!("embedded {done}/{total} blocks");
             }
-            // Widen the window by this run's refused keys, then remove them.
-            // Even an entirely refused batch advances to remaining work.
-            pending =
-                index::hashes_without_vectors(conn, &spec, batch.saturating_add(refused.len()))?
-                    .into_iter()
-                    .filter(|(hash, _)| !refused.contains(hash))
-                    .take(batch)
-                    .collect();
-            if pending.is_empty() {
-                break;
+            if queue.is_empty() {
+                // Progress and the next window once per window: both are
+                // full passes over the catalog.
+                if embedded > reported {
+                    let (done, total) = index::vector_coverage(conn, &spec)?;
+                    println!("embedded {done}/{total} blocks");
+                    reported = embedded;
+                }
+                queue = pending_window(conn, &spec, refusals)?;
+                if queue.is_empty() {
+                    break;
+                }
             }
         }
     }
-    anyhow::ensure!(
-        refused.is_empty(),
-        "embedding incomplete: {} input(s) exceeded the profile token limit; \
-         {embedded} newly derived vector(s) and earlier committed work are kept",
-        refused.len()
-    );
-    let (_, total_blocks) = index::vector_coverage(conn, &spec)?;
-    Ok(EmbedIndexReport {
-        embedded,
-        imported,
-        total_blocks,
-    })
+    Ok(embedded)
 }
 
 /// Brings the local vector cache and shared content-addressed store up to the
 /// current Markdown generation. Both the CLI and the daemon's change-driven
-/// worker use this exact path.
-pub fn sync_configured(cfg: &Config, batch: usize) -> anyhow::Result<(EmbedIndexReport, usize)> {
+/// worker use this exact path; the worker keeps one `Refusals` for its whole
+/// life, the CLI starts empty and fails on any refusal.
+pub fn sync_configured(
+    cfg: &Config,
+    batch: usize,
+    refusals: &mut Refusals,
+) -> anyhow::Result<(EmbedIndexReport, usize)> {
     // Hydration and peer ingress can publish canonical artifacts without
     // constructing an EmbedClient, so they enforce admission independently.
     cfg.embeddings.available()?;
@@ -1563,31 +1716,25 @@ pub fn sync_configured(cfg: &Config, batch: usize) -> anyhow::Result<(EmbedIndex
         None,
         &cfg.rings(),
     )?;
-    if index::ensure_vector_spec(&conn, &spec)? {
-        println!(
-            "embedding spec changed -> local vector cache dropped, re-filling for {}",
-            spec.model
-        );
-    }
-    let shared_imported = vectors::hydrate(&conn, &store)?;
-    if shared_imported > 0 {
-        println!(
-            "imported {shared_imported} vector(s) from the shared store (already derived by this group)"
-        );
-    }
-    let pending = index::hashes_without_vectors(&conn, &spec, 1)?;
-    let report = if pending.is_empty() {
-        let (_, total_blocks) = index::vector_coverage(&conn, &spec)?;
-        EmbedIndexReport {
-            embedded: 0,
-            imported: shared_imported,
-            total_blocks,
-        }
+    // Background work with no interactive deadline: waiting out the tree
+    // index's write transaction beats failing on a locked database and
+    // repeating the whole sync.
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    let (shared_imported, queue) = prepare(&conn, &store, refusals)?;
+    // The client (and with it a local model) is built only when there is work.
+    let embedded = if queue.is_empty() {
+        0
     } else {
         let client = EmbedClient::new(&cfg.embeddings)?;
-        let mut report = run(&mut conn, &client, batch, &mut store)?;
-        report.imported += shared_imported;
-        report
+        check_run_inputs(&client, batch, &store)?;
+        derive(&mut conn, &client, batch, &mut store, refusals, queue)?
+    };
+    let (_, total_blocks) = index::vector_coverage(&conn, &spec)?;
+    let report = EmbedIndexReport {
+        embedded,
+        imported: shared_imported,
+        total_blocks,
+        refused: refusals.len(),
     };
     Ok((report, store.len()))
 }
@@ -1596,7 +1743,8 @@ pub fn sync_configured(cfg: &Config, batch: usize) -> anyhow::Result<(EmbedIndex
 pub fn embed_index_cmd(batch: usize) -> anyhow::Result<()> {
     let cfg = Config::load()?;
     let spec = cfg.embeddings.spec();
-    let (report, shared_artifacts) = sync_configured(&cfg, batch)?;
+    let (report, shared_artifacts) = sync_configured(&cfg, batch, &mut Refusals::default())?;
+    ensure_no_refusals(&report)?;
     println!(
         "embed-index complete: {} embedded this run, {} imported from existing artifacts, {} block(s) total",
         report.embedded, report.imported, report.total_blocks
@@ -1740,6 +1888,11 @@ pub fn semantic_hits(
 mod tests {
     use super::*;
     use crate::testhttp::{http_response, spawn_server};
+
+    thread_local! {
+        /// Work-queue reads (`pending_window`) made on this test thread.
+        pub(super) static PENDING_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     #[test]
     fn canonical_int8_query_skips_the_extra_float_normalization_pass() {
@@ -2998,6 +3151,96 @@ mod tests {
         );
         assert!(store.is_empty());
         assert_eq!(index::vector_coverage(&conn, &spec_for(2)).unwrap(), (0, 5));
+    }
+
+    #[test]
+    fn embed_index_reads_the_work_queue_once_per_window_not_per_batch() {
+        let (brain, _state, mut conn) = five_block_index();
+        let (url, bodies, _) = spawn_server(|_, body| canned_embeddings(body, 0.0));
+        let mut store = store_for(brain.path());
+        PENDING_READS.with(|reads| reads.set(0));
+        let report = run(&mut conn, &client_for(&url), 1, &mut store).unwrap();
+        assert_eq!(report.embedded, 5);
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            5,
+            "one request per one-input batch"
+        );
+        assert_eq!(
+            PENDING_READS.with(|reads| reads.get()),
+            2,
+            "the first window and the empty refill; each read is a full catalog pass"
+        );
+    }
+
+    #[test]
+    fn remembered_refusals_are_not_retried_until_the_content_changes() {
+        let (brain, _state, mut conn) = five_block_index();
+        let (url, bodies, _) = spawn_server(|_, body| {
+            let request: serde_json::Value = serde_json::from_str(body).unwrap();
+            let too_long = request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|text| text.as_str().unwrap().ends_with("- one"));
+            if too_long {
+                overlength_response()
+            } else {
+                canned_embeddings(body, 0.0)
+            }
+        });
+        let client = client_for(&url);
+        let mut store = store_for(brain.path());
+        let mut refusals = Refusals::default();
+
+        let first = run_remembering(&mut conn, &client, 1, &mut store, &mut refusals).unwrap();
+        assert_eq!((first.embedded, first.refused), (4, 1));
+        assert_eq!(bodies.lock().unwrap().len(), 5);
+
+        // A later generation with the same content: nothing to ask for.
+        let second = run_remembering(&mut conn, &client, 1, &mut store, &mut refusals).unwrap();
+        assert_eq!((second.embedded, second.refused), (0, 1));
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            5,
+            "a remembered refusal is not tokenized or sent again"
+        );
+        assert_eq!(index::vector_coverage(&conn, &spec_for(2)).unwrap(), (4, 5));
+
+        // New content is a new payload hash: the stale refusal is dropped and
+        // the edited block is embedded.
+        std::fs::write(
+            brain.path().join("knowledge/a.md"),
+            "- uno\n- two\n- three\n- four\n- five\n",
+        )
+        .unwrap();
+        index::scan(
+            &mut conn,
+            brain.path(),
+            None,
+            &crate::config::RingRules::default(),
+        )
+        .unwrap();
+        let third = run_remembering(&mut conn, &client, 1, &mut store, &mut refusals).unwrap();
+        assert_eq!((third.embedded, third.refused), (1, 0));
+        assert!(refusals.is_empty());
+        assert_eq!(bodies.lock().unwrap().len(), 6);
+        assert_eq!(index::vector_coverage(&conn, &spec_for(2)).unwrap(), (5, 5));
+    }
+
+    #[test]
+    fn refusals_are_forgotten_when_the_vector_spec_changes() {
+        let (_brain, _state, conn) = five_block_index();
+        let (hash, _) = index::hashes_without_vectors(&conn, &spec_for(2), 1)
+            .unwrap()
+            .remove(0);
+        let mut refusals = Refusals::default();
+        refusals.refresh(&conn, &spec_for(2)).unwrap();
+        refusals.hashes.insert(hash);
+        refusals.refresh(&conn, &spec_for(2)).unwrap();
+        assert_eq!(refusals.len(), 1, "same spec, still missing: kept");
+        refusals.refresh(&conn, &spec_for(3)).unwrap();
+        assert!(refusals.is_empty(), "another spec may accept the input");
     }
 
     #[test]

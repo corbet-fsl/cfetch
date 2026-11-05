@@ -3,7 +3,9 @@
 //! The Markdown watcher advances the catalog generation. This worker reacts
 //! to that generation, hydrates shared/peer artifacts first, and derives only
 //! content hashes that remain missing. The clock only retries failures; it
-//! never causes repeated inference against an unchanged generation.
+//! never causes repeated inference against an unchanged generation. Inputs
+//! the profile refuses are remembered by payload hash for the worker's life,
+//! and a failure holds off the next attempt even when new generations arrive.
 
 use std::time::{Duration, Instant};
 
@@ -28,12 +30,35 @@ pub(crate) fn sources_available(cfg: &Config, _state_dir: &std::path::Path) -> b
             .is_ok_and(|store| !store.is_empty())
 }
 
+/// When the next sync is due. A new generation is worth a prompt attempt, but
+/// never one before `not_before`: a failing endpoint or a busy index must not
+/// turn every brain edit into another full attempt.
+fn schedule(
+    due: Option<(u64, Instant)>,
+    completed: Option<u64>,
+    current: Option<u64>,
+    not_before: Instant,
+    now: Instant,
+) -> Option<(u64, Instant)> {
+    match current {
+        Some(current)
+            if completed != Some(current)
+                && due.map(|(scheduled, _)| scheduled) != Some(current) =>
+        {
+            Some((current, (now + SETTLE_DELAY).max(not_before)))
+        }
+        _ => due,
+    }
+}
+
 pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
     if cfg.embeddings.available().is_err() {
         return;
     }
     let mut completed_generation = None;
     let mut due: Option<(u64, Instant)> = None;
+    let mut not_before = Instant::now();
+    let mut refusals = embed::Refusals::default();
 
     while !stopping() {
         // A peer may be joined, or a compatible shared artifact may appear,
@@ -45,21 +70,22 @@ pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
             std::thread::sleep(GENERATION_POLL);
             continue;
         }
-        if let Some(current) = generation()
-            && completed_generation != Some(current)
-            && due.map(|(scheduled, _)| scheduled) != Some(current)
-        {
-            due = Some((current, Instant::now() + SETTLE_DELAY));
-        }
+        due = schedule(
+            due,
+            completed_generation,
+            generation(),
+            not_before,
+            Instant::now(),
+        );
 
         if let Some((attempted_generation, deadline)) = due
             && Instant::now() >= deadline
         {
-            match embed::sync_configured(&cfg, BATCH) {
+            match embed::sync_configured(&cfg, BATCH, &mut refusals) {
                 Ok((report, _)) => {
                     eprintln!(
-                        "cfetch vectors: generation {attempted_generation}, {} embedded, {} imported, {} block(s) covered",
-                        report.embedded, report.imported, report.total_blocks,
+                        "cfetch vectors: generation {attempted_generation}, {} embedded, {} imported, {} block(s) covered, {} refused over the token limit",
+                        report.embedded, report.imported, report.total_blocks, report.refused,
                     );
                     completed_generation = Some(attempted_generation);
                     due = None;
@@ -69,7 +95,8 @@ pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
                     eprintln!(
                         "cfetch vectors degraded at generation {attempted_generation}: {error:#}"
                     );
-                    due = Some((attempted_generation, Instant::now() + FAILURE_RETRY));
+                    not_before = Instant::now() + FAILURE_RETRY;
+                    due = Some((attempted_generation, not_before));
                     let _ = runtime_status::refresh_static();
                 }
             }
@@ -81,6 +108,27 @@ pub fn run(cfg: Config, stopping: impl Fn() -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_generation_waits_out_the_failure_backoff() {
+        let now = Instant::now();
+        // Healthy: a new generation is attempted after the settle delay.
+        assert_eq!(
+            schedule(None, Some(1), Some(2), now, now),
+            Some((2, now + SETTLE_DELAY))
+        );
+        // After a failure, a newer generation does not cut the backoff short.
+        let not_before = now + FAILURE_RETRY;
+        assert_eq!(
+            schedule(Some((2, not_before)), None, Some(3), not_before, now),
+            Some((3, not_before))
+        );
+        // A completed or already scheduled generation keeps what is due.
+        assert_eq!(schedule(None, Some(3), Some(3), now, now), None);
+        let pending = Some((3, now + SETTLE_DELAY));
+        assert_eq!(schedule(pending, None, Some(3), now, now), pending);
+        assert_eq!(schedule(pending, None, None, now, now), pending);
+    }
 
     #[test]
     fn inactive_profile_worker_returns_without_retrying() {
