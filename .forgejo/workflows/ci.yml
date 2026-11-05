@@ -36,8 +36,8 @@ jobs:
           git clean --quiet -ffdx
       - name: Run the declared checks
         env:
-          CCID_REVISION: da31ec5f9b493ba83820279b44c3afa8d7f12bfe
-          CCID_TOOL_SHA256: 472055a961d88926b2610920336afbe37ae7af809828a3009c18394c8379084b
+          CCID_REVISION: 014fbb6fe06586e1d356472f089d0ffdabbcb11c
+          CCID_TOOL_SHA256: 2a8b3adac14c7e2b4315e6838c1ef599bcad3a483f38486bded73c4937bc60d2
         run: |
           set -eu
           : "${CCID_TOOL_ROOT:?the runner must provide CCID_TOOL_ROOT}"
