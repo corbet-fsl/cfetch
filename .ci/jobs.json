@@ -2,7 +2,7 @@
   "schema": 1,
   "generator": "ccid render v1",
   "tool_revision": "10a28f64c3bb63dfade833dd219cba0f504c9345",
-  "manifest_sha256": "ba1dfee1c53d013b1b0853fd93cfc7d7b2d3ba856a92886f9b972dc6ff284156",
+  "manifest_sha256": "8077efe06c78b9ee3e50d60f24ab811249302860d2baa6292db06d503d5881fa",
   "jobs": {
     "verify": {
       "job": "verify",
@@ -29,6 +29,29 @@
       ],
       "runs_on": "heavy",
       "archive_inputs": true
+    },
+    "windows": {
+      "job": "windows",
+      "scheduler": "remote",
+      "checks": [
+        "rust"
+      ],
+      "workflow": "ccid-remote",
+      "command": [],
+      "push_branches": [
+        "main"
+      ],
+      "paths": [
+        "src/**",
+        "tests/**",
+        "build.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        ".gitlab-ci.yml"
+      ],
+      "provider": "gitlab",
+      "platform": "windows-x64",
+      "timeout_minutes": 120
     }
   }
 }

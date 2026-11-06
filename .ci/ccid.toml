@@ -158,3 +158,17 @@ archive_inputs = true
 checks = ["ci-config", "catalog", "rust", "memory", "variants", "licenses", "profile", "governor", "release-guards", "staging", "admission-origin", "freshness", "hook-deadline"]
 workflow = "ci"
 command = ["bash", ".ci/run-cached.sh"]
+
+# Native Windows evidence that no owned worker can produce: the GitLab mirror's own pipeline
+# (.gitlab-ci.yml, `cargo test --locked` on a hosted Windows runner), dispatched by the remote CI
+# broker and reported back as the commit status "remote / windows". At most one branch run per
+# 72 h when one of the paths changed, plus every release tag.
+[jobs.windows]
+scheduler = "remote"
+provider = "gitlab"
+platform = "windows-x64"
+workflow = "ccid-remote"
+checks = ["rust"]
+push_branches = ["main"]
+paths = ["src/**", "tests/**", "build.rs", "Cargo.toml", "Cargo.lock", ".gitlab-ci.yml"]
+timeout_minutes = 120
