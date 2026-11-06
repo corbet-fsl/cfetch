@@ -4349,7 +4349,7 @@ Used by:
 - ring 0.17.14 (https://github.com/briansmith/ring)
 - rustc_version 0.4.1 (https://github.com/djc/rustc-version-rs)
 - rustix 1.1.5 (https://github.com/bytecodealliance/rustix)
-- rustls 0.23.45 (https://github.com/rustls/rustls)
+- rustls 0.23.46 (https://github.com/rustls/rustls)
 - scopeguard 1.2.0 (https://github.com/bluss/scopeguard)
 - signal-hook-mio 0.2.5 (https://github.com/vorner/signal-hook)
 - signal-hook-registry 1.4.8 (https://github.com/vorner/signal-hook)
@@ -5192,6 +5192,7 @@ Apache License 2.0 (Apache-2.0)
 
 Used by:
 - getrandom 0.2.17 (https://github.com/rust-random/getrandom)
+- getrandom 0.3.4 (https://github.com/rust-random/getrandom)
 - getrandom 0.4.3 (https://github.com/rust-random/getrandom)
 
                               Apache License
@@ -6132,7 +6133,7 @@ For these and/or other purposes and motivations, and without any expectation of 
 Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0)
 
 Used by:
-- webpki-roots 1.0.9 (https://github.com/rustls/webpki-roots)
+- webpki-roots 1.0.11 (https://github.com/rustls/webpki-roots)
 
 # Community Data License Agreement - Permissive - Version 2.0
 
@@ -6875,7 +6876,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ISC License (ISC)
 
 Used by:
-- rustls-webpki 0.103.15 (https://github.com/rustls/webpki)
+- rustls-webpki 0.103.16 (https://github.com/rustls/webpki)
 
 Except as otherwise noted, this project is licensed under the following
 (ISC-style) terms:
@@ -7506,7 +7507,7 @@ MIT License (MIT)
 
 Used by:
 - tokio-util 0.7.19 (https://github.com/tokio-rs/tokio)
-- tokio 1.53.1 (https://github.com/tokio-rs/tokio)
+- tokio 1.54.1 (https://github.com/tokio-rs/tokio)
 
 MIT License
 
