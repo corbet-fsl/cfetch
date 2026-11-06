@@ -608,12 +608,12 @@ impl<T: TextTokenizer, E: Engine> ServingCore<T, E> {
             let proof = completed
                 .bucket_evidence(scope, input.bucket)
                 .map_err(Failure::HardStop)?;
-            if let Some(previous) = bucket_results.insert(input.bucket, proof.clone()) {
-                if previous != proof {
-                    return Err(Failure::HardStop(anyhow::anyhow!(
-                        "worker placement changed within a bucket group"
-                    )));
-                }
+            if let Some(previous) = bucket_results.insert(input.bucket, proof.clone())
+                && previous != proof
+            {
+                return Err(Failure::HardStop(anyhow::anyhow!(
+                    "worker placement changed within a bucket group"
+                )));
             }
             let vector = completed.vector;
             let norm: f64 = vector.iter().map(|v| f64::from(*v).powi(2)).sum();
@@ -801,7 +801,7 @@ mod tests {
         let request = body("cpu", &[&text]);
         let nonce = [7; 32];
         let response = core.handle(&request, &nonce).unwrap();
-        assert_eq!(*core.tokenizer.0.lock().unwrap(), [text.clone()]);
+        assert_eq!(*core.tokenizer.0.lock().unwrap(), std::slice::from_ref(&text));
         let call = &core.engine.calls[0];
         let count = text.chars().count() + 2;
         assert_eq!(call.2[0], 2);
