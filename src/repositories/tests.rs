@@ -46,7 +46,13 @@ impl Fixture {
         .unwrap();
         git(
             dir.path(),
-            &["clone", remote.to_str().unwrap(), a.to_str().unwrap()],
+            &[
+                "clone",
+                "-c",
+                "core.autocrlf=false",
+                remote.to_str().unwrap(),
+                a.to_str().unwrap(),
+            ],
             TIMEOUT,
         )
         .unwrap();
@@ -66,7 +72,13 @@ impl Fixture {
         git(&a, &["push", "-u", "origin", "main"], TIMEOUT).unwrap();
         git(
             dir.path(),
-            &["clone", remote.to_str().unwrap(), b.to_str().unwrap()],
+            &[
+                "clone",
+                "-c",
+                "core.autocrlf=false",
+                remote.to_str().unwrap(),
+                b.to_str().unwrap(),
+            ],
             TIMEOUT,
         )
         .unwrap();
@@ -198,8 +210,14 @@ fn the_lock_carries_an_owner_record_and_removes_it_with_the_lock() {
         assert!(!field("host").is_empty());
         assert!(field("start").parse::<u64>().is_ok());
         assert!(field("epoch").parse::<u64>().unwrap() > 1_700_000_000);
-        assert!(lock(root.path(), TIMEOUT).is_err(), "a second holder is refused");
+        assert!(
+            lock(root.path(), TIMEOUT).is_err(),
+            "a second holder is refused"
+        );
         assert!(!held.path.join("owner.tmp").exists());
     }
-    assert!(!lock_path.exists(), "the lock and its record are gone after release");
+    assert!(
+        !lock_path.exists(),
+        "the lock and its record are gone after release"
+    );
 }
