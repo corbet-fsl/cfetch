@@ -15,6 +15,12 @@ from scripts import release as r
 
 
 class ReleaseTests(unittest.TestCase):
+    def require_publisher_archive(self):
+        # The shared ccid publisher archive came from the retired Crow/GitHub release route (CI_TOOL_ARCHIVE); Forgejo
+        # Actions supplies none, and releases go through the srv release flow (infra hosts/nixnas-release-publish.nix).
+        if not self.tool_environment:
+            self.skipTest("no ccid publisher archive supplied (CI_TOOL_ARCHIVE or CFETCH_PUBLISHER_ARCHIVE): the retired release route")
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -228,6 +234,7 @@ class ReleaseTests(unittest.TestCase):
             remote.present("github", {"artifacts": {}})
 
     def test_shared_publisher_preserves_selected_draft(self):
+        self.require_publisher_archive()
         with patch.dict(os.environ, self.tool_environment):
             core = r.publisher()
         identity = {"producing_commit": "1" * 40}
@@ -254,6 +261,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertTrue(calls)
 
     def test_failed_upload_reconciles_without_losing_bundle_identity(self):
+        self.require_publisher_archive()
         with patch.dict(os.environ, self.tool_environment):
             core = r.publisher()
         (self.base / "artifacts").mkdir()
@@ -277,6 +285,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(completion["status"], "download-verified")
 
     def test_matching_error_journal_is_reconciliable(self):
+        self.require_publisher_archive()
         with patch.dict(os.environ, self.tool_environment):
             core = r.publisher()
         identity = {"registry": "cargo", "producing_commit": "1" * 40}
