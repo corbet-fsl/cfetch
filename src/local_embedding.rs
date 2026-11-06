@@ -14,6 +14,8 @@ pub struct Pipeline {
     /// Minimum cosine against every canonical reference row.
     reference_floor: f64,
     /// ORT session entries required for faithful execution of this graph.
+    /// Read only by the embedded-embeddings loader (and the tests).
+    #[cfg_attr(not(any(feature = "embedded-embeddings", test)), allow(dead_code))]
     session_config: &'static [(&'static str, &'static str)],
 }
 

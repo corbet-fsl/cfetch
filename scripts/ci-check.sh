@@ -138,13 +138,13 @@ for check in "$@"; do
       export PYTHONDONTWRITEBYTECODE=1
       cxx_runtime cargo test --locked --bin cfetch local_inference::tests
       cxx_runtime cargo test --locked --bin cfetch embedding_profile::tests
-      "$python_bin" -m unittest -v scripts.test_stage_local_inference scripts.test_apply_admission_activation
-      "$python_bin" -m unittest -v packages.openvino.tests.test_manifest
+      cxx_runtime "$python_bin" -m unittest -v scripts.test_stage_local_inference scripts.test_apply_admission_activation
+      cxx_runtime "$python_bin" -m unittest -v packages.openvino.tests.test_manifest
       (
         cd experiments/embedding-profile
-        "$python_bin" -m unittest -v test_admission_origin
-        "$python_bin" cross_backend_eval.py --verify-implementation-bundle
-        "$python_bin" cross_backend_eval.py --verify-release-registry
+        cxx_runtime "$python_bin" -m unittest -v test_admission_origin
+        cxx_runtime "$python_bin" cross_backend_eval.py --verify-implementation-bundle
+        cxx_runtime "$python_bin" cross_backend_eval.py --verify-release-registry
       )
       ;;
     governor)
