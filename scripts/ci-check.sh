@@ -158,19 +158,19 @@ for check in "$@"; do
       # No dependency installation or physical-device probe occurs here.
       (
         cd experiments/embedding-profile
-        "$python_bin" -m unittest -v \
+        cxx_runtime "$python_bin" -m unittest -v \
           test_cross_backend_eval.py test_export_adapter_cache.py \
           test_kat_host_runner.py test_measurement_bundle.py \
           test_physical_evidence.py test_physical_checkpoint.py \
           test_openvino_scope_keys.py test_scifact_contract.py \
           test_final_package_conformance.py test_admission_transaction.py
-        HF_HUB_DISABLE_TELEMETRY=1 "$python_bin" scifact_contract.py
-        "$python_bin" cross_backend_eval.py --verify-implementation-bundle
-        HF_HUB_DISABLE_TELEMETRY=1 "$python_bin" cross_backend_eval.py --verify-release-registry
+        HF_HUB_DISABLE_TELEMETRY=1 cxx_runtime "$python_bin" scifact_contract.py
+        cxx_runtime "$python_bin" cross_backend_eval.py --verify-implementation-bundle
+        HF_HUB_DISABLE_TELEMETRY=1 cxx_runtime "$python_bin" cross_backend_eval.py --verify-release-registry
       )
-      "$python_bin" -m unittest discover -s packages/openvino/tests -v
-      "$python_bin" -m unittest discover -s experiments/memory-retrieval -v
-      "$python_bin" -m unittest scripts/test_apply_admission_activation.py -v
+      cxx_runtime "$python_bin" -m unittest discover -s packages/openvino/tests -v
+      cxx_runtime "$python_bin" -m unittest discover -s experiments/memory-retrieval -v
+      cxx_runtime "$python_bin" -m unittest scripts/test_apply_admission_activation.py -v
       for command in \
         experiments/embedding-profile/export_adapter_cache.py \
         experiments/embedding-profile/cross_backend_eval.py \
@@ -178,7 +178,7 @@ for check in "$@"; do
         experiments/embedding-profile/admission_transaction.py \
         experiments/embedding-profile/physical_evidence.py \
         scripts/apply_admission_activation.py; do
-        "$python_bin" "$command" --help >/dev/null
+        cxx_runtime "$python_bin" "$command" --help >/dev/null
       done
       ;;
     *) echo "Unknown check: $check (ci-config release-guards catalog rust variants licenses governor profile ort-foundation-build ort-foundation-cpu)" >&2; exit 2 ;;
