@@ -53,6 +53,7 @@ impl Fixture {
         {
             let path = &a;
             git(path, &["config", "user.name", "Test Writer"], TIMEOUT).unwrap();
+            git(path, &["config", "core.autocrlf", "false"], TIMEOUT).unwrap();
             git(
                 path,
                 &["config", "user.email", "test@example.invalid"],
@@ -70,6 +71,7 @@ impl Fixture {
         )
         .unwrap();
         git(&b, &["config", "user.name", "Test Writer"], TIMEOUT).unwrap();
+        git(&b, &["config", "core.autocrlf", "false"], TIMEOUT).unwrap();
         git(
             &b,
             &["config", "user.email", "test@example.invalid"],

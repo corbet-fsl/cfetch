@@ -11,3 +11,4 @@ experiments/embedding-profile/requirements-test.txt text eol=lf
 experiments/embedding-profile/profile_identity.py text eol=lf
 packages/openvino/package_inventory.py text eol=lf
 scripts/apply_admission_activation.py text eol=lf
+experiments/embedding-profile/physical_checkpoint.py text eol=lf
