@@ -7,11 +7,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    paths-ignore: [README.md, ARCHITECTURE.md, "docs/**"]
-  pull_request:
-    paths-ignore: [README.md, ARCHITECTURE.md, "docs/**"]
   workflow_dispatch:
   workflow_call:
     inputs:

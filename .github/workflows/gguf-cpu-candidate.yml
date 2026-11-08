@@ -4,20 +4,6 @@ name: GGUF SIMD CPU candidate
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/gguf-cpu-candidate.yml
-      - experiments/embedding-profile/gguf/**
-      - release/inference-backends.json
-      - src/embedding_profile.rs
-  pull_request:
-    paths:
-      - .github/workflows/gguf-cpu-candidate.yml
-      - experiments/embedding-profile/gguf/**
-      - release/inference-backends.json
-      - src/embedding_profile.rs
-
 permissions:
   contents: read
 
