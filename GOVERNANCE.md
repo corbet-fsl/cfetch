@@ -18,7 +18,7 @@ evidence for a load-bearing design change.
 ## Contributions and releases
 
 Contributors retain copyright and agree to Corbet Labs' organization-wide
-[Individual Contributor License Agreement](https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md).
+[Individual Contributor License Agreement](https://git.corbet.ch/corbet-legal/cla/src/tag/cla-v1.0/CLA.md).
 Every merge must pass the required CI and license gates. Releases are tagged
 from verified commits and follow the process documented in the repository
 workflows and changelog.

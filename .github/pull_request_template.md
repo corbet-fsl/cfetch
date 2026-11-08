@@ -4,7 +4,7 @@
 
 ## Contributor agreement
 
-- [ ] I have read and agree to version 1.0 of the Individual Contributor License Agreement at https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md.
+- [ ] I have read and agree to version 1.0 of the Individual Contributor License Agreement at https://git.corbet.ch/corbet-legal/cla/src/tag/cla-v1.0/CLA.md.
 
 ## Third-party provenance
 

@@ -7,12 +7,12 @@ Contributions are welcome. Three things to know before your first pull request:
 The project is licensed under [FSL-1.1-ALv2](LICENSE.md) (each release becomes
 Apache-2.0 after two years). External contributors retain copyright in their
 work and grant the rights described in Corbet Labs' organization-wide
-[Individual Contributor License Agreement](https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md).
+[Individual Contributor License Agreement](https://git.corbet.ch/corbet-legal/cla/src/tag/cla-v1.0/CLA.md).
 
 Every external contribution must be submitted through a pull request whose
 description contains this exact affirmation:
 
-> I have read and agree to version 1.0 of the Individual Contributor License Agreement at https://github.com/corbet-labs/.github/blob/cla-v1.0/CLA.md.
+> I have read and agree to version 1.0 of the Individual Contributor License Agreement at https://git.corbet.ch/corbet-legal/cla/src/tag/cla-v1.0/CLA.md.
 
 The checked affirmation and pull-request record form the electronic acceptance
 record. A maintainer must not merge an external contribution without it. Forking
