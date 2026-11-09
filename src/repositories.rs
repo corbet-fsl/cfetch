@@ -856,8 +856,28 @@ pub fn worker(cfg: crate::config::Config, stopping: impl Fn() -> bool) {
             }
             continue;
         }
+        let mut reasons = Vec::new();
+        if safety_due {
+            reasons.push("safety");
+        }
+        if !changed.is_empty() {
+            reasons.push("local-ref");
+        }
+        if requested {
+            reasons.push("request");
+        }
         match run(&targets, true, timeout, lock_timeout) {
-            Ok(status) => publish_status(status),
+            Ok(status) => {
+                // One line per pass: each entry is one fetch, so the count is
+                // the operator's answer to "how much network is this doing?".
+                eprintln!(
+                    "cfetch Git: synced {} repositor{} ({})",
+                    status.len(),
+                    if status.len() == 1 { "y" } else { "ies" },
+                    reasons.join("+")
+                );
+                publish_status(status);
+            }
             Err(error) => eprintln!("cfetch Git: {error:#}"),
         }
         // Keep the digests taken BEFORE the pass: a commit that arrived while
