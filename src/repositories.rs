@@ -52,6 +52,11 @@ pub struct RepositoryStatus {
     pub ahead: usize,
     pub behind: usize,
     pub detail: Option<String>,
+    /// True when this pass actually contacted the remote (`git fetch`). Dirty,
+    /// detached, unborn and untracked checkouts are inspected but never
+    /// fetched, so this is the number "fetches/day" must count.
+    #[serde(default)]
+    pub fetched: bool,
 }
 
 impl RepositoryStatus {
@@ -64,6 +69,7 @@ impl RepositoryStatus {
             ahead: 0,
             behind: 0,
             detail: None,
+            fetched: false,
         }
     }
 }
@@ -513,6 +519,7 @@ fn synchronize(
             });
         }
         result = observed;
+        result.fetched = true;
         if !fetched.is_empty() {
             (result.ahead, result.behind) = counts(root, &fetched, timeout)?;
             if result.behind > 0 {
@@ -589,6 +596,7 @@ fn synchronize(
                 ) {
                     Ok(_) => {
                         result = inspect(root, timeout)?;
+                        result.fetched = true;
                         result.state = "synchronized".into();
                         result.ahead = 0;
                         result.behind = 0;
@@ -605,6 +613,7 @@ fn synchronize(
         }
         // Nothing of ours is ahead of the fetched tip.
         result = inspect(root, timeout)?;
+        result.fetched = true;
         result.state = "synchronized".into();
         result.ahead = 0;
         result.behind = 0;
@@ -870,8 +879,9 @@ pub fn worker(cfg: crate::config::Config, stopping: impl Fn() -> bool) {
             Ok(status) => {
                 // One line per pass: each entry is one fetch, so the count is
                 // the operator's answer to "how much network is this doing?".
+                let fetches = status.iter().filter(|entry| entry.fetched).count();
                 eprintln!(
-                    "cfetch Git: synced {} repositor{} ({})",
+                    "cfetch Git: {fetches} fetch(es) across {} repositor{} ({})",
                     status.len(),
                     if status.len() == 1 { "y" } else { "ies" },
                     reasons.join("+")
