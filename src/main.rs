@@ -2694,6 +2694,7 @@ fn main() {
                     &roots,
                     sync,
                     std::time::Duration::from_secs(cfg.git.timeout_secs),
+                    std::time::Duration::from_secs(cfg.git.lock_timeout_secs),
                 )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&statuses)?);

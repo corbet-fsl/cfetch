@@ -111,9 +111,9 @@ fn independent_edits_merge_and_publish_without_a_special_transport() {
     commit(&f.a, "first.md");
     std::fs::write(f.b.join("second.md"), "second\n").unwrap();
     commit(&f.b, "second.md");
-    synchronize(&f.a, TIMEOUT).unwrap();
-    assert_eq!(synchronize(&f.b, TIMEOUT).unwrap().state, "synchronized");
-    synchronize(&f.a, TIMEOUT).unwrap();
+    synchronize(&f.a, TIMEOUT, TIMEOUT).unwrap();
+    assert_eq!(synchronize(&f.b, TIMEOUT, TIMEOUT).unwrap().state, "synchronized");
+    synchronize(&f.a, TIMEOUT, TIMEOUT).unwrap();
     assert_eq!(
         std::fs::read_to_string(f.a.join("second.md")).unwrap(),
         "second\n"
@@ -132,9 +132,9 @@ fn conflicting_edits_leave_worktree_and_index_unchanged() {
     commit(&f.a, "note.md");
     std::fs::write(f.b.join("note.md"), "beta\n").unwrap();
     commit(&f.b, "note.md");
-    synchronize(&f.a, TIMEOUT).unwrap();
+    synchronize(&f.a, TIMEOUT, TIMEOUT).unwrap();
     let before = inspect(&f.b, TIMEOUT).unwrap().head;
-    assert_eq!(synchronize(&f.b, TIMEOUT).unwrap().state, "conflict");
+    assert_eq!(synchronize(&f.b, TIMEOUT, TIMEOUT).unwrap().state, "conflict");
     assert_eq!(
         std::fs::read_to_string(f.b.join("note.md")).unwrap(),
         "beta\n"
@@ -150,7 +150,7 @@ fn dirty_and_staged_work_are_never_committed_or_replaced() {
     std::fs::write(f.a.join("note.md"), "unpublished\n").unwrap();
     git(&f.a, &["add", "--", "note.md"], TIMEOUT).unwrap();
     std::fs::write(f.a.join("note.md"), "still editing\n").unwrap();
-    assert_eq!(synchronize(&f.a, TIMEOUT).unwrap().state, "dirty");
+    assert_eq!(synchronize(&f.a, TIMEOUT, TIMEOUT).unwrap().state, "dirty");
     assert_eq!(
         git(&f.a, &["show", ":note.md"], TIMEOUT).unwrap(),
         "unpublished\n"
@@ -184,10 +184,88 @@ fn unavailable_remote_does_not_block_another_repository() {
         TIMEOUT,
     )
     .unwrap();
-    let statuses = run(&[f.a.clone(), f.b.clone()], true, TIMEOUT).unwrap();
+    let statuses = run(&[f.a.clone(), f.b.clone()], true, TIMEOUT, TIMEOUT).unwrap();
     assert_eq!(statuses[0].state, "error");
     assert_eq!(statuses[1].state, "synchronized");
     assert!(f.remote.is_dir());
+}
+
+/// The read-only fetch must not wait for the writer lock: a current checkout
+/// syncs while another writer holds it, because fetch touches neither the
+/// index nor the working tree. This is the behaviour that ended the give-ups.
+#[test]
+fn a_current_fetch_does_not_take_the_writer_lock() {
+    let f = Fixture::new();
+    let _held = lock(&f.a, TIMEOUT).unwrap();
+    assert_eq!(
+        synchronize(&f.a, TIMEOUT, TIMEOUT).unwrap().state,
+        "synchronized"
+    );
+}
+
+/// The merge still takes the writer lock: a behind checkout must wait, and
+/// its working files stay exactly as they were when the lock is unavailable.
+#[test]
+fn a_merge_waits_for_the_writer_lock() {
+    let f = Fixture::new();
+    std::fs::write(f.b.join("second.md"), "second\n").unwrap();
+    commit(&f.b, "second.md");
+    git(&f.b, &["push", "origin", "main"], TIMEOUT).unwrap();
+    let _held = lock(&f.a, TIMEOUT).unwrap();
+    let error = synchronize(&f.a, TIMEOUT, Duration::from_millis(300)).unwrap_err();
+    assert!(error.to_string().contains("repository busy"), "{error:#}");
+    assert!(!f.a.join("second.md").exists());
+    // The read-only fetch did run (the upstream ref moved); only the merge
+    // was refused by the held writer lock.
+    assert_eq!(inspect(&f.a, TIMEOUT).unwrap().state, "behind");
+}
+
+#[test]
+fn a_pass_targets_only_what_woke_it() {
+    let f = Fixture::new();
+    let repos = vec![
+        Enrolled::new(f.a.clone(), TIMEOUT).unwrap(),
+        Enrolled::new(f.b.clone(), TIMEOUT).unwrap(),
+    ];
+    assert!(select_targets(&repos, &[], None, false).is_empty());
+    assert_eq!(
+        select_targets(&repos, &[], None, true),
+        vec![f.a.clone(), f.b.clone()]
+    );
+    assert_eq!(
+        select_targets(&repos, &[1], None, false),
+        vec![f.b.clone()]
+    );
+    assert_eq!(
+        select_targets(&repos, &[], Some(f.a.to_str().unwrap()), false),
+        vec![f.a.clone()]
+    );
+    // A signal that names no enrolled checkout must not be dropped: sync all.
+    assert_eq!(
+        select_targets(&repos, &[], Some("/nowhere"), false).len(),
+        2
+    );
+}
+
+/// Local ref changes are what the worker watches; a remote-tracking update
+/// (our own fetch) must NOT look like a local change or the worker would sync
+/// itself in a loop.
+#[test]
+fn the_local_digest_changes_on_commit_but_not_on_fetch() {
+    let f = Fixture::new();
+    let repo = Enrolled::new(f.a.clone(), TIMEOUT).unwrap();
+    let before = repo.digest();
+    std::fs::write(f.a.join("third.md"), "third\n").unwrap();
+    commit(&f.a, "third.md");
+    let after_commit = repo.digest();
+    assert_ne!(before, after_commit);
+    // Advance the remote from the other clone and fetch into a: refs/remotes
+    // moves, refs/heads does not.
+    std::fs::write(f.b.join("fourth.md"), "fourth\n").unwrap();
+    commit(&f.b, "fourth.md");
+    git(&f.b, &["push", "origin", "main"], TIMEOUT).unwrap();
+    git(&f.a, &["fetch", "-q", "origin"], TIMEOUT).unwrap();
+    assert_eq!(after_commit, repo.digest());
 }
 
 #[test]

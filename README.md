@@ -100,7 +100,7 @@ reported as uncovered, never silently truncated.
   "git": {
     "enabled": true,
     "roots": ["/path/to/agents/knowledge", "/path/to/agents/todo"],
-    "interval_secs": 60
+    "interval_secs": 900
   }
 }
 ```
@@ -111,8 +111,22 @@ inference endpoints are refused. Optional model services must use loopback.
 
 ## Git behavior
 
-Sync discovers nested repositories and serializes operations using a lock in
-Git's common directory. It fetches and integrates committed history, then pushes.
+Sync discovers nested repositories and is event-driven: a commit tool touches
+`git-sync.request` in cfetch's state directory after a push, and local ref
+changes are watched. `interval_secs` is only the safety interval for what no
+event can see (for example a remote push while this host reaches the tree over
+NFS, whose inotify does not report another host's writes). A burst is debounced
+into one pass, and a pass with no request and no real ref change is skipped.
+
+Only a merge takes the writer lock; fetch and push never do, so a read-only sync
+cannot make a commit wait. The lock has two layers: a kernel `flock` in Git's
+common directory for local contenders (one kernel, FIFO, no polling), and the
+atomic `cfetch-repository.lock` directory for the cross-boundary case — an NFS
+client's lock is in a different lock domain and does not exclude a local
+`flock`. The directory carries an `owner` record (`host`, `pid`, `start`,
+`epoch`); a contender clears it only with proof that the owner died (local pid
+gone or reused, remote record older than six hours), never by age alone.
+
 Dirty worktrees, conflicting histories and repositories without an upstream are
 reported individually. It never stashes, resets, force-pushes or silently commits
 arbitrary edits. Commit intended changes explicitly; the next sync publishes them.

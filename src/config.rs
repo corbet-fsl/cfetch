@@ -1210,6 +1210,14 @@ impl Config {
             "git.timeout_secs must be between 1 and 300"
         );
         anyhow::ensure!(
+            self.git.debounce_ms <= 60_000,
+            "git.debounce_ms must be at most 60000"
+        );
+        anyhow::ensure!(
+            self.git.lock_timeout_secs > 0,
+            "git.lock_timeout_secs must be positive"
+        );
+        anyhow::ensure!(
             !self.git.enabled || !self.git.roots.is_empty(),
             "enroll git.roots before enabling synchronization"
         );

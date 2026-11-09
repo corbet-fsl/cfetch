@@ -424,7 +424,12 @@ fn gather_inner(
             .iter()
             .map(|p| cfg.resolve(p))
             .collect::<Vec<_>>();
-        match crate::repositories::run(&roots, false, Duration::from_secs(cfg.git.timeout_secs)) {
+        match crate::repositories::run(
+            &roots,
+            false,
+            Duration::from_secs(cfg.git.timeout_secs),
+            Duration::from_secs(cfg.git.lock_timeout_secs),
+        ) {
             Ok(repos) => repos,
             Err(error) => {
                 findings.push(Finding {

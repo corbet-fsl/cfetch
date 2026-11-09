@@ -16,21 +16,44 @@ working documents; resolve them explicitly using Git. An offline repository
 does not stop another repository from synchronizing. A failed synchronization
 returns a nonzero status, including when some repositories succeeded.
 
-Enable periodic synchronization of enrolled roots in the machine configuration:
+Enable synchronization of enrolled roots in the machine configuration:
 
 ```json
-{"git":{"enabled":true,"roots":["knowledge","todo"],"interval_secs":60,"timeout_secs":30}}
+{"git":{"enabled":true,"roots":["knowledge","todo"],"interval_secs":900,"debounce_ms":1000,"lock_timeout_secs":600,"timeout_secs":30}}
 ```
+
+Synchronization is event-driven, not polling. A commit tool signals cfetch by
+touching `git-sync.request` in the state directory after a successful push (the
+file names the repository; an empty or unknown name means "all"). Local ref
+changes in every enrolled checkout are watched with inotify. `interval_secs` is
+the safety interval for changes no event can report — most importantly a remote
+push on an NFS client, where inotify does not see another host's writes. Each
+burst is debounced (`debounce_ms`) into one pass, and a pass with neither a
+request nor a changed local ref is skipped, so cfetch's own merge cannot wake
+it in a loop. The first pass at daemon start is immediate.
 
 Roots relative to the brain are supported in configuration. Read operations do
 not fetch implicitly. Git owns credentials and hosting; there is no provider API.
 Automatic synchronization requires Git with `merge-tree --write-tree` support
 for divergent branches. cfetch never resets, stashes, rebases or force pushes.
-Its atomic lock is `cfetch-repository.lock` in Git's common directory, shared
-across cooperating processes and linked worktrees. A crash may leave that lock;
-inspect for a live writer before removing it. Locks are never stolen by age. The lock directory holds an `owner` record (`host`, `pid`, `start` = the process start time in clock ticks, `epoch`) written right after the directory is created and removed with it; cooperating writers (brain-commit) use it to clear a lock whose owner is gone or whose pid was reused, so a crashed synchronizer no longer blocks the repository.
-Other writers should cooperate with this lock or perform their work while the
-synchronizer is paused. Repository state is cached locally in `repositories.json`.
+
+Fetch and inspect take no writer lock; they touch neither the index nor the
+working tree. Only the merge (and a push that has to refetch after a rejected
+race) takes it, so a read-only sync can never delay a commit. The lock has two
+layers, in this order:
+
+- `brain-commit.flock` — a kernel `flock`, shared by all worktrees. Contenders on
+  one kernel queue in its wait queue with no polling, and a dead holder is
+  released by the kernel. `lock_timeout_secs` bounds the wait.
+- `cfetch-repository.lock` — the atomic `mkdir` directory, which remains
+  required across machines: a local `flock` does not exclude an NFS client's
+  lock (measured on this fleet). Its `owner` record (`host`, `pid`, `start` =
+  process start time in clock ticks, `epoch`) is written right after creation
+  and removed with the directory. A contender clears it only with proof that
+  the owner died: a local pid gone or reused, or a remote record older than six
+  hours. A lock without a parsable record is never broken.
+
+Repository state is cached locally in `repositories.json`.
 
 Markdown stays authoritative. The graph connects available notes across all
 enrolled content, independent of repository boundaries. Missing checkouts and

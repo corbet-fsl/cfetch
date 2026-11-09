@@ -17,8 +17,15 @@ use crate::{index, paths};
 /// Bounded wait for the drain barrier; on expiry the query answers anyway,
 /// labeled stale.
 pub const BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
-/// Event batches settle for this long before a rebuild picks them up.
-const DEBOUNCE: Duration = Duration::from_millis(50);
+/// Event batches settle for this long before a rebuild picks them up. A
+/// brain-commit writes several files (and NFS/editor write bursts are not
+/// atomic), so 50 ms used to turn one logical change into several index
+/// generations. A full second still answers a cached query immediately with
+/// the previous generation; only its freshness label can lag.
+const DEBOUNCE: Duration = Duration::from_millis(1000);
+/// Floor between event-driven index generations. Events that arrive inside
+/// the floor are coalesced into the next pass; a barrier request never waits.
+const MIN_EVENT_GAP: Duration = Duration::from_secs(2);
 /// Cadence of the stat-fingerprint correctness backstop — and of the daemon's
 /// own code-scan refresh, which rides the same tick.
 pub const FINGERPRINT_INTERVAL: Duration = Duration::from_secs(60);
@@ -956,6 +963,7 @@ fn worker(
     // invisible to the watcher.
     apply(state, &mut conn, cfg, true);
     let mut last_backstop = Instant::now();
+    let mut last_apply = Instant::now();
     let mut watched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     loop {
         match wake.recv_timeout(FINGERPRINT_INTERVAL) {
@@ -967,7 +975,19 @@ fn worker(
                 // starts is covered by it.
                 let mut forced = first == Wake::Barrier;
                 if !forced {
-                    std::thread::sleep(DEBOUNCE);
+                    // The settle waits are INTERRUPTIBLE: a strict query's
+                    // barrier can arrive during the debounce or the coalescing
+                    // floor, and it must cut the wait short — a query is
+                    // blocked on that pass, not on a freshness trade-off.
+                    forced = settle(wake, Instant::now() + DEBOUNCE);
+                }
+                if !forced {
+                    // Coalesce everything that landed during the debounce into
+                    // this pass; serve at most one generation per floor.
+                    let floor = last_apply + MIN_EVENT_GAP;
+                    if floor > Instant::now() {
+                        forced = settle(wake, floor);
+                    }
                 }
                 while let Ok(w) = wake.try_recv() {
                     forced |= w == Wake::Barrier;
@@ -976,6 +996,7 @@ fn worker(
                     state.refresh_queued.store(false, Ordering::Release);
                 }
                 apply(state, &mut conn, cfg, forced);
+                last_apply = Instant::now();
                 if forced {
                     // That pass WAS the fingerprint sweep; do not repeat it.
                     last_backstop = Instant::now();
@@ -1006,6 +1027,23 @@ fn worker(
                         watched.extend(fresh);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Waits out a coalescing window while watching the wake channel. Returns
+/// true when a barrier (a query is blocked on this pass) cut the wait short.
+fn settle(wake: &mpsc::Receiver<Wake>, deadline: Instant) -> bool {
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        match wake.recv_timeout(remaining) {
+            Ok(Wake::Barrier) => return true,
+            Ok(Wake::Event) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                return false;
             }
         }
     }
