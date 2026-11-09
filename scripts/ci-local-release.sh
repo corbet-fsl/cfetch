@@ -2,9 +2,9 @@
 set -euo pipefail
 : "${CFETCH_LOCAL_RELEASE_OUTPUT:?new artifact directory required}"
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo build --release --locked --features embedded-embeddings
+cargo build --config .cargo/release-profile.toml --release --locked --features embedded-embeddings
 if [[ -n "${CFETCH_TEST_LOCAL_MODEL:-}" ]]; then
-  cargo test --release --locked --features embedded-embeddings --test local_memory -- --ignored --nocapture
+  cargo test --config .cargo/release-profile.toml --release --locked --features embedded-embeddings --test it local_memory -- --ignored --nocapture
 fi
 mkdir "$CFETCH_LOCAL_RELEASE_OUTPUT"
 install -m755 "${CARGO_TARGET_DIR:-target}/release/cfetch" "$CFETCH_LOCAL_RELEASE_OUTPUT/cfetch"

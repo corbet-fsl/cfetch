@@ -54,7 +54,7 @@ for check in "$@"; do
       rustc --version
       cxx_runtime cargo test --locked
       cargo check --all-targets --all-features --locked
-      cxx_runtime cargo test --locked --features embedded-embeddings --test embed_model_cli
+      cxx_runtime cargo test --locked --features embedded-embeddings --test it embed_model_cli
       cxx_runtime cargo test --locked --features embedded-embeddings embedded_embed::tests
       cargo clippy --all-targets --all-features --locked -- -D warnings
       ;;
@@ -99,18 +99,18 @@ for check in "$@"; do
       cxx_runtime cargo test --locked --bin cfetch runtime_status::tests
       cxx_runtime cargo test --locked --bin cfetch hooks::tests
       cxx_runtime cargo test --locked --bin cfetch daemon::tests
-      cxx_runtime cargo test --locked --test hook_deadline
-      cxx_runtime cargo test --locked --test freshness_cli
+      cxx_runtime cargo test --locked --test it hook_deadline
+      cxx_runtime cargo test --locked --test it freshness_cli
       cargo clippy --locked --bin cfetch -- -D warnings
       ;;
     freshness)
       cxx_runtime cargo test --locked --bin cfetch serve::tests
       cxx_runtime cargo test --locked --bin cfetch daemon::tests
       cxx_runtime cargo test --locked --bin cfetch mcp::tests
-      cxx_runtime cargo test --locked --test freshness_cli
-      cargo check --locked --features embedded-embeddings --test local_memory
-      cxx_runtime cargo test --locked --test coherence
-      cxx_runtime cargo test --locked --test mcp_stdio
+      cxx_runtime cargo test --locked --test it freshness_cli
+      cargo check --locked --features embedded-embeddings --test it local_memory
+      cxx_runtime cargo test --locked --test it coherence
+      cxx_runtime cargo test --locked --test it mcp_stdio
       cargo clippy --locked --bin cfetch -- -D warnings
       ;;
     native-worker)
@@ -125,7 +125,7 @@ for check in "$@"; do
       cxx_runtime cargo test --locked --features native-openvino --bin cfetch embed::tests
       cxx_runtime cargo test --locked --features native-openvino --bin cfetch runtime_status::tests
       cxx_runtime cargo test --locked --features native-openvino --bin cfetch rerank::tests
-      cxx_runtime cargo test --locked --features native-openvino --test native_worker_cli
+      cxx_runtime cargo test --locked --features native-openvino --test it native_worker_cli
       cargo clippy --locked --features native-openvino --bin cfetch -- -D warnings
       ;;
     native-governor)

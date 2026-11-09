@@ -24,11 +24,12 @@ compiler flag.
 ## Building
 
 ```sh
-cargo build --profile release-max --locked
+cargo build --config .cargo/release-profile.toml --profile release-max --locked
 # binary at target/release-max/cfetch
 ```
 
-The profile (`[profile.release-max]` in Cargo.toml) inherits `release` and
+The profile (`[profile.release-max]` in `.cargo/release-profile.toml`, passed
+explicitly because cargo never auto-loads that file) inherits `release` and
 adds `lto = "fat"` and `codegen-units = 1`. It changes nothing about behavior
 — same binary semantics, slower build, best possible codegen for one machine.
 
@@ -36,14 +37,14 @@ For a binary that is genuinely machine-local, also let the compiler target
 the exact CPU (a `RUSTFLAGS` setting — profiles cannot express it):
 
 ```sh
-RUSTFLAGS="-C target-cpu=native" cargo build --profile release-max --locked
+RUSTFLAGS="-C target-cpu=native" cargo build --config .cargo/release-profile.toml --profile release-max --locked
 ```
 
 PowerShell:
 
 ```powershell
 $env:RUSTFLAGS = "-C target-cpu=native"
-cargo build --profile release-max --locked
+cargo build --config .cargo/release-profile.toml --profile release-max --locked
 ```
 
 ## Caveats

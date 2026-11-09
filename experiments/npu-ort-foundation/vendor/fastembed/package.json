@@ -1,0 +1,8 @@
+{
+  "dependencies": {},
+  "devDependencies": {
+    "@semantic-release/git": "^11.0.1",
+    "conventional-changelog-conventionalcommits": "8",
+    "semantic-release-cargo": "^2.4.2"
+  }
+}
