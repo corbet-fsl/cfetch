@@ -5,6 +5,12 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **Dependency security.** `rmcp` 3.9.0 closes RUSTSEC-2026-0457 (OAuth
+  client SSRF), RUSTSEC-2026-0461 (unbounded tool schema cache) and
+  RUSTSEC-2026-0462 (unbounded response buffering); the stdio-only server
+  facade is unchanged. `rusqlite` 0.41.1 bundles SQLite 3.54.1 through
+  `libsqlite3-sys` 0.39.1, closing RUSTSEC-2026-0459 (CVE-2026-119375).
+
 ## 0.10.3
 
 ## 0.10.2

@@ -11,7 +11,7 @@ use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
         ToolAnnotations,
     },
     service::{RequestContext, RoleServer},
@@ -541,8 +541,8 @@ fn call_tool(name: &str, args: &Value) -> Result<CallToolResult, McpError> {
 struct CfetchMcp;
 
 impl ServerHandler for CfetchMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("cfetch", env!("CARGO_PKG_VERSION")))
             // One doctrine, two renderers: this same source function feeds
             // the AGENTS.md/GEMINI.md marker block.

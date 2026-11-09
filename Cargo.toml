@@ -55,8 +55,13 @@ fastembed = { version = "6", optional = true, default-features = false, features
 ratatui = "0.30.2"
 # Exact-pinned official MCP SDK. cfetch owns its tools; rmcp owns JSON-RPC,
 # protocol negotiation, capability discovery, schemas, and stdio framing.
-rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+# 3.9.0 is the first release with every published transport advisory fixed
+# (RUSTSEC-2026-0457, -0461, -0462); the exact pin stays so a compatible facade
+# upgrade remains an explicit review, not a floating dependency.
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io"] }
+# 0.41 bundles SQLite 3.54.1 through libsqlite3-sys 0.39.1, the first fixed
+# release for RUSTSEC-2026-0459 (CVE-2026-119375).
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
