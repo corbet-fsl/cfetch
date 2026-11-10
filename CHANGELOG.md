@@ -5,6 +5,8 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+## 0.10.4
+
 - **A Markdown source can join the brain without restating the taxonomy.** Three
   additive config keys extend the shipped lists instead of replacing them:
   `include_prefixes` indexes a subtree inside an excluded one (for example a
