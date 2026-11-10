@@ -3283,8 +3283,10 @@ mod tests {
     /// frontmatter turns a read-only source into a maintenance target.
     #[test]
     fn a_read_only_source_is_never_a_maintenance_target() {
-        let mut rules = RingRules::default();
-        rules.include_prefixes = vec!["projects/notes-repo/".into()];
+        let mut rules = RingRules {
+            include_prefixes: vec!["projects/notes-repo/".into()],
+            ..RingRules::default()
+        };
         rules.rules.insert(
             0,
             crate::config::RingRule {
