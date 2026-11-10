@@ -718,7 +718,16 @@ pub fn brain_walker(brain_root: &Path, rules: &RingRules) -> ignore::WalkBuilder
             if rel.as_os_str().is_empty() {
                 return true;
             }
-            !policy.excluded(&rel_doc_path(rel))
+            let rel = rel_doc_path(rel);
+            // A directory is judged by the directory form so that one leading
+            // to an included prefix (`projects/` for a notes checkout inside
+            // it) is walked; its files and its other subdirectories still
+            // answer to the exclusion.
+            if entry.file_type().is_some_and(|t| t.is_dir()) {
+                !policy.excluded_dir(&rel)
+            } else {
+                !policy.excluded(&rel)
+            }
         });
     builder
 }
@@ -2881,6 +2890,7 @@ mod tests {
                 },
             ],
             exclude_prefixes: Vec::new(),
+            ..RingRules::default()
         };
         let mut conn = open(dir.path()).unwrap();
         let report = scan(&mut conn, dir.path(), None, &rules).unwrap();
@@ -2906,6 +2916,7 @@ mod tests {
         let rules = RingRules {
             rules: RingRules::default().rules,
             exclude_prefixes: vec!["drafts/".into()],
+            ..RingRules::default()
         };
         let mut conn = open(dir.path()).unwrap();
         scan(&mut conn, dir.path(), None, &rules).unwrap();
@@ -2918,6 +2929,54 @@ mod tests {
             "configured exclusion applies"
         );
         assert_eq!(recall(&conn, "kavender", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_included_checkout_inside_an_excluded_tree_is_indexed_at_its_extra_ring() {
+        let dir = brain(&[
+            ("projects/notes-repo/idea.md", "zorblax is a note\n"),
+            (
+                "projects/notes-repo/sub/deep.md",
+                "gnarvet is a deep note\n",
+            ),
+            (
+                "projects/notes-repo/.hidden/h.md",
+                "hiddenword is a dotdir\n",
+            ),
+            ("projects/other-repo/README.md", "quuxplam is code\n"),
+            ("projects/top.md", "wibblefrat is loose\n"),
+            ("knowledge/live.md", "kavender is knowledge\n"),
+        ]);
+        let cfg: crate::config::Config = serde_json::from_str(
+            r#"{"extra_ring_rules": [{"prefix": "projects/notes-repo/", "ring": 4}],
+                "include_prefixes": ["projects/notes-repo/"],
+                "read_only_prefixes": ["projects/notes-repo/"]}"#,
+        )
+        .unwrap();
+        let rules = cfg.rings();
+        let mut conn = open(dir.path()).unwrap();
+        let report = scan(&mut conn, dir.path(), None, &rules).unwrap();
+        assert_eq!(report.docs, 3, "two notes and the one knowledge file");
+        let hit = recall(&conn, "zorblax", 5).unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].path, "projects/notes-repo/idea.md");
+        assert_eq!(
+            hit[0].ring, 4,
+            "the extra rule ring, below curated knowledge"
+        );
+        assert_eq!(recall(&conn, "gnarvet", 5).unwrap()[0].ring, 4);
+        assert_eq!(recall(&conn, "kavender", 5).unwrap()[0].ring, 3);
+        for word in ["quuxplam", "wibblefrat", "hiddenword"] {
+            assert!(
+                recall(&conn, word, 5).unwrap().is_empty(),
+                "{word} stays outside the index"
+            );
+        }
+        // The same tree without the additions is exactly the old behavior.
+        let mut plain = open(tempfile::tempdir().unwrap().path()).unwrap();
+        scan(&mut plain, dir.path(), None, &RingRules::default()).unwrap();
+        assert!(recall(&plain, "zorblax", 5).unwrap().is_empty());
+        assert_eq!(recall(&plain, "kavender", 5).unwrap().len(), 1);
     }
 
     fn cite_id(ring: u8, text: &str) -> String {

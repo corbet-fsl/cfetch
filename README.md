@@ -51,6 +51,29 @@ Nested repositories are ordinary independent checkouts. Their parent ignores
 them; cfetch still indexes their visible Markdown. Repository access controls
 what can be shared. cfetch reads a filesystem and does not manage its mounts.
 
+`projects/` is excluded by default because code checkouts belong to the code
+index. A checkout of Markdown that is not code, such as a notes repository, is
+brought in by three additive keys in the config, which add to the shipped lists
+and never replace them:
+
+```json
+{
+  "include_prefixes": ["projects/notes"],
+  "extra_ring_rules": [{ "prefix": "projects/notes/", "ring": 4 }],
+  "read_only_prefixes": ["projects/notes"]
+}
+```
+
+`include_prefixes` indexes one subtree inside an excluded one (the secrets,
+exhaust and Git-internals boundary is never lifted, and such a prefix is
+refused at load). `extra_ring_rules` are matched before the shipped ring rules,
+first match wins, and the shipped rules answer for everything else.
+`read_only_prefixes` keeps a subtree recallable but never a maintenance target:
+maintenance refuses to propose or apply a change to it, and edits to it stage no
+candidates. A release without these keys ignores them, so the source is simply
+not recalled there. `ring_rules` and `exclude_prefixes` still replace the shipped
+lists whole, for a tree that wants its own taxonomy.
+
 ## Use
 
 ```sh

@@ -663,6 +663,13 @@ fn target_policy(
         index::indexable_doc(rel, rules),
         "target is excluded from the recallable Markdown tree"
     );
+    // A read-only source is recalled like any document but belongs to a
+    // repository cfetch only reads: no ring, authority or frontmatter makes it
+    // a maintenance target.
+    anyhow::ensure!(
+        !rules.read_only(rel),
+        "target is under a read-only source; maintenance never writes it"
+    );
     let ring = effective_ring(rel, after, rules);
     anyhow::ensure!(
         (2..=4).contains(&ring),
@@ -3270,5 +3277,55 @@ mod tests {
         assert_eq!(event.candidate_ids, vec![fixture.candidate.id.clone()]);
         assert!(event.detail.contains("redacted"));
         assert!(!event.detail.contains("sk-"));
+    }
+
+    /// The notes repository is recalled, never written: no authority, ring or
+    /// frontmatter turns a read-only source into a maintenance target.
+    #[test]
+    fn a_read_only_source_is_never_a_maintenance_target() {
+        let mut rules = RingRules::default();
+        rules.include_prefixes = vec!["projects/notes-repo/".into()];
+        rules.rules.insert(
+            0,
+            crate::config::RingRule {
+                prefix: "projects/notes-repo/".into(),
+                ring: 4,
+            },
+        );
+        let target = "projects/notes-repo/idea.md";
+        // The carve-out alone makes it a legal ring-4 target: the marker is
+        // what protects it.
+        assert!(target_policy(target, "# x\n", Authority::Authorized, &rules).is_ok());
+        rules.read_only_prefixes = vec!["projects/notes-repo/".into()];
+        for authority in [
+            Authority::Authorized,
+            Authority::Attested,
+            Authority::Unendorsed,
+        ] {
+            let err = target_policy(target, "# x\n", authority, &rules)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("read-only source"), "{err}");
+        }
+        assert!(
+            target_policy(
+                target,
+                "---\nring: 3\n---\n# x\n",
+                Authority::Authorized,
+                &rules
+            )
+            .is_err(),
+            "a frontmatter ring does not launder a read-only source"
+        );
+        assert!(
+            target_policy(
+                "todo/active/t/STATUS.md",
+                "# x\n",
+                Authority::Authorized,
+                &rules
+            )
+            .is_ok(),
+            "everything else is untouched"
+        );
     }
 }

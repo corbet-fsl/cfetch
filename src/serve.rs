@@ -657,6 +657,36 @@ fn register_watches(
 mod watch_scope_tests {
     use super::*;
 
+    /// The watch set is the index set: an included checkout inside `projects/`
+    /// is watched (and the way down to it), its excluded siblings are not.
+    #[test]
+    fn watchable_dirs_follow_an_included_checkout_inside_an_excluded_tree() {
+        let brain = tempfile::tempdir().unwrap();
+        for d in [
+            "projects/notes-repo/sub",
+            "projects/other-repo/src",
+            "knowledge/hosts",
+        ] {
+            std::fs::create_dir_all(brain.path().join(d)).unwrap();
+        }
+        let rules = crate::config::RingRules {
+            include_prefixes: vec!["projects/notes-repo/".into()],
+            ..crate::config::RingRules::default()
+        };
+        let rel: Vec<String> = watchable_dirs(brain.path(), &rules)
+            .dirs
+            .iter()
+            .map(|d| crate::index::rel_doc_path(d.strip_prefix(brain.path()).unwrap()))
+            .collect();
+        for want in ["projects", "projects/notes-repo", "projects/notes-repo/sub"] {
+            assert!(rel.iter().any(|r| r == want), "{want} watched: {rel:?}");
+        }
+        assert!(
+            !rel.iter().any(|r| r.starts_with("projects/other-repo")),
+            "excluded sibling not watched: {rel:?}"
+        );
+    }
+
     /// The three deployment defects, as tests: never follow a symlink out of
     /// the tree, never watch what the indexer excludes, and watch only
     /// directories that exist.

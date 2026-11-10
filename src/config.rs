@@ -66,6 +66,12 @@ impl RingRule {
 pub struct RingRules {
     pub rules: Vec<RingRule>,
     pub exclude_prefixes: Vec<String>,
+    /// Subtrees indexed even though an exclusion covers them (see
+    /// [`Config::include_prefixes`]). Never lifts the hard boundary.
+    pub include_prefixes: Vec<String>,
+    /// Subtrees that are recallable but never written by maintenance (see
+    /// [`Config::read_only_prefixes`]).
+    pub read_only_prefixes: Vec<String>,
 }
 
 impl Default for RingRules {
@@ -73,6 +79,8 @@ impl Default for RingRules {
         RingRules {
             rules: default_ring_rules(),
             exclude_prefixes: default_exclude_prefixes(),
+            include_prefixes: Vec::new(),
+            read_only_prefixes: Vec::new(),
         }
     }
 }
@@ -236,28 +244,62 @@ impl RingRules {
     }
 
     /// Whether a path must never enter any index or capture record. The hard
-    /// boundary first, the operator's own exclusions after it.
+    /// boundary first, the operator's own exclusions after it; an operator
+    /// exclusion yields to `include_prefixes`, the hard boundary never does.
     pub fn excluded(&self, rel: &str) -> bool {
         let rel = rel.trim_end_matches('/');
+        self.hard_excluded(rel) || (self.prefix_excluded(rel) && !self.included(rel))
+    }
+
+    /// Directory form: true when nothing under `rel` can ever be indexed, so
+    /// a walker can skip the whole subtree. It is the file predicate
+    /// ([`RingRules::excluded`]) plus one allowance: a directory that LEADS TO
+    /// an included prefix (`projects/` for `projects/forge/notes/`) must be
+    /// walked, or the carve-out would be unreachable. The files directly
+    /// inside such a directory stay excluded by the file form, and its other
+    /// subdirectories are skipped as before.
+    pub fn excluded_dir(&self, rel: &str) -> bool {
+        let rel = rel.trim_end_matches('/');
+        self.hard_excluded(rel)
+            || (self.prefix_excluded(rel) && !self.included(rel) && !self.leads_to_included(rel))
+    }
+
+    /// Whether maintenance may never write this path: it is recalled like any
+    /// other document but belongs to someone else's repository (the
+    /// operator's own notes), so cfetch reads it and nothing more.
+    pub fn read_only(&self, rel: &str) -> bool {
+        let rel = rel.trim_end_matches('/');
+        self.read_only_prefixes.iter().any(|p| under_prefix(rel, p))
+    }
+
+    /// The compiled-in boundary: git internals, other minds, secrets and
+    /// exhaust. No configuration lifts any of it.
+    fn hard_excluded(&self, rel: &str) -> bool {
         in_git_dir(rel)
             || (rel.starts_with("mind/")
                 && !under_prefix(rel, &format!("mind/{}", paths::mind_id())))
             || HARD_EXCLUDE_PREFIXES.iter().any(|p| under_prefix(rel, p))
-            || self.exclude_prefixes.iter().any(|p| under_prefix(rel, p))
     }
 
-    /// Directory form: true when nothing under `rel` can ever be indexed, so
-    /// a watcher can skip the whole subtree. It is the SAME predicate as
-    /// [`RingRules::excluded`] — the two used to be hand-maintained copies of
-    /// one list, which is exactly how a watcher drifts from its indexer.
-    pub fn excluded_dir(&self, rel: &str) -> bool {
-        self.excluded(rel)
+    fn prefix_excluded(&self, rel: &str) -> bool {
+        self.exclude_prefixes.iter().any(|p| under_prefix(rel, p))
+    }
+
+    fn included(&self, rel: &str) -> bool {
+        self.include_prefixes.iter().any(|p| under_prefix(rel, p))
+    }
+
+    /// `rel` is an ancestor of some included prefix (or the prefix itself).
+    fn leads_to_included(&self, rel: &str) -> bool {
+        self.include_prefixes
+            .iter()
+            .any(|p| under_prefix(p.trim_end_matches('/'), rel))
     }
 }
 
 /// The shipped taxonomy. Opinionated (it describes a conventional agent brain
 /// tree) but not baked in: replacing `ring_rules` in the config replaces it
-/// whole.
+/// whole, while `extra_ring_rules` adds in front of it and leaves it intact.
 fn default_ring_rules() -> Vec<RingRule> {
     let mind = format!("mind/{}", paths::mind_id());
     vec![
@@ -948,6 +990,27 @@ pub struct Config {
     /// boundary (secrets, logs, `.git`), which no config can lift.
     #[serde(default = "default_exclude_prefixes")]
     pub exclude_prefixes: Vec<String>,
+    /// Rules ADDED to the shipped taxonomy: they are matched before
+    /// `ring_rules`, in the order given, and the shipped list stays in force
+    /// for everything they do not claim. Unlike `ring_rules` this never
+    /// replaces anything, so it keeps working when a later release changes the
+    /// shipped list. An old binary ignores the key, so a source declared only
+    /// here is simply not recalled there.
+    #[serde(default)]
+    pub extra_ring_rules: Vec<RingRule>,
+    /// Subtrees indexed although `exclude_prefixes` (the shipped `projects/`,
+    /// or the operator's own list) covers them, so one checkout inside a
+    /// repository tree can be recalled without un-excluding the whole tree and
+    /// without restating the exclusion list. The hard boundary (secrets,
+    /// exhaust, git internals, other minds) is never lifted: a prefix under it
+    /// is refused at load.
+    #[serde(default)]
+    pub include_prefixes: Vec<String>,
+    /// Subtrees that stay recallable but are never written by maintenance, and
+    /// never staged as maintenance candidates: the operator's own notes, owned
+    /// by a repository cfetch only reads.
+    #[serde(default)]
+    pub read_only_prefixes: Vec<String>,
 }
 
 pub fn default_budget_chars() -> usize {
@@ -998,6 +1061,9 @@ impl Default for Config {
             governance: GovernanceConfig::default(),
             ring_rules: default_ring_rules(),
             exclude_prefixes: default_exclude_prefixes(),
+            extra_ring_rules: Vec::new(),
+            include_prefixes: Vec::new(),
+            read_only_prefixes: Vec::new(),
         }
     }
 }
@@ -1268,7 +1334,7 @@ impl Config {
             }
         }
 
-        for r in &self.ring_rules {
+        for r in self.extra_ring_rules.iter().chain(&self.ring_rules) {
             if r.ring > MAX_RING {
                 anyhow::bail!(
                     "ring rule {:?} names ring {}; rings run 0-{MAX_RING}",
@@ -1276,6 +1342,24 @@ impl Config {
                     r.ring
                 );
             }
+        }
+        for p in &self.include_prefixes {
+            let p = p.trim_end_matches('/');
+            anyhow::ensure!(
+                !p.is_empty(),
+                "include_prefixes holds an empty prefix: it would include nothing"
+            );
+            if HARD_EXCLUDE_PREFIXES.iter().any(|h| under_prefix(p, h)) {
+                anyhow::bail!(
+                    "include prefix {p:?} is under a hard-excluded prefix: the secrets/exhaust bar holds at ANY configuration"
+                );
+            }
+        }
+        for p in &self.read_only_prefixes {
+            anyhow::ensure!(
+                !p.trim_end_matches('/').is_empty(),
+                "read_only_prefixes holds an empty prefix: a protection that matches nothing is a silent hole"
+            );
         }
 
         if self.embeddings.enabled {
@@ -1310,9 +1394,19 @@ impl Config {
 
     /// The taxonomy this config describes, as one value to hand the indexer.
     pub fn rings(&self) -> RingRules {
+        // The additions come first: matching is first-match-wins, so an extra
+        // rule overrides the shipped list for the paths it names and the
+        // shipped list answers for the rest.
         RingRules {
-            rules: self.ring_rules.clone(),
+            rules: self
+                .extra_ring_rules
+                .iter()
+                .chain(&self.ring_rules)
+                .cloned()
+                .collect(),
             exclude_prefixes: self.exclude_prefixes.clone(),
+            include_prefixes: self.include_prefixes.clone(),
+            read_only_prefixes: self.read_only_prefixes.clone(),
         }
     }
 
@@ -1684,6 +1778,7 @@ mod tests {
                 },
             ],
             exclude_prefixes: Vec::new(),
+            ..RingRules::default()
         };
         assert_eq!(
             rules.ring_for("notes/pinned/a.md"),
@@ -1703,6 +1798,7 @@ mod tests {
         let rules = RingRules {
             rules: Vec::new(),
             exclude_prefixes: Vec::new(),
+            ..RingRules::default()
         };
         assert_eq!(rules.ring_for("whatever.md"), UNMATCHED_RING);
         assert_eq!(UNMATCHED_RING, 3);
@@ -2178,5 +2274,166 @@ mod tests {
         std::fs::write(&p, r#"{"brain_root": "/also/elsewhere"}"#).unwrap();
         let cfg = Config::load_from(&p).unwrap();
         assert_eq!(cfg.brain_root, paths::default_brain_root());
+    }
+
+    /// Loads a config document through the same path `CFETCH_CONFIG` takes.
+    fn rules_from(json: &str) -> RingRules {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, json).unwrap();
+        Config::load_from(&p).unwrap().rings()
+    }
+
+    #[test]
+    fn extra_ring_rules_extend_the_shipped_list_and_never_replace_it() {
+        let r = rules_from(
+            r#"{"extra_ring_rules": [
+                 {"prefix": "projects/notes-repo/", "ring": 4},
+                 {"prefix": "todo/pinned/", "ring": 2}
+               ]}"#,
+        );
+        assert_eq!(r.ring_for("projects/notes-repo/a.md"), 4);
+        assert_eq!(
+            r.ring_for("todo/pinned/a.md"),
+            2,
+            "an addition outranks the shipped rule that would also match"
+        );
+        // Everything the additions do not name still answers from the
+        // shipped list, which is the whole point of not replacing it.
+        let shipped = RingRules::default();
+        for path in [
+            "AGENT.md",
+            "README.md",
+            "knowledge/rules/x.md",
+            "knowledge/behaviours/x.md",
+            "todo/active/t/STATUS.md",
+            "knowledge/hosts/x.md",
+            "logs/x.md",
+        ] {
+            assert_eq!(r.ring_for(path), shipped.ring_for(path), "{path}");
+        }
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.ring_rules,
+            default_ring_rules(),
+            "the shipped list itself is untouched by additions"
+        );
+    }
+
+    #[test]
+    fn extra_ring_rules_alone_leave_the_shipped_exclusions_in_force() {
+        let r =
+            rules_from(r#"{"extra_ring_rules": [{"prefix": "projects/notes-repo/", "ring": 4}]}"#);
+        assert!(
+            r.excluded("projects/notes-repo/a.md"),
+            "a ring rule is not an inclusion: projects/ stays excluded"
+        );
+    }
+
+    #[test]
+    fn include_prefixes_carve_one_subtree_out_of_an_exclusion() {
+        let r = rules_from(r#"{"include_prefixes": ["projects/notes-repo/"]}"#);
+        // Files: only the carve-out is indexable.
+        assert!(!r.excluded("projects/notes-repo/a.md"));
+        assert!(!r.excluded("projects/notes-repo/deep/er/a.md"));
+        assert!(r.excluded("projects/other-repo/a.md"));
+        assert!(r.excluded("projects/top.md"));
+        assert!(
+            r.excluded("projects/notes-repo-old/a.md"),
+            "component-wise, never a string prefix"
+        );
+        // Directories: the way down to the carve-out is walkable, nothing else.
+        assert!(!r.excluded_dir("projects"));
+        assert!(!r.excluded_dir("projects/notes-repo"));
+        assert!(!r.excluded_dir("projects/notes-repo/deep"));
+        assert!(r.excluded_dir("projects/other-repo"));
+        assert!(r.excluded_dir("projects/notes-repo-old"));
+        // The rest of the shipped exclusions still hold.
+        assert!(r.excluded("knowledge/archive/x.md"));
+        assert!(r.excluded_dir("knowledge/archive"));
+    }
+
+    #[test]
+    fn include_prefixes_reach_through_nested_excluded_directories() {
+        let r = rules_from(r#"{"include_prefixes": ["projects/forge/personal/notes/"]}"#);
+        for d in [
+            "projects",
+            "projects/forge",
+            "projects/forge/personal",
+            "projects/forge/personal/notes",
+        ] {
+            assert!(!r.excluded_dir(d), "{d} leads to the carve-out");
+        }
+        assert!(r.excluded_dir("projects/forge/other"));
+        assert!(r.excluded_dir("projects/forge/personal/other"));
+        assert!(
+            r.excluded("projects/forge/personal/README.md"),
+            "a file beside the carve-out is still excluded"
+        );
+    }
+
+    #[test]
+    fn include_prefixes_never_lift_the_hard_boundary() {
+        // Refused at load for the prefixes that are hard-excluded outright.
+        for hard in ["knowledge/secrets/", "mind/secrets/x", "logs/", "scratch/a"] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("config.json");
+            std::fs::write(&p, format!(r#"{{"include_prefixes": ["{hard}"]}}"#)).unwrap();
+            let err = Config::load_from(&p).unwrap_err().to_string();
+            assert!(err.contains("hard-excluded"), "{hard}: {err}");
+        }
+        // The rules that are not prefixes (git internals, other minds) hold
+        // even when a rule set is built around them directly.
+        let rules = RingRules {
+            include_prefixes: vec!["projects/".into(), "mind/another/".into()],
+            ..RingRules::default()
+        };
+        assert!(rules.excluded("projects/repo/.git/config.md"));
+        assert!(rules.excluded("mind/another/memories/x.md"));
+        assert!(rules.excluded_dir("mind/another"));
+        assert!(rules.excluded("scratch/x.md"));
+    }
+
+    #[test]
+    fn read_only_prefixes_mark_exactly_their_subtree() {
+        let r = rules_from(r#"{"read_only_prefixes": ["projects/notes-repo/"]}"#);
+        assert!(r.read_only("projects/notes-repo/a.md"));
+        assert!(r.read_only("projects/notes-repo/deep/a.md"));
+        assert!(!r.read_only("projects/notes-repo-old/a.md"));
+        assert!(!r.read_only("knowledge/x.md"));
+        assert!(!RingRules::default().read_only("projects/notes-repo/a.md"));
+    }
+
+    #[test]
+    fn empty_and_out_of_range_additions_are_refused_loudly() {
+        for (doc, needle) in [
+            (r#"{"include_prefixes": [""]}"#, "empty prefix"),
+            (r#"{"include_prefixes": ["/"]}"#, "empty prefix"),
+            (r#"{"read_only_prefixes": [""]}"#, "empty prefix"),
+            (
+                r#"{"extra_ring_rules": [{"prefix": "x/", "ring": 7}]}"#,
+                "rings run 0-6",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("config.json");
+            std::fs::write(&p, doc).unwrap();
+            let err = Config::load_from(&p).unwrap_err().to_string();
+            assert!(err.contains(needle), "{doc}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_additive_keys_are_content_keys_a_tree_config_may_set() {
+        let tree = r#"{
+            "extra_ring_rules": [{"prefix": "projects/notes-repo/", "ring": 4}],
+            "include_prefixes": ["projects/notes-repo/"],
+            "read_only_prefixes": ["projects/notes-repo/"]
+        }"#;
+        let cfg = Config::load_layered(Some((std::path::Path::new("/t"), tree)), None).unwrap();
+        let r = cfg.rings();
+        assert_eq!(r.ring_for("projects/notes-repo/a.md"), 4);
+        assert!(!r.excluded("projects/notes-repo/a.md"));
+        assert!(r.read_only("projects/notes-repo/a.md"));
     }
 }

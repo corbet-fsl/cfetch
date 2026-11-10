@@ -1257,7 +1257,10 @@ fn brain_ring(brain_root: &Path, path: &str, rules: &RingRules) -> Option<u8> {
     // trap fired on it stages candidates about throwaway build trees. Six of
     // one operator's sixteen staged candidates pointed inside ephemeral agent
     // worktrees, and five of those at directories already deleted.
-    if rules.excluded(&rel) {
+    //
+    // A read-only source is the same: its files are recalled, but nothing the
+    // agents do to them may stage a maintenance candidate about them.
+    if rules.excluded(&rel) || rules.read_only(&rel) {
         return None;
     }
     let by_location = crate::index::default_ring(&rel, rules);
@@ -1382,6 +1385,27 @@ mod tests {
         assert_eq!(unquote_shell_word(r"my\ file.md"), "my file.md");
         assert_eq!(unquote_shell_word(r"a\'b"), "a'b");
         assert_eq!(unquote_shell_word("'/tmp/x y.md'"), "/tmp/x y.md");
+    }
+
+    /// A read-only source is recalled but is no maintenance subject: writes to
+    /// it carry no ring, so no trap can stage a candidate about it, even when
+    /// the extra rule that places it would put it on a trapped ring.
+    #[test]
+    fn a_read_only_source_carries_no_ring_and_so_never_reaches_a_trap() {
+        let brain = tempfile::tempdir().unwrap();
+        let rules = RingRules {
+            include_prefixes: vec!["projects/notes-repo/".into()],
+            read_only_prefixes: vec!["projects/notes-repo/".into()],
+            ..RingRules::default()
+        };
+        let ring = |rel: &str| {
+            let p = brain.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x").unwrap();
+            brain_ring(brain.path(), &p.to_string_lossy(), &rules)
+        };
+        assert_eq!(ring("projects/notes-repo/idea.md"), None);
+        assert_eq!(ring("knowledge/live.md"), Some(3));
     }
 
     /// The failure this prevents was real: an operator's staging queue held

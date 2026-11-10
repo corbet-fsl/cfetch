@@ -5,6 +5,17 @@ listed here is a fix or an internal change with no effect on behavior.
 
 ## Unreleased
 
+- **A Markdown source can join the brain without restating the taxonomy.** Three
+  additive config keys extend the shipped lists instead of replacing them:
+  `include_prefixes` indexes a subtree inside an excluded one (for example a
+  notes checkout under `projects/`), `extra_ring_rules` are matched before the
+  shipped ring rules, and `read_only_prefixes` keep a subtree recallable but
+  out of reach of maintenance. The hard boundary (secrets, exhaust, Git
+  internals, other minds) is never lifted. The directory walker and the serving
+  watcher descend to an included prefix and nowhere else under the exclusion;
+  maintenance refuses to propose or apply a change to a read-only subtree, and
+  edits to it stage no hot-file candidates. `ring_rules` and `exclude_prefixes`
+  keep replacing the shipped lists whole.
 - **Dependency security.** `rmcp` 3.9.0 closes RUSTSEC-2026-0457 (OAuth
   client SSRF), RUSTSEC-2026-0461 (unbounded tool schema cache) and
   RUSTSEC-2026-0462 (unbounded response buffering); the stdio-only server

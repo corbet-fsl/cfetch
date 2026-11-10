@@ -146,8 +146,9 @@ fn resident_ring0_descriptions(cfg: &Config, scope: &SessionScope) -> Vec<String
 /// taxonomy it is whatever that taxonomy calls the same thing — the fallback
 /// follows the config instead of assuming one tree's layout.
 fn behavior_dirs(cfg: &Config) -> Vec<PathBuf> {
-    cfg.ring_rules
+    cfg.extra_ring_rules
         .iter()
+        .chain(&cfg.ring_rules)
         .filter(|r| r.ring <= 2 && r.prefix.ends_with('/'))
         .map(|r| PathBuf::from(r.prefix.trim_end_matches('/')))
         .collect()
