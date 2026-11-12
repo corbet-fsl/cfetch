@@ -54,9 +54,8 @@ exceptions = [
 version = 2
 yanked = "deny"
 ignore = [
-  # Unmaintained transitive macro utilities. No known exploits; removal
-  # depends on upstream parents migrating off them. Tracked in the
+  # Unmaintained transitive macro utility. No known exploits; removal
+  # depends on upstream parents migrating off it. Tracked in the
   # dependency-hygiene issue.
   { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained transitive; no fixed version exists" },
-  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: unmaintained transitive; no fixed version exists" },
 ]
