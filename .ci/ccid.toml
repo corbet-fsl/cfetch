@@ -152,7 +152,7 @@ render_schema = 2
 
 [jobs.verify]
 scheduler = "forgejo"
-runs_on = "heavy"
+runs_on = "linux"
 archive_inputs = true
 checks = ["ci-config", "catalog", "rust", "memory", "variants", "licenses", "profile", "governor", "release-guards", "staging", "admission-origin", "freshness", "hook-deadline"]
 workflow = "ci"
