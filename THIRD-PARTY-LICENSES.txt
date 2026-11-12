@@ -848,7 +848,7 @@ Apache License 2.0 (Apache-2.0)
 
 Used by:
 - linux-raw-sys 0.12.1 (https://github.com/sunfishcode/linux-raw-sys)
-- rustix 1.1.5 (https://github.com/bytecodealliance/rustix)
+- rustix 1.1.6 (https://github.com/bytecodealliance/rustix)
 
 
                                  Apache License
@@ -1361,13 +1361,17 @@ Used by:
 - windows-result 0.4.1 (https://github.com/microsoft/windows-rs)
 - windows-strings 0.5.1 (https://github.com/microsoft/windows-rs)
 - windows-sys 0.48.0 (https://github.com/microsoft/windows-rs)
+- windows-sys 0.52.0 (https://github.com/microsoft/windows-rs)
 - windows-sys 0.60.2 (https://github.com/microsoft/windows-rs)
 - windows-sys 0.61.2 (https://github.com/microsoft/windows-rs)
 - windows-targets 0.48.5 (https://github.com/microsoft/windows-rs)
+- windows-targets 0.52.6 (https://github.com/microsoft/windows-rs)
 - windows-targets 0.53.5 (https://github.com/microsoft/windows-rs)
 - windows_x86_64_gnu 0.48.5 (https://github.com/microsoft/windows-rs)
+- windows_x86_64_gnu 0.52.6 (https://github.com/microsoft/windows-rs)
 - windows_x86_64_gnu 0.53.1 (https://github.com/microsoft/windows-rs)
 - windows_x86_64_msvc 0.48.5 (https://github.com/microsoft/windows-rs)
+- windows_x86_64_msvc 0.52.6 (https://github.com/microsoft/windows-rs)
 - windows_x86_64_msvc 0.53.1 (https://github.com/microsoft/windows-rs)
 
                                  Apache License
@@ -4348,7 +4352,7 @@ Used by:
 - regex 1.13.1 (https://github.com/rust-lang/regex)
 - ring 0.17.14 (https://github.com/briansmith/ring)
 - rustc_version 0.4.1 (https://github.com/djc/rustc-version-rs)
-- rustix 1.1.5 (https://github.com/bytecodealliance/rustix)
+- rustix 1.1.6 (https://github.com/bytecodealliance/rustix)
 - rustls 0.23.46 (https://github.com/rustls/rustls)
 - scopeguard 1.2.0 (https://github.com/bluss/scopeguard)
 - signal-hook-mio 0.2.5 (https://github.com/vorner/signal-hook)
