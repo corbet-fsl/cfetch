@@ -29,29 +29,6 @@
       ],
       "runs_on": "linux",
       "archive_inputs": true
-    },
-    "windows": {
-      "job": "windows",
-      "scheduler": "remote",
-      "checks": [
-        "rust"
-      ],
-      "workflow": "ccid-remote",
-      "command": [],
-      "push_branches": [
-        "main"
-      ],
-      "paths": [
-        "src/**",
-        "tests/**",
-        "build.rs",
-        "Cargo.toml",
-        "Cargo.lock",
-        ".gitlab-ci.yml"
-      ],
-      "provider": "gitlab",
-      "platform": "windows-x64",
-      "timeout_minutes": 120
     }
   }
 }
