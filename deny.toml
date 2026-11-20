@@ -33,10 +33,6 @@ exceptions = [
   # date. Keeping this crate-specific prevents another FSL dependency from
   # entering unnoticed.
   { crate = "cfetch", allow = ["FSL-1.1-ALv2"] },
-  # attohttpc is an existing iroh transitive dependency. MPL-2.0 is weak,
-  # file-level copyleft; a crate-specific review must not become a global
-  # permission for future MPL dependencies.
-  { crate = "attohttpc", allow = ["MPL-2.0"] },
   # option-ext is the small, unmodified path-helper dependency behind `dirs`
   # in both adapter libraries. MPL-2.0 is file-level copyleft; keep the review
   # crate-specific so it cannot admit an unrelated MPL dependency later.
