@@ -5654,7 +5654,7 @@ Used by:
 - thiserror 2.0.21 (https://github.com/dtolnay/thiserror)
 - time-core 0.1.9 (https://github.com/time-rs/time)
 - time 0.3.55 (https://github.com/time-rs/time)
-- unicode-ident 1.0.26 (https://github.com/dtolnay/unicode-ident)
+- unicode-ident 1.0.27 (https://github.com/dtolnay/unicode-ident)
 - utf8-zero 0.8.1 (https://github.com/algesten/utf8-zero)
 - utf8parse 0.2.2 (https://github.com/alacritty/vte)
 - yaml_serde 0.10.7 (https://github.com/yaml/yaml-serde)
@@ -8408,7 +8408,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 Unicode License v3 (Unicode-3.0)
 
 Used by:
-- unicode-ident 1.0.26 (https://github.com/dtolnay/unicode-ident)
+- unicode-ident 1.0.27 (https://github.com/dtolnay/unicode-ident)
 
 UNICODE LICENSE V3
 
