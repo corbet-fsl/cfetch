@@ -54,6 +54,7 @@ exceptions = [
 version = 2
 yanked = "deny"
 ignore = [
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; no fixed version exists. Reviewed 2026-11-20; remove when a transitive parent moves to another time crate" },
   # Unmaintained transitive macro utility. No known exploits; removal
   # depends on upstream parents migrating off it. Tracked in the
   # dependency-hygiene issue.
